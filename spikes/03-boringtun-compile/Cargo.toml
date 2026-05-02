@@ -1,0 +1,27 @@
+[package]
+name = "boringtun-compile-spike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+boringtun = { path = "vendor/boringtun", default-features = false }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[profile.release]
+panic = "unwind"
+lto = true
+opt-level = 2
+
+[package.metadata.vita]
+title_id = "TVIT00003"
+title_name = "Tailscale-Vita BoringTun"
+vita_make_fself_flags = []
+
+[patch.crates-io]
+ring = { git = "https://github.com/vita-rust/ring", branch = "v0.17.14-vita" }
+
+# Direct dep for the parking_lot sanity check (boringtun pulls it
+# transitively but the spike file references it).
+[dependencies.parking_lot]
+version = "0.12"

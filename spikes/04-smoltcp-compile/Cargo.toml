@@ -1,0 +1,25 @@
+[package]
+name = "smoltcp-compile-spike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std",
+    "log",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+    "socket-icmp",
+] }
+
+[profile.release]
+panic = "unwind"
+lto = true
+opt-level = 2
+
+[package.metadata.vita]
+title_id = "TVIT00004"
+title_name = "Tailscale-Vita smoltcp"
+vita_make_fself_flags = []

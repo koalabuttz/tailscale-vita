@@ -1,0 +1,15 @@
+[package]
+name = "hello-vita"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[profile.release]
+panic = "unwind"
+lto = true
+opt-level = 2
+
+[package.metadata.vita]
+title_id = "TVIT00001"
+title_name = "Tailscale-Vita Hello"

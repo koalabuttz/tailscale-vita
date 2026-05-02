@@ -1,0 +1,2 @@
+# Headscale persistent state — node keys, SQLite DB, etc.
+lib/

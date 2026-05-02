@@ -1,0 +1,38 @@
+# Local Headscale instance for tailscale-vita development.
+#
+# Headscale speaks the same control-plane protocol as Tailscale's
+# coordination server. Pointing our (in-development) Vita client at it
+# lets us read/write/tcpdump every byte without depending on Tailscale's
+# production service.
+#
+# Usage (from this directory):
+#   docker compose up -d
+#   docker compose exec headscale headscale users create vita
+#   docker compose exec headscale headscale preauthkeys create -e 720h --user vita
+#
+# The printed key (tskey-auth-...) goes into the Vita client's config.
+
+services:
+  headscale:
+    image: headscale/headscale:0.26
+    container_name: tailscale-vita-headscale
+    restart: unless-stopped
+    ports:
+      # Control-plane HTTP. For dev, we expose to the LAN so the Vita
+      # (and Vita3K's NAT'd network) can reach it. Bind to a specific
+      # interface in production.
+      - "8080:8080"
+      # Metrics / debug.
+      - "9090:9090"
+    volumes:
+      - ./config:/etc/headscale:ro
+      - ./lib:/var/lib/headscale
+    command: serve
+
+  # Optional web UI; uncomment if you want a browser dashboard.
+  # headscale-ui:
+  #   image: ghcr.io/gurucomputing/headscale-ui:latest
+  #   container_name: tailscale-vita-headscale-ui
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8443:443"

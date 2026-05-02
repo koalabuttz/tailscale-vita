@@ -1,0 +1,18 @@
+[package]
+name = "udp-echo-vita"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[profile.release]
+panic = "unwind"
+lto = true
+opt-level = 2
+
+[package.metadata.vita]
+title_id = "TVIT00002"
+title_name = "Tailscale-Vita UDP Echo"
+# This disables vita-make-fself's default `-s` (safe mode) so the app gets
+# full networking permissions on a hacked Vita without a manual override.
+vita_make_fself_flags = []

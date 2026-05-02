@@ -1,0 +1,14 @@
+# Cargo
+target/
+
+# Build artefacts produced under each spike
+*.vpk
+*.velf
+*.self
+*.elf
+*.sfo
+
+# Local dev state
+.idea/
+.vscode/
+*.log
