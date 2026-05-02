@@ -123,3 +123,45 @@ sceNet/`std::net` from a SUPRX plugin context (vs. the eboot context the
 spikes use), confirm the deferred-init pattern, and test sustained UDP
 throughput. Spike 2's Rust source is essentially the Phase 1 starting
 point.
+
+## Appendix: Vita3K headless attempt
+
+After the initial Phase 0 commit, attempted to run the spike VPKs in
+Vita3K headless inside this sandboxed Linux container. **Did not succeed**;
+documenting blockers so we don't re-attempt without addressing them.
+
+### Setup attempted
+
+- Vita3K `continuous` Linux release (v0.2.1, build 3967-faa4a632), x86_64.
+- Mesa software renderers installed: `mesa-vulkan-drivers` (lavapipe),
+  `libgl1-mesa-dri` + `libglx-mesa0` (llvmpipe), plus `vulkan-tools`,
+  `mesa-utils`.
+- `Xvfb` for display, `SDL_AUDIODRIVER=dummy` for audio, ran as
+  unprivileged user `vitatest` (Vita3K refuses to start as root).
+- `VK_ICD_FILENAMES` pointed at `lvp_icd.x86_64.json` (lavapipe).
+
+### Blockers
+
+| # | Blocker | Detail |
+|---|---|---|
+| 1 | **No PSVita firmware** | Vita3K cannot boot any title without `PSVUPDAT.PUP`. Sony's CDN host `h.dl.playstation.net` is not resolvable from this sandbox. |
+| 2 | **Vulkan VK_KHR_surface missing** | Lavapipe (CPU-software Vulkan) does not expose `VK_KHR_xlib_surface`. Vita3K's SDL window-creation fails before any code from the VPK runs. Real GPU + driver would solve this. |
+| 3 | **OpenGL backend segfaults** | With `backend-renderer: OpenGL`, `LIBGL_ALWAYS_SOFTWARE=1`, llvmpipe via Xvfb: `Vita3K` SIGSEGVs during init before logging is open. Likely a Mesa-GLX-via-indirect-context bug; out of scope to chase. |
+| 4 | **Error dialogs hang the process** | On init failure Vita3K opens a modal `SDL_ShowSimpleMessageBox` and waits — no `--no-gui` style flag — so the process hangs until `timeout` SIGKILLs it (exit 124) instead of exiting cleanly with a useful diagnostic. |
+
+### Conclusion
+
+Headless Vita3K in this sandbox is **not feasible** under current
+constraints. Two ways forward, both on the user's own machine:
+
+- **Vita3K on the workstation.** Install Vita3K normally, install the
+  user's existing PSVita PUP firmware via the GUI's
+  `File → Install Firmware` action, then drag-and-drop each spike VPK
+  to install it. With a real GPU the display problems go away.
+- **Real Vita.** The user's Ensō-modded Vita is the source of truth
+  anyway; once available, the on-device verification checklist above is
+  the canonical pass criterion.
+
+The Phase 0 verdict (architecture is GREEN, all crates compile + link
+cleanly for the Vita target) does not change — it was always a
+build-time spike, and runtime verification was deferred from the start.
