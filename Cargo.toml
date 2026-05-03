@@ -1,0 +1,90 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vita-log",
+    "crates/tailscale-vita-demo",
+]
+# Phase-0 spikes are standalone crates with their own [patch.crates-io] and
+# build profiles. Keep them out of the workspace so they remain reproducible
+# historical artifacts.
+exclude = [
+    "spikes/01-hello-rust",
+    "spikes/02-udp-echo",
+    "spikes/03-boringtun-compile",
+    "spikes/04-smoltcp-compile",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+# --- crypto + WireGuard (Phase-0 baseline) ---
+boringtun        = { path = "vendor/boringtun", default-features = false }
+x25519-dalek     = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+blake2           = "0.10"
+hkdf             = "0.12"
+getrandom        = "0.2"
+rand_core        = { version = "0.6", features = ["getrandom"] }
+subtle           = "2"
+parking_lot      = "0.12"
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std", "log", "medium-ip", "proto-ipv4",
+    "socket-tcp", "socket-udp", "socket-icmp",
+] }
+
+# --- Noise IK ---
+snow = { version = "0.10", default-features = false, features = [
+    "use-curve25519", "use-chacha20poly1305", "use-blake2", "std",
+] }
+
+# --- TLS + HTTPS ---
+rustls           = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1"
+webpki-roots     = "1"
+ureq             = { version = "3",  default-features = false, features = ["rustls", "tls-rustls-webpki-roots", "json", "gzip"] }
+httparse         = { version = "1",  default-features = false, features = ["std"] }
+
+# --- HTTP/2 inside Noise (M5; Plan A primary, see crates/ts-control/M5a-DECISION.md) ---
+h2    = "0.4"
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time"] }
+
+# --- DERP NaCl box (M8; cross-compile spike at head of M8) ---
+crypto_box = { version = "0.9", default-features = false, features = ["alloc", "salsa20"] }
+
+# --- Concurrency (no async runtime for the rest of the system) ---
+crossbeam-channel = "0.5"
+
+# --- JSON / serialization ---
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- Compression (Headscale gzips MapResponse bodies) ---
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+# --- Logging ---
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
+
+# --- Helpers ---
+base64    = { version = "0.22", default-features = false, features = ["alloc"] }
+bytes     = "1"
+bytemuck  = "1"
+time      = { version = "0.3", default-features = false, features = ["macros", "parsing", "formatting", "serde", "alloc"] }
+thiserror = "1"
+arc-swap  = "1"
+toml      = { version = "0.8", default-features = false, features = ["parse"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+panic     = "unwind"
+lto       = true
+opt-level = 2
+
+[patch.crates-io]
+ring = { git = "https://github.com/vita-rust/ring", branch = "v0.17.14-vita" }

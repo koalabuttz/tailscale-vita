@@ -1,0 +1,15 @@
+[package]
+name = "tailscale-vita-demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+vita-log = { path = "../vita-log" }
+tracing  = { workspace = true }
+
+[package.metadata.vita]
+title_id   = "TVIT00010"
+title_name = "Tailscale-Vita Demo"
+vita_make_fself_flags = []
