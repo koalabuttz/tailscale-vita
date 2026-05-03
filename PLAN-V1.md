@@ -6,6 +6,10 @@ best-effort), DERP-only transport, auth-key registration, exposing an
 in-tunnel `std::net`-shaped API to other Vita homebrew. Distributed as an
 eboot — SUPRX is **out of scope for v1** per scope-cut on 2026-05-03.
 
+This document is the strategic plan. File-level / function-level / type-level
+detail per milestone (the actual coding-time reference) lives in
+`~/.claude/plans/ticklish-bubbling-key.md`.
+
 This plan is grounded in six rounds of source-level research that produced
 the citations and code sketches reused below; see "Research provenance"
 at the end for which findings are upstream-cited and which are inferred.
@@ -101,22 +105,29 @@ that gets verified.
        Internet → DERP → peer
 ```
 
-**Threading model** (six pthreads max):
+**Threading model** (12 pthreads worst-case at full v1 scale; many fewer in early milestones):
 
 | Thread | Owns | Blocks on | Wakeup |
 |---|---|---|---|
 | `app` (main) | `smoltcp::Interface`, `SocketSet`, in-tunnel sockets | Condvar w/ `iface.poll_delay()` timeout | `wg_engine` notify on rx queue |
-| `wg_engine` | `HashMap<PublicKey, Mutex<Tunn>>`, both queues | Condvar w/ 250 ms timeout | `derp_rx` notify, `app` notify, timer |
-| `derp_rx` | DERP TLS stream, read half | Blocking `read()` on `rustls::Stream` | Network |
-| `derp_tx` | DERP TLS stream, write half + send queue | crossbeam-channel recv | `wg_engine` push |
+| `wg_engine` | `HashMap<PublicKey, Mutex<Tunn>>`, both queues | Condvar w/ 250 ms timeout | `derp_conn` notify, `app` notify, timer |
+| `net_rx` (M2 only) | `std::net::UdpSocket` read side | blocking `recv_from` w/ 50 ms timeout | network |
 | `control` | Noise tunnel + HTTP/2 client + map state | Blocking long-poll read | Network keepalive (~60 s) |
+| `noise_pump` (Plan A) | Background sync I/O for the Noise socket; pumps tokio AsyncRead/Write wakers | blocking `read`/`write` w/ short timeout | network or `tx_buf` push |
 | `log` | File handle for `ux0:/data/.../log.txt` | crossbeam-channel recv | Any `tracing` event |
+| `derp_conn × N` (N ≤ 8, M8+) | One thread per DERP region, single-threaded I/O loop with `select_biased!{ pong | tx | tls_readable }` | 100 ms recv_timeout + non-blocking TLS poll | channel push or network |
 
-Locks (acquire order; never reverse):
+All threads spawn with `std::thread::Builder::new().stack_size(256 * 1024)` — Vita's default 64 KiB pthread stack is too small for smoltcp poll + listener pool + h2 frame buffers.
 
-1. `Engine.by_pubkey` / `by_idx` / `by_ip` (`RwLock`, read-mostly).
-2. `PeerState.tunn` (`Mutex`, held only on `wg_engine`).
-3. `WgDevice.rx_q` / `tx_q` (`Mutex`, held only across single `pop`/`push`).
+Locks — formal acquire-order invariant; **never reverse**:
+
+1. `Engine.by_pubkey` / `by_idx` / `by_ip` (`RwLock`, read-mostly; write only on `upsert_peer`/`remove_peer`).
+2. `Peer.tunn` (`Mutex<Tunn>`, only ever held on `wg_engine` thread; never across I/O or FS).
+3. `WgDevice.rx_q` / `tx_q` *= shared `Arc<Mutex<VecDeque>>` with `EngineRunning.tun_rx`/`tun_tx`*. Held only across single `pop_front`/`push_back`. **`WgDevice::receive`/`transmit` use `try_lock`** — on contention, return `None` so smoltcp polls again; this prevents the `app` thread deadlocking against `wg_engine` holding the same Arc.
+4. `StackInner.iface` (`Mutex<Interface>`, only on `app` thread).
+5. `StackInner.sockets` (`Mutex<SocketSet>`) — always after `iface`.
+6. `StackInner.handles` (`Mutex<HashMap<SocketHandle, HandleSlot>>`).
+7. Per-handle Condvar mutex — held only across condition mutation; `sockets` lock must drop before parking on it.
 
 ## Workspace layout
 
@@ -210,9 +221,15 @@ tracing            = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std"] }
 
 # --- Helpers ---
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
-bytes  = "1"
-time   = { version = "0.3", default-features = false, features = ["macros", "parsing", "formatting", "serde", "alloc"] }
+base64    = { version = "0.22", default-features = false, features = ["alloc"] }
+bytes     = "1"
+time      = { version = "0.3", default-features = false, features = ["macros", "parsing", "formatting", "serde", "alloc"] }
+thiserror = "1"
+arc-swap  = "1"
+toml      = { version = "0.8", default-features = false, features = ["parse"] }
+
+# --- DERP NaCl box (M8). RustCrypto family; spike at head of M8 ---
+crypto_box = { version = "0.9", default-features = false, features = ["alloc", "salsa20"] }
 
 [patch.crates-io]
 ring = { git = "https://github.com/vita-rust/ring", branch = "v0.17.14-vita" }
@@ -508,10 +525,17 @@ control plane.**
 - For M2, single-peer hardcoded: read peer pubkey + endpoint from
   `ux0:/data/tailscale-vita/wg.toml`.
 - Stand up Linux peer with vanilla `wg-quick`, hard-coded keys.
-- `net_io` thread = `std::net::UdpSocket` directly. No DERP yet.
-- Run `wg_engine` thread with 250 ms timer.
-- Send a few hand-crafted IPv4 ICMP echo packets through `Tunn::encapsulate`,
-  expect echo-replies back via `Tunn::decapsulate`.
+- `net_rx` thread = `std::net::UdpSocket` directly with 50 ms read timeout. No DERP yet.
+- Run `wg_engine` thread with 250 ms timer; `Tunn::encapsulate(&[], ...)`
+  primes the handshake at startup per peer.
+- **M2-only test harness** (`wg-engine/src/icmp.rs`, ~110 LOC): hand-craft
+  IPv4+ICMP-echo packets, push into `tun_tx`, expect echo-reply on `tun_rx`.
+  Validates that data actually flows through the tunnel — not just that
+  handshake-init is generated. **Deleted in M3** when smoltcp owns the
+  in-tunnel IP layer.
+- Wrap every `Tunn::decapsulate`/`encapsulate` in `catch_unwind` so a
+  panic on a malformed datagram becomes `wg.error{kind="panic"}` and a
+  drop, not a process abort.
 
 **Success.** Vita logs show `boringtun: handshake complete`,
 `encapsulated: 84 B → 132 B`, `decapsulated: 132 B → 84 B`, and `ICMP echo
@@ -585,7 +609,16 @@ well enough to issue one request and receive a response.
     handshake, single-stream-per-connection, HEADERS+DATA, HPACK via the
     `hpack 0.3` crate). ~1500 LOC. No async.
 
-**M5a (1–2 days, gating).** Spike both. Pick one.
+**M5a (1–2 days, gating).** Spike both Plan A and Plan B. Decision criteria, in priority order:
+
+1. Cross-compiles for `armv7-sony-vita-newlibeabihf` without patches.
+2. Wall-clock latency from "M5 start" → first HTTP/2 response (< 5 s on localhost).
+3. Code size (`.text` section).
+4. Crate-author LOC in our repo (Plan A ≈ 700, Plan B ≈ 1500 — maintenance favors A).
+
+Default decision: **Plan A primary, Plan B kept as feature-gated fallback** (`feature = "http2-handrolled"`). Outcome recorded in `crates/ts-control/M5a-DECISION.md`.
+
+Tokio features locked at workspace level: `["rt", "macros", "sync", "time"]` only. **No `net`, no `io-util`, no `rt-multi-thread`** — would pull `mio` which is unavailable on Vita.
 
 **Success.** Vita establishes a Noise tunnel to a Headscale instance,
 issues a trivial `POST /machine/whoami` (501 Not Implemented response is
@@ -646,17 +679,31 @@ N `Tunn`s alive matching `headscale nodes list` count.
 **Goal.** WireGuard datagrams flow Vita ↔ peer over DERP. Replaces
 M2's direct UDP transport.
 
+**Pre-M8 spike (1 day).** `crypto_box 0.9` is RustCrypto's NaCl-box
+(XSalsa20-Poly1305) wrapper — different cipher family from the
+ChaCha20-Poly1305 we proved in Phase 0. Build a minimal `box-spike`
+eboot importing `SalsaBox::new(...)` + `encrypt`/`decrypt` on hardcoded
+vectors; verify cross-compile. **Fallback:** hand-rolled
+`xsalsa20poly1305 0.10` + `salsa20 0.10`. Document outcome in
+`PHASE-0-RESULTS.md`.
+
 **Tasks.**
 - `ts-derp::frame`: encoder/decoder for the 12 frame types listed above.
+  **Cap allocation at `MAX_PACKET_SIZE` (64 KiB)** when reading length
+  prefixes — a malformed `0x00FFFFFF` length must not OOM the Vita.
 - `ts-derp::client`: TCP+TLS dial, HTTP/1.1 `Upgrade: DERP` exchange,
-  `ServerKey` ↔ `ClientInfo` ↔ `ServerInfo` handshake, then split
-  `derp_rx` / `derp_tx` threads over the same TLS connection.
+  `ServerKey` ↔ `ClientInfo` ↔ `ServerInfo` handshake.
+- **One I/O thread per `DerpConn`**, *not* split read/write. rustls is
+  single-threaded internally; the thread runs an explicit
+  `crossbeam_channel::select_biased!{ pong | tx | tls_readable }` with
+  100 ms recv_timeout + non-blocking TLS read poll. Pong always wins
+  (servers tear down within ~10 s without it). Cap: 8 conns → 8 threads.
 - Home-region selection: TCP-RTT probe at startup; revisit every 5 min.
 - Bridge: `wg_engine::net_tx` packets get wrapped as `FrameSendPacket`
   to the right DERP. `FrameRecvPacket` payloads get fed to
   `wg_engine.handle_inbound(src_pubkey, wg_bytes)`.
 - Per-region connection pool: open a second DERP connection if a peer's
-  `HomeDERP` differs from ours (lazy).
+  `HomeDERP` differs from ours (lazy + LRU eviction at cap).
 - Handle `FramePing` → `FramePong`. Handle `FramePeerGone` →
   log + clear cached state.
 - `FrameRestarting` → schedule reconnect after `ReconnectIn` ms.
@@ -676,10 +723,19 @@ ICMP. `wg_engine` logs `wg.handshake.complete` with the peer's pubkey,
 Vita; `tailscale status` shows the Vita as `online`.
 
 **Tasks.**
-- Wire smoltcp's ICMP socket to respond to inbound pings. (The
-  `socket-icmp` feature is already enabled.)
+- Wire smoltcp's ICMP socket to respond to inbound pings. Bind
+  `IcmpEndpoint::Ident(0)` and drive replies manually via `recv_slice`
+  + `send_slice` from the `app` thread *after* `iface.poll`. smoltcp
+  does **not** auto-reply — verify in code that `Ident(0)` matches all
+  idents in smoltcp 0.12; **fallback path** if not: intercept echoes
+  directly in `WgDevice::receive` and synthesize replies into `tx_q`
+  (~50 LOC; bypasses smoltcp ICMP entirely).
+- Add `OnlineState` lifecycle: `Online` after first MapResponse + first
+  DERP `derp.rx`; `Degraded` after 60 s without either; `Offline` after
+  5 consecutive control or DERP reconnects. Logged once per transition;
+  10 min Offline → full diag dump at WARN.
 - Tighten timeouts and reconnect logic across all crates.
-- Document the on-Vita demo recipe.
+- Document the on-Vita demo recipe (`docs/HARDWARE-DEMO.md`).
 
 **Success.** `ping 100.x.y.z` from a peer Linux box shows replies under
 500 ms (DERP-relayed; this is normal). `tailscale status` shows the Vita
@@ -734,6 +790,11 @@ plan just shows where the time goes.
 | Disk fills with `log.txt` | Low | Daily rotate-on-size; keep last 3 files. |
 | Persisted node key gets corrupted (Vita unsafe-shutdown) | Low | Atomic write via tmp+rename pattern. Crash recovery: regenerate keys + re-register. |
 | `flate2` `rust_backend` can't decode Headscale's gzip | Low | It's the standard pure-Rust impl. If broken, swap to zstd by negotiating `Compress: "zstd"` (requires the `zstd` crate, which we'd need to verify cross-compiles). |
+| `crypto_box 0.9` (XSalsa20-Poly1305) doesn't cross-compile for Vita | Medium | 1-day spike at head of M8. Fallback: hand-rolled `xsalsa20poly1305 0.10` + `salsa20 0.10`. |
+| smoltcp 0.12 `IcmpEndpoint::Ident(0)` doesn't match all idents | Low | Verify in M9; if bind doesn't behave, intercept echoes directly in `WgDevice::receive` (~50 LOC). |
+| `WgDevice::receive`/`transmit` deadlocks against `wg_engine` holding the same `Arc<Mutex<VecDeque>>` | Medium | **try_lock semantics** on all `WgDevice` queue access; on contention, return `None` (smoltcp polls again next tick). |
+| Vita pthread default stack (64 KiB) too small for smoltcp poll + listener pool | Low | Spawn `app`/`wg_engine` and other working threads with 256 KiB stacks via `Builder::stack_size`. |
+| Headscale 0.26 sends bare-hex auth keys; Tailscale prod sends `tskey-auth-...`; v1 supports both | Low | Pass user input verbatim; never strip prefix. Trim whitespace once at config-load only. |
 
 ## Open questions / decisions deferred
 
