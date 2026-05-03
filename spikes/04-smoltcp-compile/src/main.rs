@@ -18,6 +18,12 @@ use smoltcp::socket::udp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpCidr, Ipv4Address, Ipv4Cidr};
 
+mod logger;
+
+macro_rules! log {
+    ($($arg:tt)*) => { logger::log_line(&format!($($arg)*)) };
+}
+
 #[derive(Clone, Default)]
 struct InMemoryDevice {
     rx: Arc<Mutex<VecDeque<Vec<u8>>>>,
@@ -87,7 +93,8 @@ impl Device for InMemoryDevice {
 }
 
 fn main() {
-    println!("smoltcp-compile spike: starting");
+    logger::init("ux0:/data/spike-4.log");
+    log!("smoltcp-compile spike: starting");
 
     let mut device = InMemoryDevice::new(1280);
     let config = Config::new(smoltcp::wire::HardwareAddress::Ip);
@@ -112,27 +119,24 @@ fn main() {
     let udp_socket = udp::Socket::new(udp_rx_buffer, udp_tx_buffer);
     let udp_handle = sockets.add(udp_socket);
 
-    // Bind UDP socket
     {
         let socket = sockets.get_mut::<udp::Socket>(udp_handle);
         socket.bind(9999).unwrap();
-        println!("smoltcp UDP socket bound to :9999");
+        log!("smoltcp UDP socket bound to :9999");
     }
 
-    // Drive the stack once with no traffic — just confirm poll() works.
     iface.poll(Instant::now(), &mut device, &mut sockets);
 
     let drained = device.drain_tx();
-    println!(
+    log!(
         "smoltcp init OK: stack polled, {} tx packets queued",
         drained.len()
     );
 
-    // Inject one bogus rx packet to confirm receive token plumbing.
     device.inject_rx(vec![0x45, 0x00, 0x00, 0x14]);
     iface.poll(Instant::now(), &mut device, &mut sockets);
-    println!("smoltcp poll after rx inject: OK (packet was malformed; expected drop)");
+    log!("smoltcp poll after rx inject: OK (packet was malformed; expected drop)");
 
-    println!("smoltcp-compile spike: done; sleeping 5s");
+    log!("smoltcp-compile spike: done; sleeping 5s");
     thread::sleep(Duration::from_secs(5));
 }

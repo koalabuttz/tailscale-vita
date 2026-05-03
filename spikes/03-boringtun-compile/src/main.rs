@@ -19,16 +19,23 @@ use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519;
 use rand_core::OsRng;
 
+mod logger;
+
+macro_rules! log {
+    ($($arg:tt)*) => { logger::log_line(&format!($($arg)*)) };
+}
+
 fn main() {
-    println!("boringtun-compile spike: starting");
+    logger::init("ux0:/data/spike-3.log");
+    log!("boringtun-compile spike: starting");
 
     let server_secret = x25519::StaticSecret::random_from_rng(OsRng);
     let server_public = x25519::PublicKey::from(&server_secret);
     let client_secret = x25519::StaticSecret::random_from_rng(OsRng);
     let client_public = x25519::PublicKey::from(&client_secret);
 
-    println!("server pub: {:02x?}", server_public.as_bytes());
-    println!("client pub: {:02x?}", client_public.as_bytes());
+    log!("server pub: {:02x?}", server_public.as_bytes());
+    log!("client pub: {:02x?}", client_public.as_bytes());
 
     let mut tun = Tunn::new(
         client_secret,
@@ -43,13 +50,13 @@ fn main() {
     let result = tun.encapsulate(&[], &mut dst);
     match result {
         TunnResult::WriteToNetwork(handshake) => {
-            println!(
+            log!(
                 "boringtun init OK: produced handshake init of {} bytes",
                 handshake.len()
             );
         }
         other => {
-            println!("unexpected encapsulate result: {other:?}");
+            log!("unexpected encapsulate result: {other:?}");
         }
     }
 
@@ -62,8 +69,8 @@ fn main() {
         }
     });
     h.join().unwrap();
-    println!("parking_lot Mutex roundtrip: {}", *counter.lock());
+    log!("parking_lot Mutex roundtrip: {}", *counter.lock());
 
-    println!("boringtun-compile spike: done; sleeping 5s");
+    log!("boringtun-compile spike: done; sleeping 5s");
     thread::sleep(Duration::from_secs(5));
 }

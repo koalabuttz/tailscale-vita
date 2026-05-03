@@ -1,39 +1,44 @@
 # Phase 0 Results — De-risk
 
-Date: 2026-05-02
+Date: 2026-05-02 (build-time spikes); 2026-05-03 (hardware verification)
 Branch: `claude/vita-tailscale-research-yeOGU`
-Test environment: headless Linux container; no Vita3K, no hardware.
-Final hardware/Vita3K verification deferred to the user.
+Build environment: ChromeOS Crostini Linux VM.
+Hardware verification: **complete** on the user's HENkaku Ensō Vita on 2026-05-03 (see "Hardware results" section below).
 
 ## Decision Matrix
 
 | Spike | Build | Runtime | Notes |
 |---|---|---|---|
 | 0 — Toolchain | **PASS** | n/a | Rust nightly 1.97 + `armv7-sony-vita-newlibeabihf` Tier-3 target via `-Z build-std`; VitaSDK 2.539 (gcc 15.2.0); cargo-vita 0.2.2. |
-| 1 — Rust hello-world VPK | **PASS** | DEFERRED | 234 KB VPK, std-using `fn main()` builds clean through cargo-vita's pipeline. Run in Vita3K to verify boot. |
-| 2 — UDP echo | **PASS** | DEFERRED | 250 KB VPK using `std::net::UdpSocket`. Server-address baked at build time via `env!`. Host-side echo helper at `spikes/02-udp-echo/host/echo.py`. |
-| 3 — boringtun compile | **PASS (with patches)** | DEFERRED | 322 KB VPK. Required vendoring boringtun 0.7.1 and applying two small patches (~12 lines) — see `spikes/03-boringtun-compile/PATCHES.md`. ring 0.17.14 builds clean against `vita-rust/ring`'s `v0.17.14-vita` branch. parking_lot, x25519-dalek, chacha20poly1305 all clean. |
-| 4 — smoltcp compile | **PASS** | DEFERRED | 262 KB VPK. smoltcp 0.12 + custom `phy::Device` impl builds with no patches. Confirmed `Interface::new` + `SocketSet` + `udp::Socket` API surface. |
-| Optional — Headscale | **STAGED** | DEFERRED | docker-compose.yml + config staged in `infra/headscale/`. Not booted here (no docker daemon in the build env); 5-line `docker compose up` runbook in the README. |
+| 1 — Rust hello-world VPK | **PASS** | **PASS (hw)** | 243 KB VPK, std-using `fn main()` builds clean and runs end-to-end on hardware. |
+| 2 — UDP echo | **PASS** | **PASS (hw)** | 258 KB VPK using `std::net::UdpSocket`. Server-address baked at build time via `env!`. Host-side echo helper at `spikes/02-udp-echo/host/echo.py`. 5/5 echo round-trips confirmed on hardware. |
+| 3 — boringtun compile | **PASS (with patches)** | **PASS (hw)** | 334 KB VPK. Required vendoring boringtun 0.7.1 and applying two small patches (~12 lines) — see `spikes/03-boringtun-compile/PATCHES.md`. ring 0.17.14 builds clean against `vita-rust/ring`'s `v0.17.14-vita` branch. Hardware: 148-byte handshake init produced; parking_lot Mutex roundtrip 100/100. |
+| 4 — smoltcp compile | **PASS** | **PASS (hw)** | 272 KB VPK. smoltcp 0.12 + custom `phy::Device` impl builds with no patches. Hardware: `Interface::poll` succeeds; malformed-packet drop path exercised. |
+| Optional — Headscale | **STAGED** | DEFERRED | docker-compose.yml + config staged in `infra/headscale/`. Not booted yet; 5-line `docker compose up` runbook in the README. |
 
 ## Verdict: GREEN — proceed to Phase 1
 
 Every architectural assumption from `RESEARCH.md` survived contact with
-reality:
+reality, **at both build time and runtime on real hardware**:
 
 1. **Rust toolchain works on Vita.** Tier-3 upstream target +
    `-Z build-std` + cargo-vita is a smooth pipeline. ~32 s clean rebuild
    (mostly std).
-2. **`std::net::UdpSocket` is available.** No need for `vitasdk-sys`
-   `sceNet*` FFI for the UDP transport; a stock std-using crate is
-   enough. (Vita3K verification still required.)
-3. **BoringTun cross-compiles** with two trivial patches. Notably, the
-   modern `parking_lot` and `std::sync::Arc`/`Mutex` work on Vita's
+2. **`std::net::UdpSocket` is available and works on hardware.** No need
+   for `vitasdk-sys` `sceNet*` FFI for the UDP transport; a stock
+   std-using crate is enough. 5/5 echo round-trips confirmed Vita ↔ host.
+3. **BoringTun cross-compiles and runs.** Two trivial patches at compile
+   time (the `nix` dep). Runtime: produced a canonical 148-byte WireGuard
+   handshake init; X25519 keygen and `parking_lot` work over Vita's
    newlib+pthread shims with no fork.
-4. **smoltcp + custom Device trait is straightforward.** No patches.
-   API exactly matches what's needed for the Phase 2 BoringTun integration.
+4. **smoltcp + custom Device trait is straightforward.** No patches at
+   compile or run time. `Interface::poll` succeeds and the
+   malformed-packet drop path is exercised.
 5. **`vita-rust/ring v0.17.14-vita` already exists upstream**, removing
    the largest implementation risk we'd worried about.
+6. **`std::fs` works with `ux0:/...` paths** on hardware (bonus
+   confirmation from the spike file-logger). Useful for Phase 3+
+   key/state persistence.
 
 ## Detected risks (none of these block Phase 1)
 
@@ -44,27 +49,41 @@ reality:
 | Headscale wire-format compatibility may drift | Low | Pin Headscale to a known release in `infra/headscale/docker-compose.yml`; treat Tailscale's prod control plane as best-effort. |
 | `cargo vita`'s default `panic = "unwind"` and `build_std = "std,panic_unwind"` increase binary size | Low | ~250-320 KB binaries are fine for Vita's RAM budget. Optimize with `panic = "abort"` + `build_std = "std,panic_abort"` later if needed. |
 
-## Hardware re-verification checklist (when the Vita is available)
+## Hardware re-verification — DONE 2026-05-03
 
-Required before Phase 1 sign-off:
+- [x] Spike 1: `hello-vita.vpk` ran end-to-end. Output captured to
+  `ux0:/data/spike-1.log`: `hello from tailscale-vita spike 1` →
+  `tick 0..2` → `goodbye`.
+- [x] Spike 2: `udp-echo-vita.vpk` (rebuilt with the Chromebook's wlan0
+  IP as `ECHO_SERVER`) sent and received all 5 echoes against
+  `host/echo.py` running in this Crostini VM, with ChromeOS port
+  forwarding `wlan0:9999/udp → vm:9999/udp`. `ux0:/data/spike-2.log`
+  contains the full 5×(send/recv) trace.
+- [x] Spike 3 (boringtun): printed `boringtun init OK: produced
+  handshake init of 148 bytes` (canonical WireGuard handshake init
+  size, correct) and `parking_lot Mutex roundtrip: 100`. Both X25519
+  pubkeys logged.
+- [x] Spike 4 (smoltcp): printed `smoltcp init OK: stack polled,
+  0 tx packets queued`, then `smoltcp poll after rx inject: OK
+  (packet was malformed; expected drop)`.
 
-- [ ] Spike 1: `hello-vita.vpk` boots, prints to PrincessLog, exits clean.
-- [ ] Spike 2: `udp-echo-vita.vpk` rebuilt with the dev workstation's
-  LAN IP as `ECHO_SERVER`; sends and receives 5 echo round-trips against
-  `host/echo.py`.
-- [ ] Spike 3 (boringtun): `boringtun-compile-spike.vpk` boots and
-  prints `boringtun init OK: produced handshake init of 148 bytes` plus
-  the `parking_lot` Mutex roundtrip count.
-- [ ] Spike 4 (smoltcp): `smoltcp-compile-spike.vpk` boots and prints
-  `smoltcp init OK: stack polled, ...`.
+### Output capture mechanism
 
-Tip: install `PrincessLog` on the Vita first so stdout is visible
-without serial-cable acrobatics. cargo-vita has built-in `cargo vita
-logs` support that pairs with PrincessLog over LAN.
+PrincessLog isn't installed on the user's Vita yet. To get visibility
+without it, each spike was extended with a tiny
+`logger.rs` (~25 LOC) that mirrors all output to
+`ux0:/data/spike-N.log` via `std::fs::OpenOptions` and installs a
+panic hook that writes panics to the same file. Logs were FTP-pulled
+back to the host via vitacompanion (port 1337) for inspection.
+
+This pattern (file-logger + FTP pull) is good enough for Phase-0/1 work
+but we should install PrincessLog before Phase 2 — `cargo vita logs`
+gives a real-time stream over UDP 8888 and is a much faster iteration
+loop.
 
 ## Deltas vs. RESEARCH.md
 
-The research doc is broadly correct but two sentences should be
+The research doc is broadly correct but a few sentences should be
 amended:
 
 1. "smoltcp is `no_std`-friendly" — true, **but** for `Instant::now()`
@@ -73,8 +92,13 @@ amended:
    we're not using the C-FFI path. Phase 5 will call BoringTun's Rust API
    directly from a Rust crate, then expose *our* C ABI to the
    plugin shim. Cleaner and avoids one layer of indirection.
+3. RESEARCH.md presumed PrincessLog would be the runtime log path. In
+   practice the file-logger + FTP-pull pattern (above) was set up first
+   because PrincessLog wasn't yet installed and the user wanted to
+   verify quickly. Both options remain valid; for Phase 2+ we should
+   install PrincessLog for real-time iteration.
 
-Both are documentation tweaks, not architectural changes.
+All documentation tweaks, not architectural changes.
 
 ## Repo layout after Phase 0
 
