@@ -18,7 +18,9 @@ pub enum ControlError {
     Url(&'static str),
     #[error("httparse: {0}")]
     HttpParse(String),
-    // M5/M6/M7 variants land later.
+    #[error("auth rejected; AuthURL={auth_url}")]
+    AuthRejected { auth_url: String },
+    // M7+ variants land later.
 }
 
 impl From<ureq::Error> for ControlError {

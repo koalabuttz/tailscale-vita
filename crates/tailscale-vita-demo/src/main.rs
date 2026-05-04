@@ -1,15 +1,15 @@
 use std::io::Read;
 use std::net::TcpStream;
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use http::Method;
-use tracing::{error, info, info_span, warn};
+use tracing::{error, info, info_span};
 
 use ts_control::async_io::AsyncNoiseStream;
 use ts_control::http2::Http2Conn;
 use ts_control::record::NoiseStream;
-use ts_control::{generate_machine_keypair, ControlError};
+use ts_control::{ControlError, KeyStore};
 
 const HEADSCALE_URL: &str = "http://192.168.8.147:8080";
 const HEADSCALE_HOST: &str = "192.168.8.147:8080";
@@ -23,7 +23,7 @@ fn main() {
     }
     let _span = info_span!(
         "startup",
-        milestone = "M5",
+        milestone = "M6",
         build = env!("BUILD_TIMESTAMP"),
         build_unix = env!("BUILD_UNIX"),
     )
@@ -31,22 +31,25 @@ fn main() {
     info!(build = env!("BUILD_TIMESTAMP"), "binary build timestamp");
 
     if let Err(e) = run() {
-        error!(error = %e, "M5 demo failed");
+        error!(error = %e, "M6 demo failed");
     }
     vita_log::flush();
     thread::sleep(Duration::from_secs(1));
 }
+
+const STATE_DIR: &str = "ux0:/data/tailscale-vita";
+const AUTH_KEY_FILE: &str = "auth-key.txt";
 
 fn run() -> Result<(), ControlError> {
     info!(headscale = HEADSCALE_URL, capver = CAPVER, "fetching Noise pubkey");
     let server_pub = ts_control::fetch_server_key(HEADSCALE_URL, CAPVER)?;
     info!(pub = %server_pub, "control.key.received");
 
-    let (my_priv, my_pub) = generate_machine_keypair()?;
-    info!(my_pub = %my_pub, "control.key.local.generated");
+    let state_dir = Path::new(STATE_DIR);
+    let ks = KeyStore::load_or_generate(state_dir)?;
 
     info!("starting Noise IK handshake");
-    let mut hs = ts_control::NoiseHandshaker::new(&my_priv, &server_pub)?;
+    let mut hs = ts_control::NoiseHandshaker::new(&ks.machine_priv, &server_pub)?;
     let header_b64 = hs.build_init_header()?;
     info!(b64_len = header_b64.len(), "control.noise.init.built");
 
@@ -72,26 +75,26 @@ fn run() -> Result<(), ControlError> {
     let mut conn = Http2Conn::open(async_stream)?;
     info!("control.http2.handshake.complete");
 
-    info!("issuing POST /machine/whoami (expecting 501 from Headscale 0.26)");
-    match conn.request(
-        Method::POST,
-        "/machine/whoami",
-        b"{}",
-        &[("content-type", "application/json")],
-        HEADSCALE_HOST,
-    ) {
-        Ok(resp) => {
-            info!(
-                status = resp.status,
-                body_len = resp.body.len(),
-                first_header = ?resp.headers.first(),
-                "control.http2.response"
-            );
-        }
-        Err(e) => warn!(error = %e, "request failed"),
-    }
+    let auth_key_path = state_dir.join(AUTH_KEY_FILE);
+    let auth_key_raw = std::fs::read_to_string(&auth_key_path).map_err(|e| {
+        ControlError::Transport(format!(
+            "auth-key read failed at {}: {e}",
+            auth_key_path.display()
+        ))
+    })?;
+    let auth_key = auth_key_raw.trim();
+    info!(
+        path = %auth_key_path.display(),
+        len = auth_key.len(),
+        "control.auth_key.loaded"
+    );
 
-    info!("M5 demo done");
+    let outcome = ts_control::register(&mut conn, auth_key, &ks.node_pub, "vita", HEADSCALE_HOST)?;
+    info!(
+        machine_authorized = outcome.machine_authorized,
+        node_key_expired = outcome.node_key_expired,
+        "M6 demo done"
+    );
     drop(conn);
     Ok(())
 }

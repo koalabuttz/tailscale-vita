@@ -22,3 +22,7 @@ tokio       = { workspace = true }
 bytes       = { workspace = true }
 http        = "1"
 crossbeam-channel = { workspace = true }
+# M6: persistent keys (machine, node, disco) + RFC3339 timestamps for register
+x25519-dalek = { workspace = true }
+rand_core    = { workspace = true }
+time         = { workspace = true }
