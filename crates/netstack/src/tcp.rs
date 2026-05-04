@@ -11,10 +11,9 @@ use smoltcp::wire::IpEndpoint;
 use tracing::{debug, trace};
 
 use crate::buf::{make_tcp_buffers, DEFAULT_TCP_RX_BUF, DEFAULT_TCP_TX_BUF};
-use crate::error::NetstackError;
 use crate::handle::HandleSlot;
-use crate::Stack;
 use crate::poll::poke;
+use crate::{Stack, StackInner};
 
 /// Atomic counter for ephemeral local-port allocation. Starts at 49152
 /// (the IANA-recommended ephemeral floor) and wraps to 49152 at 65535.
@@ -33,7 +32,7 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_RW_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct TcpStream {
-    stack: Arc<Stack>,
+    inner: Arc<StackInner>,
     handle: SocketHandle,
     slot: Arc<HandleSlot>,
     peer: SocketAddr,
@@ -43,22 +42,18 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    /// Blocking connect to `addr`. Honors `connect_timeout` (default 10 s).
-    pub fn connect<A: Into<SocketAddr>>(
-        stack: &Arc<Stack>,
-        addr: A,
-    ) -> io::Result<TcpStream> {
+    pub fn connect<A: Into<SocketAddr>>(stack: &Stack, addr: A) -> io::Result<TcpStream> {
+        let inner = stack.inner();
         let peer: SocketAddr = addr.into();
         let local_port = alloc_local_port();
 
         let (rx_buf, tx_buf) = make_tcp_buffers(DEFAULT_TCP_RX_BUF, DEFAULT_TCP_TX_BUF);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
-        // Set a large enough timeout so smoltcp doesn't reset us prematurely.
         socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(60)));
 
         let handle = {
-            let mut iface = stack.iface.lock();
-            let mut sockets = stack.sockets.lock();
+            let mut iface = inner.iface.lock();
+            let mut sockets = inner.sockets.lock();
             let h = sockets.add(socket);
             let s = sockets.get_mut::<tcp::Socket>(h);
             let remote = ip_endpoint(peer)?;
@@ -67,16 +62,15 @@ impl TcpStream {
             h
         };
 
-        let slot = stack.handles.register(handle);
-        poke(&stack.wake);
+        let slot = inner.handles.register(handle);
+        poke(&inner.wake);
 
         debug!(remote = %peer, local_port, ?handle, "tcp.connect");
 
         let deadline = Instant::now() + DEFAULT_CONNECT_TIMEOUT;
         loop {
-            // Check current state.
             let (established, closed) = {
-                let mut sockets = stack.sockets.lock();
+                let mut sockets = inner.sockets.lock();
                 let s = sockets.get_mut::<tcp::Socket>(handle);
                 let est = matches!(s.state(), tcp::State::Established);
                 let closed = matches!(s.state(), tcp::State::Closed | tcp::State::TimeWait);
@@ -85,7 +79,7 @@ impl TcpStream {
             if established {
                 debug!(remote = %peer, ?handle, "tcp.connect.established");
                 return Ok(TcpStream {
-                    stack: Arc::clone(stack),
+                    inner,
                     handle,
                     slot,
                     peer,
@@ -95,19 +89,18 @@ impl TcpStream {
                 });
             }
             if closed {
-                stack.handles.unregister(handle);
-                stack.sockets.lock().remove(handle);
+                inner.handles.unregister(handle);
+                inner.sockets.lock().remove(handle);
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     "smoltcp socket closed during connect",
                 ));
             }
             if Instant::now() >= deadline {
-                stack.handles.unregister(handle);
-                stack.sockets.lock().remove(handle);
+                inner.handles.unregister(handle);
+                inner.sockets.lock().remove(handle);
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out"));
             }
-            // Park briefly waiting for state change.
             slot.wait_until(deadline.min(Instant::now() + Duration::from_millis(200)), |ev| {
                 ev.became_established || ev.closed
             });
@@ -124,7 +117,7 @@ impl TcpStream {
         };
         loop {
             let (n_or_state, did_eof) = {
-                let mut sockets = self.stack.sockets.lock();
+                let mut sockets = self.inner.sockets.lock();
                 let s = sockets.get_mut::<tcp::Socket>(self.handle);
                 if s.recv_queue() > 0 {
                     let n = s
@@ -167,7 +160,7 @@ impl TcpStream {
         };
         loop {
             let (n_or_state, broken) = {
-                let mut sockets = self.stack.sockets.lock();
+                let mut sockets = self.inner.sockets.lock();
                 let s = sockets.get_mut::<tcp::Socket>(self.handle);
                 if !s.may_send() {
                     (Some(0), true)
@@ -180,7 +173,7 @@ impl TcpStream {
                     (None, false)
                 }
             };
-            poke(&self.stack.wake);
+            poke(&self.inner.wake);
             if let Some(n) = n_or_state {
                 if broken {
                     self.closed = true;
@@ -203,16 +196,16 @@ impl TcpStream {
 
     pub fn flush(&mut self) -> io::Result<()> {
         // smoltcp transmits on poll; nothing more to do beyond poking.
-        poke(&self.stack.wake);
+        poke(&self.inner.wake);
         Ok(())
     }
 
     pub fn shutdown(&mut self, _how: std::net::Shutdown) -> io::Result<()> {
-        let mut sockets = self.stack.sockets.lock();
+        let mut sockets = self.inner.sockets.lock();
         let s = sockets.get_mut::<tcp::Socket>(self.handle);
         s.close();
         drop(sockets);
-        poke(&self.stack.wake);
+        poke(&self.inner.wake);
         self.closed = true;
         Ok(())
     }
@@ -237,9 +230,9 @@ impl Drop for TcpStream {
         if !self.closed {
             let _ = self.shutdown(std::net::Shutdown::Both);
         }
-        self.stack.handles.unregister(self.handle);
+        self.inner.handles.unregister(self.handle);
         // Remove from SocketSet.
-        let mut sockets = self.stack.sockets.lock();
+        let mut sockets = self.inner.sockets.lock();
         let _ = sockets.remove(self.handle);
     }
 }

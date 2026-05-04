@@ -9,6 +9,7 @@ publish.workspace = true
 vita-log     = { path = "../vita-log" }
 wg-engine    = { path = "../wg-engine" }
 netstack     = { path = "../netstack" }
+ts-control   = { path = "../ts-control" }
 smoltcp      = { workspace = true }
 x25519-dalek = { workspace = true }
 parking_lot  = { workspace = true }

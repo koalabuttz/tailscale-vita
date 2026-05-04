@@ -4,6 +4,7 @@ members = [
     "crates/vita-log",
     "crates/wg-engine",
     "crates/netstack",
+    "crates/ts-control",
     "crates/tailscale-vita-demo",
 ]
 # Phase-0 spikes are standalone crates with their own [patch.crates-io] and
@@ -47,7 +48,7 @@ snow = { version = "0.10", default-features = false, features = [
 rustls           = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1"
 webpki-roots     = "1"
-ureq             = { version = "3",  default-features = false, features = ["rustls", "tls-rustls-webpki-roots", "json", "gzip"] }
+ureq             = { version = "3",  default-features = false, features = ["rustls", "json"] }
 httparse         = { version = "1",  default-features = false, features = ["std"] }
 
 # --- HTTP/2 inside Noise (M5; Plan A primary, see crates/ts-control/M5a-DECISION.md) ---
