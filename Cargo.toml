@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/vita-log",
     "crates/wg-engine",
+    "crates/netstack",
     "crates/tailscale-vita-demo",
 ]
 # Phase-0 spikes are standalone crates with their own [patch.crates-io] and

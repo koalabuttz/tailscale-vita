@@ -1,0 +1,13 @@
+[package]
+name = "netstack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+smoltcp           = { workspace = true }
+parking_lot       = { workspace = true }
+tracing           = { workspace = true }
+thiserror         = { workspace = true }
+wg-engine         = { path = "../wg-engine" }
