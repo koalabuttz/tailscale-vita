@@ -6,8 +6,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-vita-log = { path = "../vita-log" }
-tracing  = { workspace = true }
+vita-log     = { path = "../vita-log" }
+wg-engine    = { path = "../wg-engine" }
+x25519-dalek = { workspace = true }
+parking_lot  = { workspace = true }
+tracing      = { workspace = true }
 
 [package.metadata.vita]
 title_id   = "TVIT00010"
