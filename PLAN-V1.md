@@ -243,6 +243,28 @@ ring = { git = "https://github.com/vita-rust/ring", branch = "v0.17.14-vita" }
 Persist as the server's Noise static; on subsequent runs, refuse to
 proceed if the server returns a different key (loud warning, fail).
 
+### TS2021 protocol gotchas (caught during M5 hardware bringup)
+
+Four non-obvious wire details — each fails silently or with a misleading
+server error if wrong. M6+ work depends on getting these right; they're
+already correct in the M5 commit (`8caa23f`) but worth keeping front-of-mind.
+
+1. **Wire envelope's `protocolVersion` IS the `CapabilityVersion`.** One
+   field, two names. `tailcfg.CapabilityVersion(protocolVersion)` is what
+   Headscale checks. Use 90 for Headscale 0.26 (floor 88).
+2. **Prologue version is base-10 ASCII**, not BE u16. Per Tailscale's
+   `controlbase/handshake.go::protocolVersionPrologue`:
+   `"Tailscale Control Protocol v" + strconv.AppendUint(version, 10)`.
+   For version 90 the bytes are `b"Tailscale Control Protocol v90"`.
+3. **Transport ChaCha20-Poly1305 nonces are big-endian**, not little.
+   Tailscale deviates from the Noise spec here. Symptom: AEAD succeeds at
+   nonce=0 (zero either way), fails at nonce=1+. Fixed via a custom snow
+   `CryptoResolver` in `crates/ts-control/src/noise.rs::be_nonce_chachapoly`.
+4. **EarlyPayload prefix before HTTP/2** for protocolVersion ≥ 49:
+   5 B magic `\xff\xff\xffTS` + u32_be JSON length + JSON
+   (`tailcfg.EarlyNoise`), inside the encrypted Noise transport. Consume
+   it before passing the stream to `h2::client::handshake`.
+
 ### TS2021 control protocol — Noise IK tunnel + HTTP/2
 
 Open `POST /ts2021` with:
