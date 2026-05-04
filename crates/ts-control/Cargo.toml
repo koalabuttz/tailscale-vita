@@ -13,3 +13,12 @@ base64      = { workspace = true }
 tracing     = { workspace = true }
 thiserror   = { workspace = true }
 parking_lot = { workspace = true }
+# M5: Noise IK + HTTP/2 over the Noise tunnel
+snow        = { workspace = true }
+chacha20poly1305 = { workspace = true }
+httparse    = { workspace = true }
+h2          = { workspace = true }
+tokio       = { workspace = true }
+bytes       = { workspace = true }
+http        = "1"
+crossbeam-channel = { workspace = true }

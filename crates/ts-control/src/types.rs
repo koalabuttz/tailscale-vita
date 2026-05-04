@@ -1,5 +1,28 @@
 use crate::ControlError;
 
+/// Generate a fresh `(MachinePrivate, MachinePublic)` pair using snow's
+/// default-resolver RNG. Suitable for ephemeral M5 demos; the real
+/// `KeyStore` (M6) persists these keys to disk so they survive restart.
+pub fn generate_machine_keypair() -> Result<(MachinePrivate, MachinePublic), ControlError> {
+    use snow::Builder;
+    let pattern = "Noise_IK_25519_ChaChaPoly_BLAKE2s"
+        .parse()
+        .expect("static pattern parses");
+    let kp = Builder::new(pattern)
+        .generate_keypair()
+        .map_err(|e| ControlError::Transport(format!("snow keygen: {e}")))?;
+    if kp.private.len() != 32 || kp.public.len() != 32 {
+        return Err(ControlError::Transport(
+            "snow returned non-32-byte keypair".into(),
+        ));
+    }
+    let mut priv_bytes = [0u8; 32];
+    priv_bytes.copy_from_slice(&kp.private);
+    let mut pub_bytes = [0u8; 32];
+    pub_bytes.copy_from_slice(&kp.public);
+    Ok((MachinePrivate(priv_bytes), MachinePublic(pub_bytes)))
+}
+
 pub const MKEY_PREFIX: &str = "mkey:";
 pub const NODEKEY_PREFIX: &str = "nodekey:";
 pub const DISCOKEY_PREFIX: &str = "discokey:";

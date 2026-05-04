@@ -16,11 +16,19 @@ pub enum ControlError {
     ServerKeyChanged,
     #[error("url: {0}")]
     Url(&'static str),
+    #[error("httparse: {0}")]
+    HttpParse(String),
     // M5/M6/M7 variants land later.
 }
 
 impl From<ureq::Error> for ControlError {
     fn from(e: ureq::Error) -> Self {
         ControlError::Transport(e.to_string())
+    }
+}
+
+impl From<httparse::Error> for ControlError {
+    fn from(e: httparse::Error) -> Self {
+        ControlError::HttpParse(e.to_string())
     }
 }

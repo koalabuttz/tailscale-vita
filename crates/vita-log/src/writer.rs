@@ -84,16 +84,22 @@ struct WriterState {
 
 impl WriterState {
     fn open(path: PathBuf, cfg: LogConfig) -> Self {
+        // Truncate on init: each run gets a fresh log. M1's accumulating-
+        // append behavior was unhelpful in practice — by M5 a single
+        // diagnostic session interleaves 5+ runs and you lose track of
+        // which line is from which. Rotate-on-size still applies within
+        // a run.
         let file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(&path)
             .unwrap_or_else(|e| {
                 eprintln!("vita-log: cannot open {}: {}", path.display(), e);
                 File::create(std::env::temp_dir().join("vita-log-fallback.txt"))
                     .expect("vita-log fallback file create failed")
             });
-        let bytes_written = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let bytes_written = 0u64;
         Self {
             path,
             cfg,
