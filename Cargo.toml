@@ -8,6 +8,7 @@ members = [
     "crates/ts-derp",
     "crates/tailscale-vita",
     "crates/tailscale-vita-demo",
+    "crates/tailscale-vita-rt",
 ]
 # Phase-0 spikes are standalone crates with their own [patch.crates-io] and
 # build profiles. Keep them out of the workspace so they remain reproducible
@@ -96,6 +97,16 @@ unsafe_op_in_unsafe_fn = "deny"
 panic     = "unwind"
 lto       = true
 opt-level = 2
+
+# `staticlib` profile is used by the *.suprx Rust shim (crates/tailscale-vita-rt).
+# `panic = "abort"` is required because the shim is no_std and the workspace's
+# default `panic = "unwind"` pulls in the eh_personality lang-item which std
+# normally provides. Different artifact dir from `release/` so it never
+# co-builds with the demo eboot.
+[profile.staticlib]
+inherits  = "release"
+panic     = "abort"
+opt-level = "z"
 
 [patch.crates-io]
 ring = { git = "https://github.com/vita-rust/ring", branch = "v0.17.14-vita" }

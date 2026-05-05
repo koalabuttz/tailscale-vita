@@ -1,0 +1,15 @@
+[package]
+name = "tailscale-vita-rt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Phase 1B: minimal no_std staticlib invoked from the *.suprx C shim.
+# We keep this no_std until Phase 1C wires up taipool as the global
+# allocator. Until then, no String/Vec/format_args!/Box.
+[lib]
+name        = "tailscale_vita_rt"
+crate-type  = ["staticlib"]
+
+[dependencies]
