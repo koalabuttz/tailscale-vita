@@ -42,16 +42,28 @@ pub use smoltcp::wire::Ipv4Cidr as Ipv4CidrRe;
 use crate::device::WgDevice;
 use crate::handle::HandleRegistry;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct StackConfig {
-    pub local_ip: Ipv4Cidr,
+    /// `None` = no IPs set at construction; smoltcp will drop all
+    /// inbound packets until `Stack::set_local_addrs` is called. M9's
+    /// demo uses this — our tailnet IP only arrives in the first
+    /// `MapResponse`, so the netstack starts empty and gets populated
+    /// after register+map.
+    pub local_ip: Option<Ipv4Cidr>,
     pub mtu: usize,
 }
 
 impl StackConfig {
-    pub fn new(local_ip: Ipv4Cidr) -> Self {
+    pub fn new() -> Self {
         Self {
-            local_ip,
+            local_ip: None,
+            mtu: 1280,
+        }
+    }
+
+    pub fn with_local_ip(local_ip: Ipv4Cidr) -> Self {
+        Self {
+            local_ip: Some(local_ip),
             mtu: 1280,
         }
     }
@@ -92,9 +104,11 @@ impl Stack {
 
         let config = Config::new(HardwareAddress::Ip);
         let mut iface = Interface::new(config, &mut device, SmolInstant::from(StdInstant::now()));
-        iface.update_ip_addrs(|store| {
-            let _ = store.push(IpCidr::Ipv4(cfg.local_ip));
-        });
+        if let Some(local_ip) = cfg.local_ip {
+            iface.update_ip_addrs(|store| {
+                let _ = store.push(IpCidr::Ipv4(local_ip));
+            });
+        }
 
         let inner = Arc::new(StackInner {
             iface: Mutex::new(iface),
@@ -111,7 +125,7 @@ impl Stack {
             .spawn(move || poll::run(inner_for_thread, device))
             .map_err(NetstackError::Io)?;
 
-        info!(local_ip = %cfg.local_ip, "netstack started");
+        info!(local_ip = ?cfg.local_ip, "netstack started");
 
         Ok(Stack {
             inner,
@@ -123,6 +137,31 @@ impl Stack {
     /// Internal handle to the shared state. Cloned into per-socket types.
     pub(crate) fn inner(&self) -> Arc<StackInner> {
         Arc::clone(&self.inner)
+    }
+
+    /// Replace the iface's IPv4 address list. Called by the demo from
+    /// each `MapResponse.Node.Addresses` (M7 surfaces this as
+    /// `NetMapSnapshot.our_addrs`).
+    ///
+    /// Why M9 needs this: smoltcp's `iface.poll` only **accepts**
+    /// inbound packets whose destination address is in `iface.ip_addrs`.
+    /// Without our tailnet IP (100.64.0.x) registered, smoltcp drops
+    /// pings before its `process_icmpv4` can auto-reply.
+    ///
+    /// smoltcp 0.12's `process_icmpv4` does the actual ICMP echo-reply
+    /// synthesis (we verified in source: `iface/interface/ipv4.rs`
+    /// lines 337–351). No explicit ICMP socket needed.
+    pub fn set_local_addrs(&self, addrs: Vec<Ipv4Cidr>) {
+        let mut iface = self.inner.iface.lock();
+        iface.update_ip_addrs(|store| {
+            store.clear();
+            for cidr in &addrs {
+                let _ = store.push(IpCidr::Ipv4(*cidr));
+            }
+        });
+        drop(iface);
+        info!(?addrs, "netstack.local_addrs.set");
+        crate::poll::poke(&self.inner.wake);
     }
 
     pub fn shutdown(&mut self) {

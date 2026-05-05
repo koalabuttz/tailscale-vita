@@ -13,6 +13,12 @@ use ts_control::{ControlError, KeyStore, MapClient, MapEvent, NetMap};
 use ts_derp::{DerpMap, DerpNodeAddr, DerpTransport};
 use wg_engine::{Engine, EngineConfig, Ipv4Cidr, PeerConfig, TransportAddr};
 
+use netstack::{Stack, StackConfig};
+use smoltcp::wire::Ipv4Cidr as SmolIpv4Cidr;
+
+mod lifecycle;
+use lifecycle::LifecycleTracker;
+
 const HEADSCALE_URL: &str = "http://192.168.8.147:8080";
 const HEADSCALE_HOST: &str = "192.168.8.147:8080";
 const CAPVER: u32 = 90;
@@ -25,7 +31,7 @@ fn main() {
     }
     let _span = info_span!(
         "startup",
-        milestone = "M8",
+        milestone = "M9",
         build = env!("BUILD_TIMESTAMP"),
         build_unix = env!("BUILD_UNIX"),
     )
@@ -33,7 +39,7 @@ fn main() {
     info!(build = env!("BUILD_TIMESTAMP"), "binary build timestamp");
 
     if let Err(e) = run() {
-        error!(error = %e, "M8 demo failed");
+        error!(error = %e, "M9 demo failed");
     }
     vita_log::flush();
     thread::sleep(Duration::from_secs(1));
@@ -98,7 +104,7 @@ fn run() -> Result<(), ControlError> {
         "control.register.ok"
     );
 
-    // ---- M8: spawn the WG engine with DerpTransport and drive the map ----
+    // ---- M8/M9: spawn engine + DerpTransport + netstack, drive the map ----
 
     // Both wg-engine's WG static_public AND ts-derp's NaCl-box ECDH derive
     // from the same 32 priv bytes (proven by spike-05). One key, three uses.
@@ -112,10 +118,17 @@ fn run() -> Result<(), ControlError> {
         peers: vec![],
     })
     .map_err(|e| ControlError::Transport(format!("engine new: {e}")))?;
-    let _engine_running = engine
+    let engine_running = engine
         .start(derp_transport)
         .map_err(|e| ControlError::Transport(format!("engine start: {e}")))?;
     info!("wg-engine: pump running with DerpTransport (DerpMap pending)");
+
+    // M9: spin up smoltcp-backed netstack so inbound ICMP echoes get
+    // auto-replied (smoltcp 0.12's iface.process_icmpv4 does this for free
+    // once iface.ip_addrs contains our 100.64.x.y).
+    let stack = Stack::start(StackConfig::new(), engine_running)
+        .map_err(|e| ControlError::Transport(format!("netstack start: {e}")))?;
+    info!("netstack: poll thread running (no local IP yet)");
 
     let mut map = MapClient::start(
         conn,
@@ -128,16 +141,26 @@ fn run() -> Result<(), ControlError> {
     info!("control.map.started");
 
     // The first MapResponse with derp_region_count > 0 is when we pick a
-    // home and start dialing.
+    // home and start dialing. The first MapResponse with our_addrs set
+    // is when we hand our tailnet IP to the netstack.
     let demo_window = Duration::from_secs(120);
     let deadline = Instant::now() + demo_window;
     let mut keepalive_count = 0u32;
     let mut snapshot_count = 0u32;
     let mut derp_map_set = false;
+    let mut local_addrs_set = false;
+    let mut lifecycle = LifecycleTracker::new();
+
     while Instant::now() < deadline {
-        match map.next_event(Duration::from_secs(2))? {
+        let event = map.next_event(Duration::from_secs(2))?;
+        let now = Instant::now();
+
+        match event {
             MapEvent::Snapshot(snap) => {
                 snapshot_count += 1;
+                lifecycle.record_map_event(now);
+
+                // Wire DERP first time we see regions.
                 if !derp_map_set && snap.derp_region_count > 0 {
                     let derp_map = build_derp_map(map.netmap());
                     derp_ctl.set_derp_map(derp_map.clone());
@@ -147,14 +170,38 @@ fn run() -> Result<(), ControlError> {
                     }
                     derp_map_set = true;
                 }
+
+                // Wire local IP into smoltcp first time MapResponse has
+                // our_addrs. Without this, smoltcp drops inbound packets
+                // for 100.64.0.1 and the auto-ICMP-reply never fires.
+                if !local_addrs_set && !snap.our_addrs.is_empty() {
+                    let local_cidrs: Vec<SmolIpv4Cidr> = snap
+                        .our_addrs
+                        .iter()
+                        .map(|a| SmolIpv4Cidr::new(a.addr, a.prefix))
+                        .collect();
+                    info!(addrs = ?local_cidrs, "netstack.local_addrs.from_mapresponse");
+                    stack.set_local_addrs(local_cidrs);
+                    local_addrs_set = true;
+                }
+
                 push_delta_to_engine(&engine, &snap, derp_ctl.home_region());
             }
             MapEvent::KeepAlive { seq } => {
                 keepalive_count += 1;
+                lifecycle.record_map_event(now);
                 info!(seq, count = keepalive_count, "control.map.keepalive");
             }
             MapEvent::Idle => {}
         }
+
+        // v1 proxy for "DERP rx" until M10 plumbs a real per-rx hook:
+        // any region in the alive set means our DERP path is up.
+        if !derp_ctl.alive_regions().is_empty() {
+            lifecycle.record_derp_rx(now);
+        }
+
+        lifecycle.tick(now, engine.peer_count(), derp_ctl.alive_regions().len());
     }
 
     info!(
@@ -162,10 +209,12 @@ fn run() -> Result<(), ControlError> {
         snapshots = snapshot_count,
         keepalives = keepalive_count,
         derp_alive_regions = ?derp_ctl.alive_regions(),
-        "M8 demo done"
+        lifecycle_state = ?lifecycle.state(),
+        "M9 demo done"
     );
     drop(map);
     derp_ctl.shutdown();
+    drop(stack); // joins netstack poll + wg-engine pump
     Ok(())
 }
 
