@@ -1,0 +1,21 @@
+[package]
+name = "crypto-box-compile-spike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crypto_box = { version = "0.9", default-features = false, features = ["alloc", "salsa20"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[profile.release]
+panic = "unwind"
+lto = true
+opt-level = 2
+
+[package.metadata.vita]
+title_id = "TVIT00005"
+title_name = "Tailscale-Vita crypto_box"
+vita_make_fself_flags = []
+
+[patch.crates-io]
+ring = { git = "https://github.com/vita-rust/ring", branch = "v0.17.14-vita" }

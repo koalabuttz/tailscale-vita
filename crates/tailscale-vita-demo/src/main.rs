@@ -9,8 +9,9 @@ use tracing::{error, info, info_span, warn};
 use ts_control::async_io::AsyncNoiseStream;
 use ts_control::http2::Http2Conn;
 use ts_control::record::NoiseStream;
-use ts_control::{ControlError, KeyStore, MapClient, MapEvent};
-use wg_engine::{Engine, EngineConfig, Ipv4Cidr, NoopTransport, PeerConfig};
+use ts_control::{ControlError, KeyStore, MapClient, MapEvent, NetMap};
+use ts_derp::{DerpMap, DerpNodeAddr, DerpTransport};
+use wg_engine::{Engine, EngineConfig, Ipv4Cidr, PeerConfig, TransportAddr};
 
 const HEADSCALE_URL: &str = "http://192.168.8.147:8080";
 const HEADSCALE_HOST: &str = "192.168.8.147:8080";
@@ -24,7 +25,7 @@ fn main() {
     }
     let _span = info_span!(
         "startup",
-        milestone = "M7",
+        milestone = "M8",
         build = env!("BUILD_TIMESTAMP"),
         build_unix = env!("BUILD_UNIX"),
     )
@@ -32,7 +33,7 @@ fn main() {
     info!(build = env!("BUILD_TIMESTAMP"), "binary build timestamp");
 
     if let Err(e) = run() {
-        error!(error = %e, "M7 demo failed");
+        error!(error = %e, "M8 demo failed");
     }
     vita_log::flush();
     thread::sleep(Duration::from_secs(1));
@@ -97,9 +98,14 @@ fn run() -> Result<(), ControlError> {
         "control.register.ok"
     );
 
-    // ---- M7: spawn the WG engine and drive the /machine/map long-poll ----
+    // ---- M8: spawn the WG engine with DerpTransport and drive the map ----
 
+    // Both wg-engine's WG static_public AND ts-derp's NaCl-box ECDH derive
+    // from the same 32 priv bytes (proven by spike-05). One key, three uses.
     let our_secret = x25519_dalek::StaticSecret::from(ks.node_priv.0);
+
+    let (derp_transport, derp_ctl) = DerpTransport::new(ks.node_priv.0, ks.node_pub.0, /*cap=*/ 8);
+
     let engine = Engine::new(EngineConfig {
         our_static_secret: our_secret,
         mtu: 1280,
@@ -107,9 +113,9 @@ fn run() -> Result<(), ControlError> {
     })
     .map_err(|e| ControlError::Transport(format!("engine new: {e}")))?;
     let _engine_running = engine
-        .start(NoopTransport::new())
+        .start(derp_transport)
         .map_err(|e| ControlError::Transport(format!("engine start: {e}")))?;
-    info!("wg-engine: idle pump running with NoopTransport");
+    info!("wg-engine: pump running with DerpTransport (DerpMap pending)");
 
     let mut map = MapClient::start(
         conn,
@@ -121,15 +127,27 @@ fn run() -> Result<(), ControlError> {
     )?;
     info!("control.map.started");
 
-    let demo_window = Duration::from_secs(70);
+    // The first MapResponse with derp_region_count > 0 is when we pick a
+    // home and start dialing.
+    let demo_window = Duration::from_secs(120);
     let deadline = Instant::now() + demo_window;
     let mut keepalive_count = 0u32;
     let mut snapshot_count = 0u32;
+    let mut derp_map_set = false;
     while Instant::now() < deadline {
         match map.next_event(Duration::from_secs(2))? {
             MapEvent::Snapshot(snap) => {
                 snapshot_count += 1;
-                push_delta_to_engine(&engine, &snap);
+                if !derp_map_set && snap.derp_region_count > 0 {
+                    let derp_map = build_derp_map(map.netmap());
+                    derp_ctl.set_derp_map(derp_map.clone());
+                    match derp_ctl.pick_and_set_home(&derp_map) {
+                        Ok(home) => info!(home, regions = derp_map.regions.len(), "derp.home.selected"),
+                        Err(e) => warn!(error = %e, "derp.home.selection.failed"),
+                    }
+                    derp_map_set = true;
+                }
+                push_delta_to_engine(&engine, &snap, derp_ctl.home_region());
             }
             MapEvent::KeepAlive { seq } => {
                 keepalive_count += 1;
@@ -143,13 +161,38 @@ fn run() -> Result<(), ControlError> {
         peer_count = engine.peer_count(),
         snapshots = snapshot_count,
         keepalives = keepalive_count,
-        "M7 demo done"
+        derp_alive_regions = ?derp_ctl.alive_regions(),
+        "M8 demo done"
     );
     drop(map);
+    derp_ctl.shutdown();
     Ok(())
 }
 
-fn push_delta_to_engine(engine: &Engine, snap: &ts_control::NetMapSnapshot) {
+/// Translate ts-control's `NetMap.derp_regions` into ts-derp's `DerpMap`
+/// shape. Both are HashMap<u16, region-info> but with different node
+/// types — copying field-by-field.
+fn build_derp_map(nm: &NetMap) -> DerpMap {
+    let mut regions = std::collections::HashMap::with_capacity(nm.derp_regions.len());
+    for (region_id, region) in &nm.derp_regions {
+        let nodes: Vec<DerpNodeAddr> = region
+            .nodes
+            .iter()
+            .map(|n| DerpNodeAddr {
+                region_id: n.region_id,
+                name: n.name.clone(),
+                hostname: n.hostname.clone(),
+                ipv4: n.ipv4.clone(),
+                ipv6: n.ipv6.clone(),
+                derp_port: n.derp_port,
+            })
+            .collect();
+        regions.insert(*region_id, nodes);
+    }
+    DerpMap { regions }
+}
+
+fn push_delta_to_engine(engine: &Engine, snap: &ts_control::NetMapSnapshot, our_home: u16) {
     let delta = &snap.delta;
     info!(
         seq = snap.seq,
@@ -172,12 +215,26 @@ fn push_delta_to_engine(engine: &Engine, snap: &ts_control::NetMapSnapshot) {
             })
             .collect();
         let pubkey = x25519_dalek::PublicKey::from(p.node_key);
+        // Pick the peer's home DERP if known, else fall back to ours
+        // (Tailscale relays bridge between regions, so even cross-region
+        //  peers reach each other via either side's home).
+        let region = if p.home_derp != 0 { p.home_derp } else { our_home };
+        let initial_endpoint = if region != 0 {
+            Some(TransportAddr::Derp {
+                region,
+                peer_pubkey: p.node_key,
+            })
+        } else {
+            None
+        };
         if let Err(e) = engine.upsert_peer(PeerConfig {
             pubkey,
             preshared_key: None,
-            persistent_keepalive_secs: None,
+            // 25 s keepalive so WG keeps the encrypted tunnel alive even
+            // when no app traffic flows. Required for M9 ICMP reachability.
+            persistent_keepalive_secs: Some(25),
             allowed_ips,
-            initial_endpoint: None,
+            initial_endpoint,
         }) {
             warn!(error = %e, node_id = p.node_id, "control.map.peer.upsert.failed");
         } else {
@@ -185,6 +242,7 @@ fn push_delta_to_engine(engine: &Engine, snap: &ts_control::NetMapSnapshot) {
                 node_id = p.node_id,
                 allowed_ips = ?p.allowed_ips,
                 home_derp = p.home_derp,
+                routed_via_region = region,
                 "control.map.peer.upsert"
             );
         }
@@ -209,12 +267,25 @@ fn push_delta_to_engine(engine: &Engine, snap: &ts_control::NetMapSnapshot) {
             })
             .collect();
         let new_pubkey = x25519_dalek::PublicKey::from(r.snapshot.node_key);
+        let region = if r.snapshot.home_derp != 0 {
+            r.snapshot.home_derp
+        } else {
+            our_home
+        };
+        let initial_endpoint = if region != 0 {
+            Some(TransportAddr::Derp {
+                region,
+                peer_pubkey: r.snapshot.node_key,
+            })
+        } else {
+            None
+        };
         let _ = engine.upsert_peer(PeerConfig {
             pubkey: new_pubkey,
             preshared_key: None,
-            persistent_keepalive_secs: None,
+            persistent_keepalive_secs: Some(25),
             allowed_ips,
-            initial_endpoint: None,
+            initial_endpoint,
         });
         info!(node_id = r.snapshot.node_id, "control.map.peer.rekeyed");
     }

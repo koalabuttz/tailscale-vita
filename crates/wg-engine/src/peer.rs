@@ -8,11 +8,20 @@ use parking_lot::Mutex;
 
 use crate::WgError;
 
-/// Where to send encrypted WireGuard datagrams for a peer. M2 only uses
-/// `Udp`; `Derp` arrives in M8.
+/// Where to send encrypted WireGuard datagrams for a peer.
+///
+/// - `Udp` (M2): direct UDP — used by the M2 hardcoded-peer ICMP harness
+///   and by anyone running a wireguard-go peer on the same network.
+/// - `Derp` (M8): Tailscale DERP relay over TLS/443. The `peer_pubkey`
+///   is the destination's `key.NodePublic` (32 raw bytes); the relay
+///   uses it to demux SendPacket → RecvPacket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportAddr {
     Udp(SocketAddr),
+    Derp {
+        region: u16,
+        peer_pubkey: [u8; 32],
+    },
 }
 
 /// A `prefix`-bit IPv4 CIDR. Hand-rolled to avoid pulling smoltcp into

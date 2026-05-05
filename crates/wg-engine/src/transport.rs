@@ -40,7 +40,10 @@ impl UdpTransport {
 
 impl Transport for UdpTransport {
     fn send(&self, addr: TransportAddr, datagram: &[u8]) -> Result<(), WgError> {
-        let TransportAddr::Udp(sa) = addr;
+        let sa = match addr {
+            TransportAddr::Udp(sa) => sa,
+            TransportAddr::Derp { .. } => return Err(WgError::TransportMismatch),
+        };
         self.socket.send_to(datagram, sa).map_err(WgError::Io)?;
         Ok(())
     }

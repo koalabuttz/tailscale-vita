@@ -5,6 +5,7 @@ members = [
     "crates/wg-engine",
     "crates/netstack",
     "crates/ts-control",
+    "crates/ts-derp",
     "crates/tailscale-vita-demo",
 ]
 # Phase-0 spikes are standalone crates with their own [patch.crates-io] and
@@ -15,6 +16,7 @@ exclude = [
     "spikes/02-udp-echo",
     "spikes/03-boringtun-compile",
     "spikes/04-smoltcp-compile",
+    "spikes/05-crypto-box-compile",
 ]
 
 [workspace.package]

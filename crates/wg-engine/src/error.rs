@@ -24,4 +24,8 @@ pub enum WgError {
     BadCidr(String),
     #[error("expected exactly one peer, got {0}")]
     BadPeerCount(usize),
+    #[error("transport: {0}")]
+    Transport(String),
+    #[error("transport mismatch: addr type doesn't match transport impl")]
+    TransportMismatch,
 }
