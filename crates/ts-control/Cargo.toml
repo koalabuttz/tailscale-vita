@@ -26,3 +26,5 @@ crossbeam-channel = { workspace = true }
 x25519-dalek = { workspace = true }
 rand_core    = { workspace = true }
 time         = { workspace = true }
+# M7: gunzip Headscale's HTTP/2 DATA stream (Content-Encoding: gzip)
+flate2       = { workspace = true }

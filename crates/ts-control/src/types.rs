@@ -157,6 +157,169 @@ fn decode_hex(hex: &str, out: &mut [u8]) -> Result<(), ControlError> {
     Ok(())
 }
 
+// =============================================================================
+// M7: /machine/map wire types
+//
+// Mirrors `tailcfg.MapRequest` / `tailcfg.MapResponse` and friends. Field
+// names match Go's default JSON-tag behavior (capitalized struct field name
+// used verbatim) via explicit `#[serde(rename = "...")]` per field. We
+// only declare fields we actually consume; everything else is dropped on
+// the floor by serde (no-op).
+// =============================================================================
+
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize)]
+pub(crate) struct MapRequestWire {
+    #[serde(rename = "Version")]
+    pub version: u32,
+    #[serde(rename = "Compress")]
+    pub compress: String, // "" — Headscale gzips the HTTP layer regardless
+    #[serde(rename = "NodeKey")]
+    pub node_key: String, // "nodekey:<hex>"
+    #[serde(rename = "DiscoKey")]
+    pub disco_key: String, // "discokey:<hex>"
+    #[serde(rename = "Hostinfo")]
+    pub hostinfo: MapHostinfoWire,
+    #[serde(rename = "Stream")]
+    pub stream: bool,
+    #[serde(rename = "OmitPeers")]
+    pub omit_peers: bool,
+    #[serde(rename = "ReadOnly")]
+    pub read_only: bool,
+    #[serde(rename = "Endpoints")]
+    pub endpoints: Vec<String>, // empty for v1 (no magicsock)
+    #[serde(rename = "MapSessionHandle")]
+    pub map_session_handle: String,
+    #[serde(rename = "MapSessionSeq")]
+    pub map_session_seq: i64,
+}
+
+#[derive(Serialize)]
+pub(crate) struct MapHostinfoWire {
+    #[serde(rename = "IPNVersion")]
+    pub ipn_version: String,
+    #[serde(rename = "Hostname")]
+    pub hostname: String,
+    #[serde(rename = "OS")]
+    pub os: String,
+    #[serde(rename = "OSVersion")]
+    pub os_version: String,
+}
+
+#[derive(Deserialize, Default, Debug, Clone)]
+pub(crate) struct MapResponseWire {
+    #[serde(rename = "MapSessionHandle", default)]
+    pub map_session_handle: String,
+    #[serde(rename = "Seq", default)]
+    pub seq: i64,
+    #[serde(rename = "KeepAlive", default)]
+    pub keep_alive: bool,
+    #[serde(rename = "Node", default)]
+    pub node: Option<NodeWire>,
+    #[serde(rename = "DERPMap", default)]
+    pub derp_map: Option<DerpMapWire>,
+    #[serde(rename = "Peers", default)]
+    pub peers: Option<Vec<NodeWire>>,
+    #[serde(rename = "PeersChanged", default)]
+    pub peers_changed: Option<Vec<NodeWire>>,
+    #[serde(rename = "PeersRemoved", default)]
+    pub peers_removed: Option<Vec<i64>>,
+    #[serde(rename = "PeersChangedPatch", default)]
+    pub peers_changed_patch: Option<Vec<PeerChangeWire>>,
+    #[serde(rename = "Domain", default)]
+    pub domain: String,
+    #[serde(rename = "ControlTime", default)]
+    pub control_time: Option<String>,
+    // DNSConfig, PacketFilter, ClientVersion, etc. are parsed-and-dropped
+    // by serde (no fields). v1 doesn't consume them.
+}
+
+#[derive(Deserialize, Default, Debug, Clone)]
+pub(crate) struct NodeWire {
+    #[serde(rename = "ID", default)]
+    pub id: i64,
+    #[serde(rename = "StableID", default)]
+    pub stable_id: String,
+    #[serde(rename = "Name", default)]
+    pub name: String,
+    #[serde(rename = "Key", default)]
+    pub key: String, // "nodekey:<hex>"
+    #[serde(rename = "DiscoKey", default)]
+    pub disco_key: String, // "discokey:<hex>"
+    #[serde(rename = "Addresses", default)]
+    pub addresses: Vec<String>, // "100.64.0.1/32"
+    #[serde(rename = "AllowedIPs", default)]
+    pub allowed_ips: Vec<String>,
+    #[serde(rename = "HomeDERP", default)]
+    pub home_derp: u16,
+    #[serde(rename = "DERP", default)]
+    pub derp_legacy: String, // "127.3.3.40:<region>"
+    #[serde(rename = "Online", default)]
+    pub online: Option<bool>,
+}
+
+#[derive(Deserialize, Default, Debug, Clone)]
+pub(crate) struct DerpMapWire {
+    #[serde(rename = "Regions", default)]
+    pub regions: HashMap<String, DerpRegionWire>,
+    // HomeParams ignored for v1
+}
+
+#[derive(Deserialize, Default, Debug, Clone)]
+pub(crate) struct DerpRegionWire {
+    #[serde(rename = "RegionID", default)]
+    pub region_id: u16,
+    #[serde(rename = "RegionCode", default)]
+    pub region_code: String,
+    #[serde(rename = "RegionName", default)]
+    pub region_name: String,
+    #[serde(rename = "Nodes", default)]
+    pub nodes: Vec<DerpNodeWire>,
+}
+
+#[derive(Deserialize, Default, Debug, Clone)]
+pub(crate) struct DerpNodeWire {
+    #[serde(rename = "Name", default)]
+    pub name: String,
+    #[serde(rename = "RegionID", default)]
+    pub region_id: u16,
+    #[serde(rename = "HostName", default)]
+    pub hostname: String,
+    #[serde(rename = "IPv4", default)]
+    pub ipv4: String,
+    #[serde(rename = "IPv6", default)]
+    pub ipv6: String,
+    #[serde(rename = "DERPPort", default)]
+    pub derp_port: u16,
+    #[serde(rename = "STUNPort", default)]
+    pub stun_port: i32,
+}
+
+#[derive(Deserialize, Default, Debug, Clone)]
+pub(crate) struct PeerChangeWire {
+    #[serde(rename = "NodeID", default)]
+    pub node_id: i64,
+    #[serde(rename = "Key", default)]
+    pub key: Option<String>,
+    #[serde(rename = "DiscoKey", default)]
+    pub disco_key: Option<String>,
+    #[serde(rename = "HomeDERP", default)]
+    pub home_derp: Option<u16>,
+    #[serde(rename = "DERPRegion", default)]
+    pub derp_region_legacy: Option<u16>,
+    #[serde(rename = "Endpoints", default)]
+    pub endpoints: Option<Vec<String>>,
+    #[serde(rename = "Online", default)]
+    pub online: Option<bool>,
+    #[serde(rename = "LastSeen", default)]
+    pub last_seen: Option<String>,
+    #[serde(rename = "KeyExpiry", default)]
+    pub key_expiry: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +352,77 @@ mod tests {
     fn rejects_bad_hex() {
         let s = format!("mkey:{}", "Z".repeat(64));
         assert!(MachinePublic::from_mkey_str(&s).is_err());
+    }
+
+    #[test]
+    fn map_request_serializes_with_session_seq_and_handle() {
+        let req = MapRequestWire {
+            version: 90,
+            compress: String::new(),
+            node_key: "nodekey:01".repeat(32),
+            disco_key: "discokey:02".repeat(32),
+            hostinfo: MapHostinfoWire {
+                ipn_version: "tailscale-vita/0.1.0".into(),
+                hostname: "vita".into(),
+                os: "linux".into(),
+                os_version: "vita-3.74".into(),
+            },
+            stream: true,
+            omit_peers: false,
+            read_only: false,
+            endpoints: vec![],
+            map_session_handle: "abc123".into(),
+            map_session_seq: 42,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["Version"], 90);
+        assert_eq!(v["Stream"], true);
+        assert_eq!(v["OmitPeers"], false);
+        assert_eq!(v["MapSessionSeq"], 42);
+        assert_eq!(v["MapSessionHandle"], "abc123");
+        assert_eq!(v["Hostinfo"]["IPNVersion"], "tailscale-vita/0.1.0");
+        assert!(v["Endpoints"].is_array());
+        assert_eq!(v["Endpoints"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn map_response_keepalive_parses() {
+        let body = br#"{"KeepAlive":true}"#;
+        let resp: MapResponseWire = serde_json::from_slice(body).unwrap();
+        assert!(resp.keep_alive);
+        assert_eq!(resp.seq, 0);
+    }
+
+    #[test]
+    fn map_response_full_node_parses() {
+        let body = br#"{
+            "Seq": 5,
+            "Node": {
+                "ID": 1,
+                "Name": "vita.example.com",
+                "Key": "nodekey:e3faa33ff4008f822e0957d41bc1d83c5ba97f362239253e298f64b39a4cda51",
+                "Addresses": ["100.64.0.1/32", "fd7a:115c:a1e0::1/128"],
+                "HomeDERP": 0
+            },
+            "Peers": [],
+            "Domain": "example.com"
+        }"#;
+        let resp: MapResponseWire = serde_json::from_slice(body).unwrap();
+        assert_eq!(resp.seq, 5);
+        assert_eq!(resp.domain, "example.com");
+        let node = resp.node.unwrap();
+        assert_eq!(node.id, 1);
+        assert_eq!(node.addresses.len(), 2);
+        assert_eq!(node.addresses[0], "100.64.0.1/32");
+    }
+
+    #[test]
+    fn peer_change_optional_fields_parse() {
+        let body = br#"{"NodeID": 7, "Online": true, "HomeDERP": 5}"#;
+        let pc: PeerChangeWire = serde_json::from_slice(body).unwrap();
+        assert_eq!(pc.node_id, 7);
+        assert_eq!(pc.online, Some(true));
+        assert_eq!(pc.home_derp, Some(5));
+        assert!(pc.key.is_none());
     }
 }

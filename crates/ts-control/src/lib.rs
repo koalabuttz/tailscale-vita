@@ -9,6 +9,8 @@ pub mod async_io;
 mod error;
 pub mod http2;
 pub mod keystore;
+pub mod map;
+pub mod netmap;
 pub mod noise;
 mod persist;
 pub mod record;
@@ -20,6 +22,8 @@ pub mod url;
 
 pub use error::ControlError;
 pub use keystore::KeyStore;
+pub use map::{MapClient, MapEvent, NetMapSnapshot};
+pub use netmap::{AllowedIp, NetMap, NetMapDelta, PeerSnapshot, RekeyedPeer};
 pub use noise::{NoiseHandshaker, NoiseTransport};
 pub use persist::{atomic_write, pin_or_load_server_key};
 pub use register::{register, RegistrationOutcome};

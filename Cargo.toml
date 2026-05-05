@@ -67,7 +67,11 @@ serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # --- Compression (Headscale gzips MapResponse bodies) ---
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Use `zlib-rs` (pure-Rust port of zlib) instead of miniz_oxide. miniz_oxide's
+# Cargo.toml in flate2 1.1.9 forces `simd-adler32`, whose ARM NEON path uses
+# the unstable `stdarch_arm_neon_intrinsics` feature and fails to cross-compile
+# to `armv7-sony-vita-newlibeabihf`. zlib-rs avoids that dep entirely.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 
 # --- Logging ---
 tracing            = "0.1"

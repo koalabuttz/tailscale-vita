@@ -67,3 +67,36 @@ impl Transport for UdpTransport {
         }
     }
 }
+
+/// Drops sends, blocks on receive until timeout. Used in M7 where the
+/// engine has Tunns but no actual transport (DERP arrives in M8) — keeps
+/// the pump loop quiescent without busy-spinning.
+pub struct NoopTransport;
+
+impl NoopTransport {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for NoopTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Transport for NoopTransport {
+    fn send(&self, _addr: TransportAddr, _datagram: &[u8]) -> Result<(), WgError> {
+        Ok(())
+    }
+
+    fn recv_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<(TransportAddr, Vec<u8>)>, WgError> {
+        // Block for `timeout` so the pump loop yields cleanly instead of
+        // spinning at 100% CPU.
+        std::thread::sleep(timeout);
+        Ok(None)
+    }
+}

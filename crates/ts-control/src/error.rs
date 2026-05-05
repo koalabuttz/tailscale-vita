@@ -20,7 +20,14 @@ pub enum ControlError {
     HttpParse(String),
     #[error("auth rejected; AuthURL={auth_url}")]
     AuthRejected { auth_url: String },
-    // M7+ variants land later.
+    #[error("map watchdog: no frame in {idle_secs}s")]
+    MapWatchdog { idle_secs: u64 },
+    #[error("map frame too large: {len} bytes (cap {cap})")]
+    MapFrameTooLarge { len: usize, cap: usize },
+    #[error("map decode: {0}")]
+    MapDecode(String),
+    #[error("map connection lost: {0}")]
+    MapConnectionLost(String),
 }
 
 impl From<ureq::Error> for ControlError {

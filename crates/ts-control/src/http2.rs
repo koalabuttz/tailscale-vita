@@ -30,6 +30,25 @@ pub struct Http2Conn {
     rt: Runtime,
     send: h2::client::SendRequest<Bytes>,
     _conn_task: tokio::task::JoinHandle<()>,
+    /// M7: streaming body from the most recent `request_stream`. `None`
+    /// when no stream is in flight; `Some(...)` after a successful
+    /// `request_stream` until the body is fully drained or the conn drops.
+    body: Option<h2::RecvStream>,
+}
+
+/// Response head returned by `request_stream` — body chunks come later
+/// via `Http2Conn::next_chunk`.
+pub struct Http2ResponseHead {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+}
+
+/// Outcome of `next_chunk_timeout`: a chunk, clean EOF, or the timeout
+/// elapsed without either.
+pub enum ChunkOutcome {
+    Chunk(Bytes),
+    Eof,
+    Timeout,
 }
 
 /// Newtype so we can implement `AsyncRead + AsyncWrite` for the move into
@@ -94,7 +113,140 @@ impl Http2Conn {
             rt,
             send,
             _conn_task: conn_task,
+            body: None,
         })
+    }
+
+    /// Variant of `request` for streaming response bodies (M7's
+    /// `/machine/map` long-poll).
+    ///
+    /// Sends the request, awaits the response head, then stashes the
+    /// `RecvStream` on `self`. Caller drains chunks via `next_chunk()`
+    /// in a loop. Calling `request_stream` again drops any pending body.
+    pub fn request_stream(
+        &mut self,
+        method: Method,
+        path: &str,
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+        authority: &str,
+    ) -> Result<Http2ResponseHead, ControlError> {
+        // Drop any pending body before starting a new stream.
+        self.body = None;
+
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", authority);
+        for (k, v) in extra_headers {
+            builder = builder.header(*k, *v);
+        }
+        let req = builder
+            .body(())
+            .map_err(|e| ControlError::Transport(format!("build request: {e}")))?;
+
+        let body_bytes = Bytes::copy_from_slice(body);
+        let send_handle = self.send.clone();
+        let path_owned = path.to_string();
+
+        let (status, headers, recv_stream) = self.rt.block_on(async move {
+            let send = send_handle;
+            let mut send = send
+                .ready()
+                .await
+                .map_err(|e| ControlError::Transport(format!("h2 ready: {e}")))?;
+            let (resp_fut, mut send_stream) = send
+                .send_request(req, body_bytes.is_empty())
+                .map_err(|e| ControlError::Transport(format!("h2 send_request: {e}")))?;
+            if !body_bytes.is_empty() {
+                send_stream
+                    .send_data(body_bytes, true)
+                    .map_err(|e| ControlError::Transport(format!("h2 send_data: {e}")))?;
+            }
+            let resp = resp_fut
+                .await
+                .map_err(|e| ControlError::Transport(format!("h2 resp: {e}")))?;
+            let status = resp.status().as_u16();
+            let headers: Vec<(String, String)> = resp
+                .headers()
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.as_str().to_owned(),
+                        String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                    )
+                })
+                .collect();
+            let recv_stream = resp.into_body();
+            Ok::<_, ControlError>((status, headers, recv_stream))
+        })?;
+
+        info!(
+            status,
+            headers_count = headers.len(),
+            path = %path_owned,
+            "control.http2.response_head"
+        );
+        self.body = Some(recv_stream);
+        Ok(Http2ResponseHead { status, headers })
+    }
+
+    /// Block on the next chunk of the streaming body stored on `self`.
+    /// Returns `Ok(None)` at clean EOF. Auto-releases flow-control credit
+    /// per chunk so the h2 window doesn't stall.
+    pub fn next_chunk(&mut self) -> Result<Option<Bytes>, ControlError> {
+        let Self { rt, body, .. } = self;
+        let body_ref = body
+            .as_mut()
+            .ok_or_else(|| ControlError::Transport("no streaming body active".into()))?;
+        rt.block_on(async {
+            match body_ref.data().await {
+                Some(Ok(c)) => {
+                    let _ = body_ref.flow_control().release_capacity(c.len());
+                    Ok(Some(c))
+                }
+                Some(Err(e)) => Err(ControlError::Transport(format!("h2 body chunk: {e}"))),
+                None => Ok(None),
+            }
+        })
+    }
+
+    /// Variant of `next_chunk` with a deadline. Returns
+    /// `ChunkOutcome::Timeout` if no chunk arrived within `timeout`,
+    /// allowing the caller to re-check upper-level deadlines (e.g.
+    /// the M7 framer's 2-min watchdog) without blocking forever.
+    pub fn next_chunk_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<ChunkOutcome, ControlError> {
+        let Self { rt, body, .. } = self;
+        let body_ref = body
+            .as_mut()
+            .ok_or_else(|| ControlError::Transport("no streaming body active".into()))?;
+        rt.block_on(async {
+            match tokio::time::timeout(timeout, body_ref.data()).await {
+                Ok(Some(Ok(c))) => {
+                    let _ = body_ref.flow_control().release_capacity(c.len());
+                    Ok(ChunkOutcome::Chunk(c))
+                }
+                Ok(Some(Err(e))) => {
+                    Err(ControlError::Transport(format!("h2 body chunk: {e}")))
+                }
+                Ok(None) => Ok(ChunkOutcome::Eof),
+                Err(_elapsed) => Ok(ChunkOutcome::Timeout),
+            }
+        })
+    }
+
+    /// True if a streaming body is currently attached.
+    pub fn streaming(&self) -> bool {
+        self.body.is_some()
+    }
+
+    /// Drop any attached streaming body (e.g., before a soft reconnect
+    /// re-issues the request).
+    pub fn drop_stream(&mut self) {
+        self.body = None;
     }
 
     /// Issue an HTTP/2 request. Reads the full response body before

@@ -31,7 +31,7 @@ mod error;
 pub use config::{build_engine_inputs, decode_priv_key, decode_pub_key, read_wg_toml, WgToml};
 pub use error::WgError;
 pub use peer::{Ipv4Cidr, Peer, PeerConfig, PeerStats, TransportAddr};
-pub use transport::{Transport, UdpTransport};
+pub use transport::{NoopTransport, Transport, UdpTransport};
 
 use indices::Indices;
 
@@ -130,10 +130,20 @@ impl Engine {
             .map(|p| *p.stats.lock())
     }
 
+    /// Snapshot peer count. Cheap (single read-lock + len). Used by M7
+    /// to verify that the netmap delta stream has populated the engine.
+    pub fn peer_count(&self) -> usize {
+        self.indices.by_pubkey.read().len()
+    }
+
     /// Spawn the pump thread driving `transport`. Returns an `EngineRunning`
     /// with the rx/tx queues for callers to interact with the tunnel.
+    ///
+    /// Takes `&self` so the caller keeps the `Engine` alive after start —
+    /// M7's control thread needs to call `upsert_peer` / `remove_peer`
+    /// based on `MapResponse` deltas.
     pub fn start<T: Transport + 'static>(
-        self,
+        &self,
         transport: T,
     ) -> Result<EngineRunning, WgError> {
         let transport = Arc::new(transport);
