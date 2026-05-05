@@ -35,9 +35,11 @@ mod error;
 mod handle;
 mod poll;
 pub mod tcp;
+pub mod tcp_listener;
 
 pub use error::NetstackError;
 pub use smoltcp::wire::Ipv4Cidr as Ipv4CidrRe;
+pub use tcp_listener::{TcpListener, DEFAULT_LISTENER_POOL};
 
 use crate::device::WgDevice;
 use crate::handle::HandleRegistry;

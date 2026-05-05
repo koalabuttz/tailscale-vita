@@ -6,16 +6,15 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-vita-log     = { path = "../vita-log" }
-wg-engine    = { path = "../wg-engine" }
-netstack     = { path = "../netstack" }
-ts-control   = { path = "../ts-control" }
-ts-derp      = { path = "../ts-derp" }
-smoltcp      = { workspace = true }
-x25519-dalek = { workspace = true }
-parking_lot  = { workspace = true }
-tracing      = { workspace = true }
-http         = "1"
+# M10: demo links the public Runtime API. The lower-level
+# ts-control/ts-derp/wg-engine crates are no longer direct deps.
+vita-log       = { path = "../vita-log" }
+netstack       = { path = "../netstack" }
+tailscale-vita = { path = "../tailscale-vita" }
+
+# Public crate types we touch directly.
+crossbeam-channel = { workspace = true }
+tracing           = { workspace = true }
 
 [package.metadata.vita]
 title_id   = "TVIT00010"

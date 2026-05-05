@@ -1,0 +1,218 @@
+//! TOML config for the Tailscale-on-Vita Runtime. Reads from
+//! `ux0:/data/tailscale-vita/config.toml` (or wherever
+//! `Config::load_or_template` is pointed).
+//!
+//! On first run, if the file doesn't exist, a template is written and
+//! `Config::load_or_template` returns `ConfigError::TemplateWritten`
+//! with a clear "fill in auth_key and re-run" message — the demo's
+//! main.rs can log this as an actionable error.
+
+use std::path::Path;
+
+use serde::Deserialize;
+
+use crate::error::ConfigError;
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Config {
+    /// Headscale URL — e.g. "http://192.168.8.147:8080" for the dev
+    /// Headscale, or "https://controlplane.tailscale.com" for prod.
+    pub control_url: String,
+
+    /// Headscale auth key. Bare hex on Headscale 0.26; `tskey-auth-...`
+    /// on Tailscale prod. Passed verbatim — don't strip prefixes.
+    pub auth_key: String,
+
+    /// Hostname this Vita advertises in `Hostinfo`.
+    #[serde(default = "default_hostname")]
+    pub hostname: String,
+
+    /// `tracing` filter. Defaults to "info".
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+
+    /// Where KeyStore + auth-key.txt + last_seq + session_handle live.
+    #[serde(default = "default_state_dir")]
+    pub state_dir: String,
+
+    /// Port for the demo HTTP listener. Default 8080.
+    #[serde(default = "default_demo_port")]
+    pub demo_port: u16,
+
+    /// DerpTransport conn-pool cap. PLAN-V1 §M8 sets this at 8.
+    #[serde(default = "default_max_derp")]
+    pub max_derp_conns: usize,
+
+    /// TcpListener pre-allocated socket-pool size. PLAN-V1 §M10 = 4.
+    #[serde(default = "default_listener_pool")]
+    pub listener_pool_size: usize,
+
+    /// Demo runtime window in seconds. `None` = run forever (until
+    /// PS-button or other process-level termination).
+    #[serde(default)]
+    pub run_window_secs: Option<u64>,
+
+    /// CapabilityVersion to send. Don't change unless you know what
+    /// you're doing — Headscale 0.26's floor is 88; we send 90.
+    #[serde(default = "default_capver")]
+    pub capver: u32,
+}
+
+impl Config {
+    /// Load TOML config from `path`. If the file doesn't exist, write
+    /// a template and return `ConfigError::TemplateWritten`. Caller
+    /// (demo's main) should log the error and exit cleanly so the
+    /// user can edit and re-launch.
+    pub fn load_or_template(path: &Path) -> Result<Self, ConfigError> {
+        match std::fs::read_to_string(path) {
+            Ok(s) => Ok(toml::from_str(&s)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Self::write_template(path)?;
+                Err(ConfigError::TemplateWritten {
+                    path: path.display().to_string(),
+                })
+            }
+            Err(e) => Err(ConfigError::Io(e)),
+        }
+    }
+
+    /// Write the template TOML file at `path`. Creates parent dirs.
+    pub fn write_template(path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, TEMPLATE)
+    }
+
+    /// `host:port` form of `control_url` — the value used as the HTTP/2
+    /// `:authority` pseudo-header on the Noise tunnel. Strips the
+    /// scheme prefix (`http://` or `https://`).
+    pub fn host_authority(&self) -> String {
+        let s = self.control_url.as_str();
+        if let Some(rest) = s.strip_prefix("https://") {
+            rest.trim_end_matches('/').to_string()
+        } else if let Some(rest) = s.strip_prefix("http://") {
+            rest.trim_end_matches('/').to_string()
+        } else {
+            s.trim_end_matches('/').to_string()
+        }
+    }
+}
+
+const TEMPLATE: &str = r#"# tailscale-vita demo config
+#
+# Edit this file in place after the demo writes the template. Required
+# fields: `control_url` and `auth_key`. Everything else has defaults.
+
+control_url = "http://192.168.8.147:8080"
+
+# Bare hex on Headscale 0.26. Generate via:
+#   docker exec tailscale-vita-headscale headscale preauthkeys create \
+#     --user 1 -e 720h --reusable
+auth_key    = ""
+
+hostname    = "vita"
+log_level   = "info"
+state_dir   = "ux0:/data/tailscale-vita"
+
+# HTTP "hello from vita" listener.
+demo_port           = 8080
+
+# DERP / netstack tuning.
+max_derp_conns      = 8
+listener_pool_size  = 4
+
+# Uncomment for a finite demo window. Default runs forever; PS button
+# exits the eboot.
+# run_window_secs   = 120
+
+# Don't change unless you know what you're doing.
+capver              = 90
+"#;
+
+fn default_hostname() -> String {
+    "vita".to_string()
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
+fn default_state_dir() -> String {
+    "ux0:/data/tailscale-vita".to_string()
+}
+fn default_demo_port() -> u16 {
+    8080
+}
+fn default_max_derp() -> usize {
+    8
+}
+fn default_listener_pool() -> usize {
+    4
+}
+fn default_capver() -> u32 {
+    90
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_round_trip() {
+        let cfg: Config = toml::from_str(TEMPLATE).unwrap();
+        assert_eq!(cfg.control_url, "http://192.168.8.147:8080");
+        assert_eq!(cfg.auth_key, "");
+        assert_eq!(cfg.hostname, "vita");
+        assert_eq!(cfg.demo_port, 8080);
+        assert_eq!(cfg.max_derp_conns, 8);
+        assert_eq!(cfg.listener_pool_size, 4);
+        assert_eq!(cfg.capver, 90);
+        assert_eq!(cfg.run_window_secs, None);
+    }
+
+    #[test]
+    fn host_authority_strips_scheme() {
+        let cfg = Config {
+            control_url: "http://192.168.8.147:8080/".into(),
+            auth_key: String::new(),
+            hostname: "v".into(),
+            log_level: "info".into(),
+            state_dir: ".".into(),
+            demo_port: 8080,
+            max_derp_conns: 8,
+            listener_pool_size: 4,
+            run_window_secs: None,
+            capver: 90,
+        };
+        assert_eq!(cfg.host_authority(), "192.168.8.147:8080");
+    }
+
+    #[test]
+    fn host_authority_handles_https() {
+        let cfg = Config {
+            control_url: "https://controlplane.tailscale.com".into(),
+            auth_key: String::new(),
+            hostname: "v".into(),
+            log_level: "info".into(),
+            state_dir: ".".into(),
+            demo_port: 8080,
+            max_derp_conns: 8,
+            listener_pool_size: 4,
+            run_window_secs: None,
+            capver: 90,
+        };
+        assert_eq!(cfg.host_authority(), "controlplane.tailscale.com");
+    }
+
+    #[test]
+    fn missing_optional_fields_fall_back_to_defaults() {
+        let minimal = r#"
+            control_url = "http://x:8080"
+            auth_key = "abc"
+        "#;
+        let cfg: Config = toml::from_str(minimal).unwrap();
+        assert_eq!(cfg.hostname, "vita");
+        assert_eq!(cfg.demo_port, 8080);
+        assert_eq!(cfg.max_derp_conns, 8);
+        assert_eq!(cfg.capver, 90);
+    }
+}

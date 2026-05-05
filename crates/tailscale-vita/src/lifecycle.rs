@@ -1,5 +1,8 @@
-//! Per PLAN-V1 §M9: track Vita's connection-to-tailnet state and log
-//! transitions. State machine:
+//! Tailnet connection-state machine. M9 introduced this in the demo;
+//! M10 moves it here so the public `Runtime` API can drive it on
+//! behalf of any embedding application.
+//!
+//! State machine:
 //!
 //! ```text
 //!                        first map_event && first derp_rx
@@ -18,9 +21,9 @@
 //!                       no signal in 60 s
 //! ```
 //!
-//! Transitions are emitted at INFO level once per change. A heartbeat
-//! line goes out every 60 s while running. After 10 minutes Offline,
-//! a WARN-level diagnostic dump fires once.
+//! Transitions emit one INFO log per change; a heartbeat fires every
+//! 60 s. After 10 minutes Offline, a one-shot WARN diagnostic dump
+//! captures last-error context.
 
 use std::time::{Duration, Instant};
 
@@ -47,23 +50,14 @@ pub enum OnlineState {
 
 pub struct LifecycleTracker {
     state: OnlineState,
-    /// First time we saw a MapEvent of any kind (Snapshot or KeepAlive).
     first_map_event: Option<Instant>,
-    /// First time we saw a DERP rx (proxy in v1: alive_regions().len() > 0).
     first_derp_rx: Option<Instant>,
-    /// Most recent MapEvent.
     last_map_event: Option<Instant>,
-    /// Most recent DERP rx (proxy).
     last_derp_rx: Option<Instant>,
-    /// Consecutive control reconnects (cleared on success).
     consecutive_control_reconnects: u32,
-    /// Consecutive DERP reconnects (cleared on success).
     consecutive_derp_reconnects: u32,
-    /// Last heartbeat-log timestamp.
     last_heartbeat: Option<Instant>,
-    /// When we transitioned into Offline. None if never offline.
     offline_since: Option<Instant>,
-    /// Whether the 10-min Offline diagnostic has fired (one-shot).
     offline_diag_fired: bool,
 }
 
@@ -96,9 +90,8 @@ impl LifecycleTracker {
         self.consecutive_control_reconnects = 0;
     }
 
-    /// Record DERP-side activity. v1 demo uses
-    /// `derp_alive_regions().len() > 0` as a proxy until M10 plumbs a
-    /// real per-rx signal.
+    /// Record DERP-side activity. v1 proxy: any region in
+    /// `derp_alive_regions().is_empty() == false` counts.
     pub fn record_derp_rx(&mut self, now: Instant) {
         if self.first_derp_rx.is_none() {
             self.first_derp_rx = Some(now);
@@ -107,24 +100,21 @@ impl LifecycleTracker {
         self.consecutive_derp_reconnects = 0;
     }
 
-    /// Public API for v1 lifecycle. The M9 demo doesn't drive these
-    /// directly (next_event errors propagate via `?` rather than
-    /// retrying), but they're used by unit tests to validate the
-    /// Offline transition; M10 will wire them at the runtime boundary
-    /// when a real reconnect manager is added.
-    #[allow(dead_code)]
+    /// Increment the control-plane reconnect counter. M10 Runtime calls
+    /// this when MapClient errors out and we re-establish.
     pub fn record_control_reconnect(&mut self) {
         self.consecutive_control_reconnects += 1;
     }
 
-    #[allow(dead_code)]
+    /// Increment the DERP reconnect counter. M10 Runtime calls this
+    /// when a DERP region's I/O thread dies and we re-dial.
     pub fn record_derp_reconnect(&mut self) {
         self.consecutive_derp_reconnects += 1;
     }
 
-    /// Recompute current state. Logs transitions and emits a heartbeat
-    /// every `HEARTBEAT_INTERVAL`. Should be called once per outer-loop
-    /// iteration in the demo (~2 s cadence is fine).
+    /// Recompute current state. Logs transitions and heartbeats every
+    /// `HEARTBEAT_INTERVAL`. Should be called once per outer-loop tick
+    /// in the runtime (~2 s cadence is fine).
     pub fn tick(&mut self, now: Instant, peer_count: usize, alive_regions: usize) {
         let prev = self.state;
         let new = self.compute_next_state(now);
@@ -147,7 +137,6 @@ impl LifecycleTracker {
             }
         }
 
-        // Heartbeat.
         let due = match self.last_heartbeat {
             Some(t) => now.saturating_duration_since(t) >= HEARTBEAT_INTERVAL,
             None => true,
@@ -164,7 +153,6 @@ impl LifecycleTracker {
             self.last_heartbeat = Some(now);
         }
 
-        // Diag dump after 10 min Offline.
         if let Some(off_since) = self.offline_since {
             if !self.offline_diag_fired
                 && now.saturating_duration_since(off_since) >= OFFLINE_DIAG_AFTER
@@ -189,26 +177,21 @@ impl LifecycleTracker {
     }
 
     fn compute_next_state(&self, now: Instant) -> OnlineState {
-        // Offline trumps everything.
         if self.consecutive_control_reconnects >= OFFLINE_RECONNECT_THRESHOLD
             || self.consecutive_derp_reconnects >= OFFLINE_RECONNECT_THRESHOLD
         {
             return OnlineState::Offline;
         }
-
-        // Need both signals to leave Connecting.
         let have_map = self.first_map_event.is_some();
         let have_derp = self.first_derp_rx.is_some();
         if !have_map || !have_derp {
             return OnlineState::Connecting;
         }
-
-        // Online vs Degraded based on most recent signal.
         let most_recent = match (self.last_map_event, self.last_derp_rx) {
             (Some(m), Some(d)) => m.max(d),
             (Some(m), None) => m,
             (None, Some(d)) => d,
-            (None, None) => return OnlineState::Connecting, // shouldn't happen
+            (None, None) => return OnlineState::Connecting,
         };
         if now.saturating_duration_since(most_recent) > DEGRADED_AFTER {
             OnlineState::Degraded
@@ -229,9 +212,6 @@ mod tests {
     use super::*;
 
     fn t(secs: u64) -> Instant {
-        // Tests can't construct an Instant from raw seconds, but they can
-        // start from `Instant::now()` and add durations relative to a base.
-        // We capture a base once and offset from it.
         static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         let base = BASE.get_or_init(Instant::now);
         *base + Duration::from_secs(secs)
@@ -249,7 +229,6 @@ mod tests {
         lt.record_map_event(t(0));
         lt.tick(t(0), 0, 0);
         assert_eq!(lt.state(), OnlineState::Connecting);
-
         lt.record_derp_rx(t(1));
         lt.tick(t(1), 0, 1);
         assert_eq!(lt.state(), OnlineState::Online);
@@ -262,7 +241,6 @@ mod tests {
         lt.record_derp_rx(t(0));
         lt.tick(t(0), 0, 1);
         assert_eq!(lt.state(), OnlineState::Online);
-
         lt.tick(t(61), 0, 1);
         assert_eq!(lt.state(), OnlineState::Degraded);
     }
@@ -275,7 +253,6 @@ mod tests {
         lt.tick(t(0), 0, 1);
         lt.tick(t(61), 0, 1);
         assert_eq!(lt.state(), OnlineState::Degraded);
-
         lt.record_map_event(t(62));
         lt.tick(t(62), 0, 1);
         assert_eq!(lt.state(), OnlineState::Online);
@@ -314,7 +291,6 @@ mod tests {
             lt.record_control_reconnect();
         }
         lt.record_map_event(t(0));
-        // Counter cleared by record_map_event.
         for _ in 0..4 {
             lt.record_control_reconnect();
         }
@@ -331,10 +307,8 @@ mod tests {
         lt.tick(t(0), 0, 0);
         assert_eq!(lt.state(), OnlineState::Offline);
         assert!(!lt.offline_diag_fired);
-
         lt.tick(t(599), 0, 0);
         assert!(!lt.offline_diag_fired);
-
         lt.tick(t(600), 0, 0);
         assert!(lt.offline_diag_fired);
     }

@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use smoltcp::wire::IpEndpoint;
@@ -222,6 +221,27 @@ impl TcpStream {
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.peer)
+    }
+
+    /// Construct a `TcpStream` wrapping a socket handle that has just
+    /// transitioned to Established via the listener accept path. The
+    /// caller (TcpListener) is responsible for ensuring the handle is
+    /// freshly Established and the slot's HandleSlot is registered.
+    pub(crate) fn from_listener_handle(
+        inner: Arc<StackInner>,
+        handle: SocketHandle,
+        slot: Arc<HandleSlot>,
+        peer: SocketAddr,
+    ) -> Self {
+        TcpStream {
+            inner,
+            handle,
+            slot,
+            peer,
+            read_timeout: Some(DEFAULT_RW_TIMEOUT),
+            write_timeout: Some(DEFAULT_RW_TIMEOUT),
+            closed: false,
+        }
     }
 }
 

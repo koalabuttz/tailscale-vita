@@ -1568,19 +1568,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "tailscale-vita-demo"
+name = "tailscale-vita"
 version = "0.1.0"
 dependencies = [
  "http",
  "netstack",
  "parking_lot",
+ "serde",
  "smoltcp",
+ "thiserror 1.0.69",
+ "toml",
  "tracing",
  "ts-control",
  "ts-derp",
- "vita-log",
  "wg-engine",
  "x25519-dalek",
+]
+
+[[package]]
+name = "tailscale-vita-demo"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "netstack",
+ "tailscale-vita",
+ "tracing",
+ "vita-log",
 ]
 
 [[package]]
