@@ -1,0 +1,24 @@
+[package]
+name = "ts-magicsock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# M12D: shared UDP socket for Disco probing (Ping/Pong) AND direct-path
+# WireGuard traffic. Receive worker dispatches by inspecting magic
+# bytes — Disco frames stay internal (state machine + Pong reply);
+# everything else is forwarded via crossbeam channel for wg-engine.
+
+[dependencies]
+ts-disco          = { path = "../ts-disco" }
+crypto_box        = { workspace = true }
+parking_lot       = { workspace = true }
+crossbeam-channel = { workspace = true }
+rand_core         = { workspace = true }
+zerocopy          = { workspace = true, features = ["derive"] }
+tracing           = { workspace = true }
+thiserror         = { workspace = true }
+
+[dev-dependencies]
+rand = "0.8"

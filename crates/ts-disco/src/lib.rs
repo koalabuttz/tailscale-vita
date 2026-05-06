@@ -26,7 +26,7 @@ pub use endpoint::Endpoint;
 pub use error::Error;
 pub use header::Header;
 pub use message_type::MessageType;
-pub use packet::Packet;
+pub use packet::{Encrypted, Packet, Plaintext};
 pub use ping::Ping;
 pub use pong::Pong;
 

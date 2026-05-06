@@ -34,8 +34,8 @@ impl fmt::Display for Error {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {}
+/// `core::error::Error` is stable since Rust 1.81 — no std needed.
+impl core::error::Error for Error {}
 
 impl<A, S, V> From<zerocopy::ConvertError<A, S, V>> for Error {
     fn from(value: zerocopy::ConvertError<A, S, V>) -> Self {

@@ -73,7 +73,8 @@ impl DiscoPrivateKey {
         DiscoPublicKey(BoxSecret::from(self.0).public_key().to_bytes())
     }
 
-    #[cfg(any(test, feature = "std"))]
+    /// Generate a fresh private key from the OS RNG. Always available
+    /// (rand_core's OsRng + getrandom feature is in our workspace deps).
     pub fn random() -> Self {
         use rand_core::RngCore;
         let mut b = [0u8; 32];

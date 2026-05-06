@@ -42,6 +42,19 @@ impl Header {
         }
     }
 
+    /// The Disco public key claimed by the sender (un-validated; only
+    /// the AEAD decrypt below proves possession). Callers use this to
+    /// look up which peer a packet came from.
+    pub fn sender_pub(&self) -> DiscoPublicKey {
+        self.sender_pub
+    }
+
+    /// The nonce used for AEAD on this packet's payload. Public for
+    /// debugging only — encryption / decryption set this internally.
+    pub fn nonce(&self) -> [u8; Self::NONCE_LEN] {
+        self.nonce
+    }
+
     /// Parse header from buffer, validating that message has the correct
     /// magic bytes.
     pub fn from_bytes(buf: &[u8]) -> Result<(&Self, &[u8]), Error> {

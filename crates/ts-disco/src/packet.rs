@@ -135,8 +135,12 @@ impl Packet<Plaintext> {
     ) -> Result<&mut Packet<Encrypted>, Error> {
         let bx = crypto_box::SalsaBox::new(&receiver.into(), &secret.into());
 
-        self.header.sender_pub = secret.public_key();
-        self.header.nonce = nonce;
+        // Initialise the header in-full. The upstream tailscale-rs
+        // implementation skipped magic here (its roundtrip test reused
+        // the same `&mut Packet` so never reparsed) — but real packets
+        // going over UDP MUST go through `from_encrypted_bytes`'s
+        // magic-validation path, so we set magic here too.
+        self.header = Header::new(secret.public_key(), nonce);
 
         let tag = bx
             .encrypt_in_place_detached(&GenericArray::from(nonce), &[], &mut self.payload.payload)

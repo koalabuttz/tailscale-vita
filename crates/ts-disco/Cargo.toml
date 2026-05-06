@@ -21,6 +21,9 @@ num-traits = { workspace = true }
 num-derive = { workspace = true }
 rand_core  = { workspace = true }
 
+# rand_core's getrandom feature pulls in std::os via getrandom 0.2;
+# fine for our std targets.
+
 [dev-dependencies]
 zerocopy = { workspace = true, features = ["derive", "std"] }
 rand     = "0.8"

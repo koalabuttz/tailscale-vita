@@ -7,6 +7,7 @@ members = [
     "crates/ts-control",
     "crates/ts-derp",
     "crates/ts-disco",
+    "crates/ts-magicsock",
     "crates/tailscale-vita",
     "crates/tailscale-vita-demo",
     "crates/tailscale-vita-rt",
