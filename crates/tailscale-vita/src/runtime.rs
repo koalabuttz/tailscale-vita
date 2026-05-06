@@ -148,6 +148,8 @@ impl Runtime {
         info!("netstack: poll thread running (no local IP yet)");
 
         // 9. MapClient.
+        // M12B: local_endpoints is empty here; M12F will wire actual
+        // candidates (LAN IP + Disco UDP port) through Runtime::up.
         let map = MapClient::start(
             conn,
             ks.node_pub,
@@ -155,6 +157,7 @@ impl Runtime {
             config.hostname.clone(),
             host_authority.clone(),
             state_dir.clone(),
+            Vec::new(),
         )?;
         info!("control.map.started");
 

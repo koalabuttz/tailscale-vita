@@ -58,6 +58,12 @@ pub struct MapClient {
     netmap: NetMap,
     framer: Framer,
     last_frame_at: Instant,
+    /// Local endpoint candidates this node thinks peers can reach it on,
+    /// formatted as `ip:port` (IPv4 or `[ipv6]:port`). Populated by the
+    /// runtime once the Disco UDP socket is bound and the LAN IP is
+    /// known. Sent in `MapRequest.Endpoints` on the next dial /
+    /// reissue. Empty until M12F wires the runtime hook.
+    local_endpoints: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -86,6 +92,9 @@ pub struct NetMapSnapshot {
 impl MapClient {
     /// Open a streaming `/machine/map` request through `conn`. Loads
     /// (or generates) the persistent `last_seq` and `session_handle`.
+    ///
+    /// `local_endpoints` is the M12 direct-paths candidate list — pass
+    /// `Vec::new()` to omit (Headscale tolerates empty Endpoints).
     pub fn start(
         mut conn: Http2Conn,
         node_pub: NodePublic,
@@ -93,11 +102,13 @@ impl MapClient {
         hostname: String,
         authority: String,
         state_dir: PathBuf,
+        local_endpoints: Vec<String>,
     ) -> Result<Self, ControlError> {
         let (last_seq, session_handle) = load_session_state(&state_dir)?;
         info!(
             last_seq,
             handle_short = %short_handle(&session_handle),
+            endpoint_count = local_endpoints.len(),
             "control.map.session.resume"
         );
 
@@ -107,6 +118,7 @@ impl MapClient {
             &hostname,
             last_seq,
             &session_handle,
+            &local_endpoints,
         );
         let body = serde_json::to_vec(&request)?;
         info!(
@@ -153,7 +165,19 @@ impl MapClient {
             netmap,
             framer: Framer::new(gzipped),
             last_frame_at: Instant::now(),
+            local_endpoints,
         })
+    }
+
+    /// Replace the local-endpoint candidate list. Takes effect on the
+    /// next `reissue()` (the open long-poll continues to advertise the
+    /// previous set until it cycles).
+    pub fn set_local_endpoints(&mut self, endpoints: Vec<String>) {
+        info!(
+            count = endpoints.len(),
+            "control.map.local_endpoints.set"
+        );
+        self.local_endpoints = endpoints;
     }
 
     /// Drive the long-poll for one event with a per-call deadline. The
@@ -240,6 +264,7 @@ impl MapClient {
             &self.hostname,
             self.netmap.last_seq,
             &self.netmap.session_handle,
+            &self.local_endpoints,
         );
         let body = serde_json::to_vec(&request)?;
         let head = self.conn.request_stream(
@@ -285,6 +310,7 @@ fn build_map_request(
     hostname: &str,
     last_seq: i64,
     session_handle: &str,
+    endpoints: &[String],
 ) -> MapRequestWire {
     MapRequestWire {
         version: MAP_VERSION,
@@ -300,7 +326,7 @@ fn build_map_request(
         stream: true,
         omit_peers: false,
         read_only: false,
-        endpoints: vec![],
+        endpoints: endpoints.to_vec(),
         map_session_handle: session_handle.to_string(),
         map_session_seq: last_seq,
     }
