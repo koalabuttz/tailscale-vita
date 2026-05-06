@@ -10,7 +10,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::dispatch::{parse_ipv4_dst, peer_for_ip, route_inbound, InboundRoute};
 use crate::indices::Indices;
-use crate::peer::{Peer, TransportAddr};
+use crate::peer::{DirectPathHint, Peer, TransportAddr};
 use crate::transport::Transport;
 
 /// Buffer size for `Tunn::encapsulate` / `decapsulate` work area. Per
@@ -39,6 +39,7 @@ enum Outcome {
 pub(crate) fn run<T: Transport + ?Sized>(
     indices: Arc<Indices>,
     transport: Arc<T>,
+    direct_path_hint: Option<Arc<dyn DirectPathHint>>,
     tun_rx_q: Arc<Mutex<VecDeque<Vec<u8>>>>,
     tun_tx_q: Arc<Mutex<VecDeque<Vec<u8>>>>,
     rx_notify: Arc<(Mutex<bool>, Condvar)>,
@@ -46,7 +47,8 @@ pub(crate) fn run<T: Transport + ?Sized>(
 ) {
     info!(peers = indices.count(), "wg-engine pump starting");
 
-    prime_handshakes(&indices, &*transport);
+    let hint_ref = direct_path_hint.as_deref();
+    prime_handshakes(&indices, &*transport, hint_ref);
 
     let mut last_tick = Instant::now();
 
@@ -72,14 +74,14 @@ pub(crate) fn run<T: Transport + ?Sized>(
         loop {
             let pkt = tun_tx_q.lock().pop_front();
             match pkt {
-                Some(p) => handle_outbound(&indices, &*transport, &p),
+                Some(p) => handle_outbound(&indices, &*transport, hint_ref, &p),
                 None => break,
             }
         }
 
         // 3. Timer tick.
         if last_tick.elapsed() >= TIMER_TICK {
-            tick_timers(&indices, &*transport);
+            tick_timers(&indices, &*transport, hint_ref);
             last_tick = Instant::now();
         }
     }
@@ -87,10 +89,30 @@ pub(crate) fn run<T: Transport + ?Sized>(
     info!("wg-engine pump exiting");
 }
 
-fn prime_handshakes<T: Transport + ?Sized>(indices: &Indices, transport: &T) {
+/// Pick the best transport addr for a peer right now. Prefers a
+/// Disco-validated direct UDP path if the optional hint says one is
+/// alive; otherwise falls back to the peer's cached `transport_addr`
+/// (typically Derp).
+fn pick_addr(
+    peer: &Peer,
+    hint: Option<&dyn DirectPathHint>,
+) -> Option<TransportAddr> {
+    if let Some(h) = hint {
+        if let Some(udp) = h.alive_endpoint(&peer.pubkey) {
+            return Some(TransportAddr::Udp(udp));
+        }
+    }
+    peer.transport_addr_load()
+}
+
+fn prime_handshakes<T: Transport + ?Sized>(
+    indices: &Indices,
+    transport: &T,
+    hint: Option<&dyn DirectPathHint>,
+) {
     let snapshot: Vec<Arc<Peer>> = indices.by_pubkey.read().values().cloned().collect();
     for peer in snapshot {
-        let addr = match peer.transport_addr_load() {
+        let addr = match pick_addr(&peer, hint) {
             Some(a) => a,
             None => continue,
         };
@@ -127,7 +149,15 @@ fn handle_inbound<T: Transport + ?Sized>(
     };
 
     for peer in peers {
-        peer.set_transport_addr(src_addr);
+        // M12: only update peer's cached transport_addr for Derp arrivals.
+        // Direct UDP packets MUST NOT overwrite the Derp fallback —
+        // path selection at send time is handled by `DirectPathHint`,
+        // not by which transport we last received on. (Pre-M12 behavior
+        // was to roam unconditionally; that broke Derp-as-fallback once
+        // a single direct-path packet arrived.)
+        if matches!(src_addr, TransportAddr::Derp { .. }) {
+            peer.set_transport_addr(src_addr);
+        }
 
         // First decapsulate consumes `datagram`. Subsequent calls drain queued
         // tx with empty input (per boringtun docs).
@@ -154,6 +184,12 @@ fn handle_inbound<T: Transport + ?Sized>(
             }
         }
 
+        // Net outputs from decapsulate (handshake reply, keepalive)
+        // get routed back through the same channel they arrived on
+        // (src_addr). This stays correct in M12 because Disco-direct
+        // paths handle their own bidirectional liveness — if a WG
+        // packet arrived via Udp(addr), we already validated that
+        // path with Disco and addr is reachable.
         for bytes in net_outputs {
             send_outbound(transport, &peer.pubkey, src_addr, &bytes);
         }
@@ -181,6 +217,7 @@ fn handle_inbound<T: Transport + ?Sized>(
 fn handle_outbound<T: Transport + ?Sized>(
     indices: &Indices,
     transport: &T,
+    hint: Option<&dyn DirectPathHint>,
     plaintext: &[u8],
 ) {
     let dst = match parse_ipv4_dst(plaintext) {
@@ -197,7 +234,7 @@ fn handle_outbound<T: Transport + ?Sized>(
             return;
         }
     };
-    let addr = match peer.transport_addr_load() {
+    let addr = match pick_addr(&peer, hint) {
         Some(a) => a,
         None => {
             trace!(peer_pub = %short_hex(&peer.pubkey), "no known transport addr; dropping");
@@ -223,10 +260,14 @@ fn handle_outbound<T: Transport + ?Sized>(
     }
 }
 
-fn tick_timers<T: Transport + ?Sized>(indices: &Indices, transport: &T) {
+fn tick_timers<T: Transport + ?Sized>(
+    indices: &Indices,
+    transport: &T,
+    hint: Option<&dyn DirectPathHint>,
+) {
     let snapshot: Vec<Arc<Peer>> = indices.by_pubkey.read().values().cloned().collect();
     for peer in snapshot {
-        let addr = match peer.transport_addr_load() {
+        let addr = match pick_addr(&peer, hint) {
             Some(a) => a,
             None => continue,
         };

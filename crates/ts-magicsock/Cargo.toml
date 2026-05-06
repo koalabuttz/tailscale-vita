@@ -12,6 +12,9 @@ publish.workspace = true
 
 [dependencies]
 ts-disco          = { path = "../ts-disco" }
+# `DirectPathHint` trait — wg-engine's pump consults a `MagicSocketCtl`
+# at send time to prefer a Disco-validated direct UDP path.
+wg-engine         = { path = "../wg-engine" }
 crypto_box        = { workspace = true }
 parking_lot       = { workspace = true }
 crossbeam-channel = { workspace = true }

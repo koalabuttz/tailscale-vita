@@ -1612,6 +1612,7 @@ dependencies = [
 name = "tailscale-vita"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "http",
  "netstack",
  "parking_lot",
@@ -1622,6 +1623,7 @@ dependencies = [
  "tracing",
  "ts-control",
  "ts-derp",
+ "ts-magicsock",
  "wg-engine",
  "x25519-dalek",
 ]
@@ -1945,6 +1947,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "ts-disco",
+ "wg-engine",
  "zerocopy",
 ]
 

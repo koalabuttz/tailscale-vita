@@ -8,6 +8,16 @@ use parking_lot::Mutex;
 
 use crate::WgError;
 
+/// Optional path-selection oracle the pump consults at send time.
+///
+/// Implementors (e.g. `ts-magicsock::MagicSocketCtl`) report whether a
+/// peer has a Disco-validated direct UDP path right now. If `Some(addr)`,
+/// the pump uses `TransportAddr::Udp(addr)`; if `None`, falls back to the
+/// peer's cached `transport_addr` (Derp).
+pub trait DirectPathHint: Send + Sync {
+    fn alive_endpoint(&self, peer_pubkey: &[u8; 32]) -> Option<SocketAddr>;
+}
+
 /// Where to send encrypted WireGuard datagrams for a peer.
 ///
 /// - `Udp` (M2): direct UDP — used by the M2 hardcoded-peer ICMP harness

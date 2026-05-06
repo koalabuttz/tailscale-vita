@@ -7,10 +7,14 @@ publish.workspace = true
 
 [dependencies]
 # Path deps — the v1 stack crates that Runtime orchestrates.
-ts-control = { path = "../ts-control" }
-ts-derp    = { path = "../ts-derp" }
-wg-engine  = { path = "../wg-engine" }
-netstack   = { path = "../netstack" }
+ts-control   = { path = "../ts-control" }
+ts-derp      = { path = "../ts-derp" }
+ts-magicsock = { path = "../ts-magicsock" }
+wg-engine    = { path = "../wg-engine" }
+netstack     = { path = "../netstack" }
+
+# DualTransport's RX side waits on the non-Disco channel from MagicSocket.
+crossbeam-channel = { workspace = true }
 
 # Workspace deps.
 serde       = { workspace = true }

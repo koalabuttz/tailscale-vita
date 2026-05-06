@@ -1,0 +1,69 @@
+//! `DualTransport` — `wg_engine::Transport` adapter that multiplexes
+//! direct UDP (via `ts-magicsock`) and DERP (via `ts-derp`) for the
+//! engine pump's send/recv calls.
+//!
+//! Send: pattern-match the `TransportAddr` variant. `Udp(addr)` →
+//! `MagicSocketCtl::send_to`; `Derp{..}` → delegate to the inner
+//! `DerpTransport`.
+//!
+//! Recv: prefer non-Disco packets queued by the magic socket
+//! (try_recv non-blocking) before blocking on the DERP receiver. This
+//! gives direct-path bytes priority once they're available, but
+//! doesn't starve DERP — the magic queue empties to `None` quickly,
+//! and the Derp recv consumes the full timeout when it does.
+
+use std::time::Duration;
+
+use crossbeam_channel::Receiver;
+use tracing::trace;
+use ts_derp::DerpTransport;
+use ts_magicsock::{MagicSocketCtl, NonDiscoPacket};
+use wg_engine::{Transport, TransportAddr, WgError};
+
+pub struct DualTransport {
+    magic: MagicSocketCtl,
+    magic_rx: Receiver<NonDiscoPacket>,
+    derp: DerpTransport,
+}
+
+impl DualTransport {
+    pub fn new(
+        magic: MagicSocketCtl,
+        magic_rx: Receiver<NonDiscoPacket>,
+        derp: DerpTransport,
+    ) -> Self {
+        Self {
+            magic,
+            magic_rx,
+            derp,
+        }
+    }
+}
+
+impl Transport for DualTransport {
+    fn send(&self, addr: TransportAddr, datagram: &[u8]) -> Result<(), WgError> {
+        match addr {
+            TransportAddr::Udp(sa) => self
+                .magic
+                .send_to(sa, datagram)
+                .map(|_| ())
+                .map_err(WgError::Io),
+            TransportAddr::Derp { .. } => self.derp.send(addr, datagram),
+        }
+    }
+
+    fn recv_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<(TransportAddr, Vec<u8>)>, WgError> {
+        // Magic first (non-blocking). If something's queued, return it.
+        if let Ok((src, bytes)) = self.magic_rx.try_recv() {
+            trace!(%src, n = bytes.len(), "dual.rx.udp");
+            return Ok(Some((TransportAddr::Udp(src), bytes)));
+        }
+        // Otherwise block on Derp for the full timeout. Magic packets
+        // that arrive during the wait stay queued (the magic_rx
+        // channel is unbounded) and get picked up next tick.
+        self.derp.recv_with_timeout(timeout)
+    }
+}

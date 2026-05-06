@@ -30,7 +30,7 @@ mod error;
 
 pub use config::{build_engine_inputs, decode_priv_key, decode_pub_key, read_wg_toml, WgToml};
 pub use error::WgError;
-pub use peer::{Ipv4Cidr, Peer, PeerConfig, PeerStats, TransportAddr};
+pub use peer::{DirectPathHint, Ipv4Cidr, Peer, PeerConfig, PeerStats, TransportAddr};
 pub use transport::{NoopTransport, Transport, UdpTransport};
 
 use indices::Indices;
@@ -146,6 +146,16 @@ impl Engine {
         &self,
         transport: T,
     ) -> Result<EngineRunning, WgError> {
+        self.start_with_hint(transport, None)
+    }
+
+    /// Like [`Engine::start`], with an optional [`DirectPathHint`] oracle
+    /// the pump consults at send time. M12 wires `MagicSocketCtl` here.
+    pub fn start_with_hint<T: Transport + 'static>(
+        &self,
+        transport: T,
+        direct_path_hint: Option<Arc<dyn DirectPathHint>>,
+    ) -> Result<EngineRunning, WgError> {
         let transport = Arc::new(transport);
         let tun_rx_q = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
         let tun_tx_q = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
@@ -159,6 +169,7 @@ impl Engine {
             let tun_tx_q = Arc::clone(&tun_tx_q);
             let rx_notify = Arc::clone(&rx_notify);
             let shutdown = Arc::clone(&shutdown);
+            let hint = direct_path_hint.clone();
             std::thread::Builder::new()
                 .name("wg_engine".into())
                 .stack_size(256 * 1024)
@@ -166,6 +177,7 @@ impl Engine {
                     pump::run(
                         indices,
                         transport,
+                        hint,
                         tun_rx_q,
                         tun_tx_q,
                         rx_notify,
@@ -175,7 +187,11 @@ impl Engine {
                 .map_err(WgError::Io)?
         };
 
-        info!(peers = self.indices.count(), "wg-engine started");
+        info!(
+            peers = self.indices.count(),
+            direct_hint = direct_path_hint.is_some(),
+            "wg-engine started"
+        );
 
         Ok(EngineRunning {
             tun_rx: tun_rx_q,

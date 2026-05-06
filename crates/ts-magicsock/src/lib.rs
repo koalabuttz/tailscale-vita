@@ -250,6 +250,13 @@ impl MagicSocketCtl {
     }
 }
 
+/// wg-engine's path-selection oracle. The pump asks per send.
+impl wg_engine::DirectPathHint for MagicSocketCtl {
+    fn alive_endpoint(&self, peer_pubkey: &[u8; 32]) -> Option<SocketAddr> {
+        MagicSocketCtl::alive_endpoint(self, peer_pubkey)
+    }
+}
+
 // ============================================================
 // Worker: receive loop + periodic ping pump.
 // ============================================================

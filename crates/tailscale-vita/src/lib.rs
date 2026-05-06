@@ -19,12 +19,14 @@
 //! ```
 
 mod config;
+pub mod dual_transport;
 mod error;
 pub mod lifecycle;
 mod proto;
 pub mod runtime;
 
 pub use config::Config;
+pub use dual_transport::DualTransport;
 pub use error::{ConfigError, RuntimeError};
 pub use lifecycle::{LifecycleTracker, OnlineState};
 pub use runtime::{RunStats, Runtime};
