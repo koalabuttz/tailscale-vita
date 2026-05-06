@@ -6,6 +6,7 @@ members = [
     "crates/netstack",
     "crates/ts-control",
     "crates/ts-derp",
+    "crates/ts-disco",
     "crates/tailscale-vita",
     "crates/tailscale-vita-demo",
     "crates/tailscale-vita-rt",
@@ -62,6 +63,12 @@ tokio = { version = "1", default-features = false, features = ["rt", "macros", "
 
 # --- DERP NaCl box (M8; cross-compile spike at head of M8) ---
 crypto_box = { version = "0.9", default-features = false, features = ["alloc", "salsa20"] }
+
+# --- Disco wire format (M12; lifted from tailscale-rs::ts_disco_protocol) ---
+aead       = { version = "0.5", default-features = false }
+zerocopy   = { version = "0.8", default-features = false, features = ["alloc"] }
+num-traits = { version = "0.2", default-features = false }
+num-derive = "0.4"
 
 # --- Concurrency (no async runtime for the rest of the system) ---
 crossbeam-channel = "0.5"

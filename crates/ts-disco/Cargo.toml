@@ -1,0 +1,31 @@
+[package]
+name = "ts-disco"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# M12: Tailscale's "disco" protocol — NaCl-box encrypted Ping/Pong/CallMeMaybe
+# packets sent over UDP for direct-path liveness probing. Lifted from
+# tailscale-rs's `ts_disco_protocol` (~95% complete reference implementation),
+# with the ts_keys dep replaced by our own minimal newtype wrappers in keys.rs
+# so we don't have to vendor an entire keys crate.
+[lib]
+name = "ts_disco"
+
+[dependencies]
+aead       = { workspace = true }
+crypto_box = { workspace = true }
+zerocopy   = { workspace = true, features = ["derive"] }
+num-traits = { workspace = true }
+num-derive = { workspace = true }
+rand_core  = { workspace = true }
+
+[dev-dependencies]
+zerocopy = { workspace = true, features = ["derive", "std"] }
+rand     = "0.8"
+
+[features]
+default = ["alloc"]
+alloc   = []
+std     = ["alloc"]
