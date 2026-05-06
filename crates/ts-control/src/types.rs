@@ -259,6 +259,11 @@ pub(crate) struct NodeWire {
     pub derp_legacy: String, // "127.3.3.40:<region>"
     #[serde(rename = "Online", default)]
     pub online: Option<bool>,
+    /// M12: peer's advertised direct-path candidates ("ip:port" strings;
+    /// IPv4 or "[v6]:port"). Headscale forwards what each peer sent in
+    /// its `MapRequest.Endpoints`.
+    #[serde(rename = "Endpoints", default)]
+    pub endpoints: Vec<String>,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]

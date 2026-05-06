@@ -17,7 +17,7 @@
 //! - `DERPMap` → replace wholesale.
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 use tracing::{debug, info, warn};
 
@@ -41,6 +41,10 @@ pub struct PeerSnapshot {
     pub allowed_ips: Vec<AllowedIp>,
     pub home_derp: u16,
     pub online: bool,
+    /// M12: peer's advertised direct-path UDP candidates. Empty for
+    /// peers running pre-M12 clients. Strings that don't parse as
+    /// SocketAddr are silently dropped (logged at trace level).
+    pub endpoints: Vec<SocketAddr>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -244,7 +248,10 @@ fn apply_patch_fields(peer: &mut PeerSnapshot, patch: &PeerChangeWire) {
     if let Some(online) = patch.online {
         peer.online = online;
     }
-    // endpoints / last_seen / key_expiry: v1 doesn't consume.
+    if let Some(endpoints) = &patch.endpoints {
+        peer.endpoints = parse_endpoints(endpoints);
+    }
+    // last_seen / key_expiry: v1 doesn't consume.
 }
 
 fn node_to_snapshot(n: &NodeWire) -> Option<PeerSnapshot> {
@@ -268,7 +275,15 @@ fn node_to_snapshot(n: &NodeWire) -> Option<PeerSnapshot> {
         allowed_ips,
         home_derp,
         online: n.online.unwrap_or(false),
+        endpoints: parse_endpoints(&n.endpoints),
     })
+}
+
+/// Parse the wire `["1.2.3.4:41641", "[v6]:port", ...]` strings into
+/// `SocketAddr`. Bad entries are dropped silently — a peer advertising
+/// junk shouldn't break our netmap.
+fn parse_endpoints(addrs: &[String]) -> Vec<SocketAddr> {
+    addrs.iter().filter_map(|s| s.parse().ok()).collect()
 }
 
 fn parse_nodekey(s: &str) -> Option<NodeKeyBytes> {
@@ -425,6 +440,50 @@ mod tests {
         assert_eq!(delta.removed, vec![key_bytes(0x11)]);
         assert_eq!(nm.peers.len(), 1);
         assert!(nm.peers.contains_key(&key_bytes(0x22)));
+    }
+
+    #[test]
+    fn full_peer_picks_up_endpoints() {
+        let mut nm = NetMap::default();
+        let mut n = node(1, 0x11, "100.64.0.2");
+        n.endpoints = vec![
+            "192.168.8.147:41641".into(),
+            "[2001:db8::1]:41641".into(),
+            "garbage".into(), // dropped silently
+        ];
+        nm.apply(&MapResponseWire {
+            peers: Some(vec![n]),
+            ..Default::default()
+        });
+        let p = &nm.peers[&key_bytes(0x11)];
+        assert_eq!(p.endpoints.len(), 2);
+        assert_eq!(
+            p.endpoints[0],
+            "192.168.8.147:41641".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn apply_patch_endpoints_replaces() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            peers: Some(vec![node(7, 0x77, "100.64.0.7")]),
+            ..Default::default()
+        });
+        assert!(nm.peers[&key_bytes(0x77)].endpoints.is_empty());
+
+        let delta = nm.apply(&MapResponseWire {
+            peers_changed_patch: Some(vec![PeerChangeWire {
+                node_id: 7,
+                endpoints: Some(vec!["10.0.0.1:41641".into()]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        assert_eq!(delta.patches_applied, 1);
+        let eps = &nm.peers[&key_bytes(0x77)].endpoints;
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0], "10.0.0.1:41641".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
