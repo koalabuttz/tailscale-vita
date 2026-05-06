@@ -56,6 +56,16 @@ pub struct Config {
     /// you're doing — Headscale 0.26's floor is 88; we send 90.
     #[serde(default = "default_capver")]
     pub capver: u32,
+
+    /// M11 Phase 2 flag. When true, the demo eboot's main() skips
+    /// `Runtime::up` and just sleeps forever — the demo becomes a host
+    /// process for the SUPRX (which runs the actual runtime). Set
+    /// this in `config.toml` when running with the
+    /// `tailscale-vita-plugin.suprx` loaded under `*TVIT00010`.
+    /// Default false: demo behaves as in M10 and runs the runtime
+    /// itself.
+    #[serde(default)]
+    pub suprx_host_only: bool,
 }
 
 impl Config {
@@ -128,6 +138,12 @@ listener_pool_size  = 4
 
 # Don't change unless you know what you're doing.
 capver              = 90
+
+# M11 Phase 2: set true when the SUPRX (`tailscale-vita-plugin.suprx`)
+# is loaded under *TVIT00010 — the demo eboot then skips its own
+# Runtime startup and just keeps the process alive so the SUPRX can
+# run. Default false (M10 demo behavior).
+# suprx_host_only   = false
 "#;
 
 fn default_hostname() -> String {
@@ -167,6 +183,7 @@ mod tests {
         assert_eq!(cfg.listener_pool_size, 4);
         assert_eq!(cfg.capver, 90);
         assert_eq!(cfg.run_window_secs, None);
+        assert!(!cfg.suprx_host_only);
     }
 
     #[test]
@@ -182,6 +199,7 @@ mod tests {
             listener_pool_size: 4,
             run_window_secs: None,
             capver: 90,
+            suprx_host_only: false,
         };
         assert_eq!(cfg.host_authority(), "192.168.8.147:8080");
     }
@@ -199,6 +217,7 @@ mod tests {
             listener_pool_size: 4,
             run_window_secs: None,
             capver: 90,
+            suprx_host_only: false,
         };
         assert_eq!(cfg.host_authority(), "controlplane.tailscale.com");
     }

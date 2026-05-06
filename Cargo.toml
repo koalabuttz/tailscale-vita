@@ -99,13 +99,12 @@ lto       = true
 opt-level = 2
 
 # `staticlib` profile is used by the *.suprx Rust shim (crates/tailscale-vita-rt).
-# `panic = "abort"` is required because the shim is no_std and the workspace's
-# default `panic = "unwind"` pulls in the eh_personality lang-item which std
-# normally provides. Different artifact dir from `release/` so it never
-# co-builds with the demo eboot.
+# Phase 2 switched to `panic = "unwind"` because the shim now uses std +
+# `std::panic::catch_unwind` (the Phase 1 staticlib was no_std + panic=abort).
+# Different artifact dir from `release/` so it never co-builds with the demo eboot.
 [profile.staticlib]
 inherits  = "release"
-panic     = "abort"
+panic     = "unwind"
 opt-level = "z"
 
 [patch.crates-io]

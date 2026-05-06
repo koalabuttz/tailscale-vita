@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, RecvTimeoutError};
 use tracing::{error, info, info_span, warn};
+use vita_log::LogError;
 
 use netstack::TcpListener;
 use tailscale_vita::{Config, ConfigError, Runtime};
@@ -29,9 +30,17 @@ const CONFIG_PATH: &str = "ux0:/data/tailscale-vita/config.toml";
 const ACCEPT_POLL: Duration = Duration::from_millis(500);
 
 fn main() {
-    if let Err(e) = vita_log::init() {
-        eprintln!("vita-log init failed: {e}");
-        return;
+    // M11 Phase 2: when the SUPRX is staged under *TVIT00010, its
+    // module_start runs BEFORE this `main` and inits vita-log first.
+    // Treat AlreadyInitialized as benign — it just means the SUPRX
+    // beat us.
+    match vita_log::init() {
+        Ok(()) => {}
+        Err(LogError::AlreadyInitialized) => {}
+        Err(e) => {
+            eprintln!("vita-log init failed: {e}");
+            return;
+        }
     }
     let _span = info_span!(
         "startup",
@@ -101,8 +110,19 @@ fn run() -> Result<(), DemoError> {
         demo_port = config.demo_port,
         listener_pool_size = config.listener_pool_size,
         run_window_secs = ?config.run_window_secs,
+        suprx_host_only = config.suprx_host_only,
         "demo.config.loaded"
     );
+
+    // M11 Phase 2: if the SUPRX is the runtime owner, demo just keeps
+    // the process alive. SUPRX module_start has already spawned the
+    // bootstrap thread before we got here.
+    if config.suprx_host_only {
+        info!("demo: suprx_host_only=true — skipping Runtime::up; sleeping forever to host the SUPRX");
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
+    }
 
     if config.auth_key.is_empty() {
         warn!(

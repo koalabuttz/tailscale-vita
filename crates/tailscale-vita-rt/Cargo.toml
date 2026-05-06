@@ -5,11 +5,19 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Phase 1B: minimal no_std staticlib invoked from the *.suprx C shim.
-# We keep this no_std until Phase 1C wires up taipool as the global
-# allocator. Until then, no String/Vec/format_args!/Box.
+# Phase 2: std-based staticlib that runs the full tailscale-vita Runtime
+# inside a SUPRX-spawned thread. Phase 1's no_std + alloc-only structure
+# is gone; the TaipoolAllocator stays as our `#[global_allocator]`.
 [lib]
 name        = "tailscale_vita_rt"
 crate-type  = ["staticlib"]
 
 [dependencies]
+# Path deps — the runtime + log + listener types we wrap.
+tailscale-vita = { path = "../tailscale-vita" }
+vita-log       = { path = "../vita-log" }
+netstack       = { path = "../netstack" }
+
+# Workspace deps for the runtime body + worker thread.
+crossbeam-channel = { workspace = true }
+tracing           = { workspace = true }
