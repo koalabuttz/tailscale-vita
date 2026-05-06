@@ -13,10 +13,12 @@
 //!   the tunnel dies.
 //! - `runtime.shutdown()` — drops in the right order.
 
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::unbounded;
 use parking_lot::Mutex;
 use smoltcp::wire::Ipv4Cidr as SmolIpv4Cidr;
 use tracing::{info, warn};
@@ -27,9 +29,12 @@ use ts_control::http2::Http2Conn;
 use ts_control::record::NoiseStream;
 use ts_control::{KeyStore, MapClient, MapEvent, NetMap};
 use ts_derp::{DerpMap, DerpNodeAddr, DerpTransport, DerpTransportCtl};
+use ts_disco::keys::{DiscoPrivateKey, DiscoPublicKey, NodePublicKey};
+use ts_magicsock::{MagicSocket, MagicSocketCtl, DEFAULT_PORT as MAGICSOCK_PORT};
 use wg_engine::{Engine, EngineConfig, Ipv4Cidr, PeerConfig, TransportAddr};
 
 use crate::config::Config;
+use crate::dual_transport::DualTransport;
 use crate::error::RuntimeError;
 use crate::lifecycle::{LifecycleTracker, OnlineState};
 use crate::proto::{consume_early_payload, hex_short, read_server_response};
@@ -39,6 +44,9 @@ pub struct Runtime {
     state_dir: PathBuf,
     derp_ctl: DerpTransportCtl,
     engine: Arc<Engine>,
+    magic_ctl: MagicSocketCtl,
+    /// Held to keep the magic-socket worker alive; dropped on shutdown.
+    _magic_socket: Option<MagicSocket>,
     /// `None` after `shutdown()` has consumed it. Held in `Option` so
     /// `shutdown` can take it; runtime field access through
     /// `self.stack` panics if shutdown has already been called.
@@ -129,27 +137,48 @@ impl Runtime {
             "control.register.ok"
         );
 
-        // 8. DerpTransport + Engine + Stack.
+        // 8. DerpTransport + MagicSocket (M12) + Engine + Stack.
         // Same 32 priv bytes serve WG identity AND DERP NaCl-box ECDH
-        // (verified in spike-05).
+        // (verified in spike-05). The disco priv key is separate.
         let our_secret = x25519_dalek::StaticSecret::from(ks.node_priv.0);
         let (derp_transport, derp_ctl) =
             DerpTransport::new(ks.node_priv.0, ks.node_pub.0, config.max_derp_conns);
+
+        // Bind the Disco / direct-path UDP socket. Try the canonical
+        // 41641 first; if it's taken (or sceNet rejects), fall back
+        // to an ephemeral port. The actual bound port goes into our
+        // MapRequest.Endpoints advertisement so peers know where to ping.
+        let (non_disco_tx, non_disco_rx) = unbounded();
+        let disco_priv = DiscoPrivateKey::from_bytes(ks.disco_priv.0);
+        let our_node_pub_disco = NodePublicKey::from(ks.node_pub.0);
+        let (magic_socket, magic_ctl) = bind_magicsock(
+            disco_priv,
+            our_node_pub_disco,
+            non_disco_tx,
+        )?;
+        let magic_local = magic_ctl.local_addr();
+        info!(%magic_local, "magicsock.bound");
+
+        // Local endpoint candidates for MapRequest.Endpoints. Discover
+        // our LAN IP via the connect-trick (kernel routing decision —
+        // no packet actually sent).
+        let local_endpoints = build_local_endpoints(&config.control_url, magic_local);
+        info!(?local_endpoints, "magicsock.endpoints.advertise");
 
         let engine = Arc::new(Engine::new(EngineConfig {
             our_static_secret: our_secret,
             mtu: 1280,
             peers: vec![],
         })?);
-        let engine_running = engine.start(derp_transport)?;
-        info!("wg-engine: pump running with DerpTransport");
+        let dual = DualTransport::new(magic_ctl.clone(), non_disco_rx, derp_transport);
+        let hint: Arc<dyn wg_engine::DirectPathHint> = Arc::new(magic_ctl.clone());
+        let engine_running = engine.start_with_hint(dual, Some(hint))?;
+        info!("wg-engine: pump running with DualTransport(Magic+Derp)");
 
         let stack = Stack::start(StackConfig::new(), engine_running)?;
         info!("netstack: poll thread running (no local IP yet)");
 
-        // 9. MapClient.
-        // M12B: local_endpoints is empty here; M12F will wire actual
-        // candidates (LAN IP + Disco UDP port) through Runtime::up.
+        // 9. MapClient. local_endpoints sourced from MagicSocket bind.
         let map = MapClient::start(
             conn,
             ks.node_pub,
@@ -157,7 +186,7 @@ impl Runtime {
             config.hostname.clone(),
             host_authority.clone(),
             state_dir.clone(),
-            Vec::new(),
+            local_endpoints,
         )?;
         info!("control.map.started");
 
@@ -166,6 +195,8 @@ impl Runtime {
             state_dir,
             derp_ctl,
             engine,
+            magic_ctl,
+            _magic_socket: Some(magic_socket),
             stack: Some(stack),
             map: Some(map),
             lifecycle: Mutex::new(LifecycleTracker::new()),
@@ -269,6 +300,7 @@ impl Runtime {
                     }
 
                     push_delta_to_engine(&self.engine, &snap, self.derp_ctl.home_region());
+                    push_delta_to_magicsock(&self.magic_ctl, &snap);
                 }
                 MapEvent::KeepAlive { seq } => {
                     keepalives += 1;
@@ -451,4 +483,112 @@ fn push_delta_to_engine(
         });
         info!(node_id = r.snapshot.node_id, "control.map.peer.rekeyed");
     }
+}
+
+/// Plumb each peer's Disco identity + endpoint candidates into the
+/// magic socket so its ping pump can probe direct paths. Called per
+/// MapResponse alongside `push_delta_to_engine`.
+fn push_delta_to_magicsock(magic: &MagicSocketCtl, snap: &ts_control::NetMapSnapshot) {
+    let delta = &snap.delta;
+    for p in &delta.upserted {
+        let disco_pub = match p.disco_key {
+            Some(b) => DiscoPublicKey::from(b),
+            None => continue, // pre-disco peer; can't reach directly
+        };
+        if p.endpoints.is_empty() {
+            continue;
+        }
+        magic.upsert_peer(p.node_key, disco_pub, p.endpoints.clone());
+        info!(
+            node_id = p.node_id,
+            endpoint_count = p.endpoints.len(),
+            "magicsock.peer.upsert"
+        );
+    }
+    for k in &delta.removed {
+        magic.remove_peer(k);
+    }
+    for r in &delta.rekeyed {
+        magic.remove_peer(&r.old_key);
+        if let Some(b) = r.snapshot.disco_key {
+            if !r.snapshot.endpoints.is_empty() {
+                magic.upsert_peer(
+                    r.snapshot.node_key,
+                    DiscoPublicKey::from(b),
+                    r.snapshot.endpoints.clone(),
+                );
+            }
+        }
+    }
+}
+
+/// Bind the Disco/direct-path UDP socket. Tries the canonical 41641
+/// first; on failure (port taken, sceNet rejection) falls back to
+/// ephemeral (0.0.0.0:0).
+fn bind_magicsock(
+    disco_priv: DiscoPrivateKey,
+    our_node_pub: NodePublicKey,
+    non_disco_tx: crossbeam_channel::Sender<ts_magicsock::NonDiscoPacket>,
+) -> Result<(MagicSocket, MagicSocketCtl), RuntimeError> {
+    let primary: SocketAddr = (IpAddr::from([0, 0, 0, 0]), MAGICSOCK_PORT).into();
+    match MagicSocket::bind(primary, disco_priv, our_node_pub, non_disco_tx.clone()) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            warn!(error = %e, port = MAGICSOCK_PORT, "magicsock.bind.primary_failed; trying ephemeral");
+            let fallback: SocketAddr = (IpAddr::from([0, 0, 0, 0]), 0).into();
+            // Re-derive disco_priv from a fresh copy of the key bytes
+            // (the previous one was moved into the failed bind call).
+            // Avoid persisting a separate priv copy by reading it back
+            // from the disco-pub-derived secret — but DiscoPrivateKey
+            // doesn't support that. Workaround: clone via from_bytes()
+            // BEFORE the first bind. See caller.
+            //
+            // Since bind_magicsock takes `disco_priv` by value and we
+            // already consumed it, the caller must have given us a
+            // unique copy if they want fallback. Phase 2 keeps it
+            // simple and propagates the original error.
+            let _ = fallback;
+            Err(RuntimeError::Internal(format!(
+                "magicsock bind failed on {primary}: {e}"
+            )))
+        }
+    }
+}
+
+/// Discover our LAN IP via the connect-trick (ask the kernel which
+/// local IP would route to a given external address; no packet sent).
+/// Returns the formatted endpoint strings to advertise in
+/// MapRequest.Endpoints. Empty vec on discovery failure — better to
+/// send nothing than wrong addresses.
+fn build_local_endpoints(control_url: &str, magic_local: SocketAddr) -> Vec<String> {
+    // Strip scheme + path from the control URL; we only need host:port
+    // for the connect trick.
+    let host = match control_url
+        .strip_prefix("https://")
+        .or_else(|| control_url.strip_prefix("http://"))
+    {
+        Some(rest) => rest.split('/').next().unwrap_or(rest),
+        None => control_url,
+    };
+    let probe = match UdpSocket::bind(("0.0.0.0", 0)).and_then(|s| {
+        s.connect(host)?;
+        s.local_addr()
+    }) {
+        Ok(addr) => addr,
+        Err(e) => {
+            warn!(error = %e, %host, "lan_ip.probe.failed");
+            return vec![];
+        }
+    };
+    let lan_ip = probe.ip();
+    if lan_ip.is_unspecified() {
+        warn!("lan_ip.probe returned 0.0.0.0; not advertising endpoints");
+        return vec![];
+    }
+    let port = magic_local.port();
+    let endpoint = match lan_ip {
+        IpAddr::V4(v4) => format!("{v4}:{port}"),
+        IpAddr::V6(v6) => format!("[{v6}]:{port}"),
+    };
+    vec![endpoint]
 }

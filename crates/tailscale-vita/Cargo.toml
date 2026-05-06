@@ -9,6 +9,7 @@ publish.workspace = true
 # Path deps — the v1 stack crates that Runtime orchestrates.
 ts-control   = { path = "../ts-control" }
 ts-derp      = { path = "../ts-derp" }
+ts-disco     = { path = "../ts-disco" }
 ts-magicsock = { path = "../ts-magicsock" }
 wg-engine    = { path = "../wg-engine" }
 netstack     = { path = "../netstack" }

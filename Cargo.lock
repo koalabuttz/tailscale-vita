@@ -1623,6 +1623,7 @@ dependencies = [
  "tracing",
  "ts-control",
  "ts-derp",
+ "ts-disco",
  "ts-magicsock",
  "wg-engine",
  "x25519-dalek",
