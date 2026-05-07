@@ -28,6 +28,8 @@ pub enum ControlError {
     MapDecode(String),
     #[error("map connection lost: {0}")]
     MapConnectionLost(String),
+    #[error("tls: {0}")]
+    Tls(String),
 }
 
 impl From<ureq::Error> for ControlError {

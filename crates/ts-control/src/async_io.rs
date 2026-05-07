@@ -1,5 +1,5 @@
 //! Plan A: drive the `h2` crate (async, but without an async I/O reactor)
-//! by wrapping our sync `NoiseStream<TcpStream>` in an `AsyncRead +
+//! by wrapping our sync `NoiseStream<ControlStream>` in an `AsyncRead +
 //! AsyncWrite` adapter. A dedicated `noise_pump` thread does the actual
 //! blocking I/O; the adapter's `poll_*` methods exchange bytes with that
 //! thread via two `Mutex<VecDeque<u8>>`s.
@@ -9,7 +9,6 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,6 +20,7 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, trace, warn};
 
+use crate::control_stream::ControlStream;
 use crate::record::NoiseStream;
 
 /// Bytes that the pump's read direction polls for at a time.
@@ -33,7 +33,7 @@ const TX_DRAIN_MAX: usize = 16 * 1024;
 pub struct IoCore {
     /// The underlying sync stream + Noise framer. Held only by the pump
     /// thread (other threads exchange bytes via `rx_buf` / `tx_buf`).
-    noise: Mutex<Option<NoiseStream<TcpStream>>>,
+    noise: Mutex<Option<NoiseStream<ControlStream>>>,
     /// Plaintext bytes already drained from inbound records, ready for
     /// `poll_read`.
     rx_buf: Mutex<VecDeque<u8>>,
@@ -90,7 +90,7 @@ pub struct AsyncNoiseStream {
 }
 
 impl AsyncNoiseStream {
-    pub fn spawn(stream: NoiseStream<TcpStream>) -> Self {
+    pub fn spawn(stream: NoiseStream<ControlStream>) -> Self {
         let core = Arc::new(IoCore {
             noise: Mutex::new(Some(stream)),
             rx_buf: Mutex::new(VecDeque::with_capacity(8192)),
@@ -198,7 +198,7 @@ fn pump(core: Arc<IoCore>) {
     *core.noise.lock() = Some(noise);
 }
 
-fn set_read_timeout(noise: &NoiseStream<TcpStream>, t: Duration) -> io::Result<()> {
+fn set_read_timeout(noise: &NoiseStream<ControlStream>, t: Duration) -> io::Result<()> {
     noise.set_read_timeout(Some(t))
 }
 

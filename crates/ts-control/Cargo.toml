@@ -28,3 +28,7 @@ rand_core    = { workspace = true }
 time         = { workspace = true }
 # M7: gunzip Headscale's HTTP/2 DATA stream (Content-Encoding: gzip)
 flate2       = { workspace = true }
+# M14: rustls + webpki for HTTPS to controlplane.tailscale.com
+rustls           = { workspace = true }
+rustls-pki-types = { workspace = true }
+webpki-roots     = { workspace = true }

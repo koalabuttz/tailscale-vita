@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use crate::control_stream::ControlStream;
 use std::time::Duration;
 
 use crate::noise::{NoiseTransport, NOISE_MAX_RECORD_PAYLOAD};
@@ -49,10 +49,11 @@ impl<S: Read + Write> NoiseStream<S> {
     }
 }
 
-impl NoiseStream<TcpStream> {
+impl NoiseStream<ControlStream> {
     /// Configure the underlying TCP stream's read timeout. Used by the
     /// async-IO pump thread (`async_io.rs`) to alternate read/write
-    /// without busy-spinning.
+    /// without busy-spinning. Works for both plain and TLS-wrapped
+    /// streams (TLS calls down to the underlying TcpStream's setsockopt).
     pub fn set_read_timeout(&self, t: Option<Duration>) -> io::Result<()> {
         self.inner.set_read_timeout(t)
     }

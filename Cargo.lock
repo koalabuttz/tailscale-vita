@@ -1891,6 +1891,8 @@ dependencies = [
  "httparse",
  "parking_lot",
  "rand_core",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "snow",
@@ -1899,6 +1901,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ureq",
+ "webpki-roots",
  "x25519-dalek",
 ]
 

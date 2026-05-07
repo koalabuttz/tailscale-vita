@@ -388,6 +388,13 @@ mod tests {
         assert_eq!(v["Hostinfo"]["IPNVersion"], "tailscale-vita/0.1.0");
         assert!(v["Endpoints"].is_array());
         assert_eq!(v["Endpoints"].as_array().unwrap().len(), 0);
+        // M14 verification: top-level DiscoKey is the canonical place
+        // (matches upstream tailcfg.MapRequest.DiscoKey, JSON-encoded
+        // as the MarshalText form `"discokey:<hex>"`). Pixel9a's
+        // netmap entry on Headscale 0.26 had a non-zero disco_key
+        // populated from MapRequest, so the wire path works at this
+        // shape — kept this assertion to guard against regressions.
+        assert!(v["DiscoKey"].as_str().unwrap().starts_with("discokey:"));
     }
 
     #[test]

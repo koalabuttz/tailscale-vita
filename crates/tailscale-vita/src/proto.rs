@@ -4,14 +4,13 @@
 //! These are private to the Runtime — embedding apps don't see them.
 
 use std::io::Read;
-use std::net::TcpStream;
 use std::time::Duration;
 
 use tracing::info;
 
 use ts_control::record::NoiseStream;
 use ts_control::upgrade::UpgradedSocket;
-use ts_control::ControlError;
+use ts_control::{ControlError, ControlStream};
 
 const EARLY_PAYLOAD_MAGIC: &[u8; 5] = b"\xff\xff\xffTS";
 const SERVER_RESP_LEN: usize = 51;
@@ -20,7 +19,7 @@ const SERVER_RESP_LEN: usize = 51;
 /// JSON) before handing the Noise-framed stream to h2. Required for
 /// protocolVersion ≥ 49 — our 90.
 pub(crate) fn consume_early_payload(
-    stream: &mut NoiseStream<TcpStream>,
+    stream: &mut NoiseStream<ControlStream>,
 ) -> Result<(), ControlError> {
     let mut hdr = [0u8; 9];
     stream

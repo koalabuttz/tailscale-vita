@@ -6,6 +6,7 @@
 //! §"Wire protocols summary".
 
 pub mod async_io;
+pub mod control_stream;
 mod error;
 pub mod http2;
 pub mod keystore;
@@ -20,6 +21,7 @@ mod types;
 pub mod upgrade;
 pub mod url;
 
+pub use control_stream::{wrap_tls, ControlStream};
 pub use error::ControlError;
 pub use keystore::KeyStore;
 pub use map::{MapClient, MapEvent, NetMapSnapshot};

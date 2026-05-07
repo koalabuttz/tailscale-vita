@@ -20,14 +20,17 @@ use std::time::Duration;
 use httparse::Status;
 use tracing::{debug, warn};
 
+use crate::control_stream::{wrap_tls, ControlStream};
 use crate::url as urlmod;
 use crate::ControlError;
 
 /// Handle on the upgraded socket. M5 wraps this with a `NoiseStream`
 /// adapter (record framer); the rest of the control client never reads
-/// directly.
+/// directly. M14 generalised from `TcpStream` to `ControlStream` so we
+/// can carry either cleartext (Headscale dev) or TLS-wrapped (real
+/// `controlplane.tailscale.com`) sockets through the same pipeline.
 pub struct UpgradedSocket {
-    pub tcp: TcpStream,
+    pub tcp: ControlStream,
     /// Bytes that arrived after the `\r\n\r\n` of the 101 response in the
     /// same `read()` syscall. Almost always empty for well-behaved servers.
     pub leftover: Vec<u8>,
@@ -39,32 +42,48 @@ const PATH: &str = "/ts2021";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Open a fresh TCP connection to `server_url` and perform the upgrade.
-/// `handshake_b64` is the base64-encoded init envelope produced by
+/// Open a fresh connection to `server_url` (TLS-wrapped if `https://`)
+/// and perform the HTTP/1.1 upgrade. `handshake_b64` is the
+/// base64-encoded init envelope produced by
 /// `NoiseHandshaker::build_init_header()`.
-pub fn dial_and_upgrade(server_url: &str, handshake_b64: &str) -> Result<UpgradedSocket, ControlError> {
+pub fn dial_and_upgrade(
+    server_url: &str,
+    handshake_b64: &str,
+) -> Result<UpgradedSocket, ControlError> {
     let parsed = urlmod::parse(server_url)?;
-    if parsed.scheme != "http" {
-        return Err(ControlError::Url(
-            "v1 only supports cleartext http on this path; HTTPS hookup is M5+",
-        ));
-    }
+    let scheme: &str = &parsed.scheme;
+    let tls = match scheme {
+        "http" => false,
+        "https" => true,
+        _ => {
+            return Err(ControlError::Url(
+                "control_url scheme must be http or https",
+            ))
+        }
+    };
     let host = parsed.host;
     let port = parsed.port;
 
     let host_header = format!("{host}:{port}");
-    debug!(host = %host, port, "control.upgrade.dial");
+    debug!(host = %host, port, tls, "control.upgrade.dial");
 
-    let addr = (host, port)
+    let host_for_resolve: &str = &host;
+    let addr = (host_for_resolve, port)
         .to_socket_addrs()
         .map_err(|e| ControlError::Transport(format!("resolve {host}:{port}: {e}")))?
         .next()
         .ok_or_else(|| ControlError::Transport(format!("no addrs for {host}:{port}")))?;
 
-    let mut tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+    let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
     tcp.set_read_timeout(Some(READ_TIMEOUT))?;
     tcp.set_write_timeout(Some(READ_TIMEOUT))?;
     tcp.set_nodelay(true)?;
+
+    let mut stream = if tls {
+        wrap_tls(tcp, &host)?
+    } else {
+        ControlStream::Plain(tcp)
+    };
 
     let req = format!(
         "POST {PATH} HTTP/1.1\r\n\
@@ -76,17 +95,20 @@ pub fn dial_and_upgrade(server_url: &str, handshake_b64: &str) -> Result<Upgrade
          Content-Length: 0\r\n\
          \r\n"
     );
-    tcp.write_all(req.as_bytes())?;
-    tcp.flush()?;
+    stream.write_all(req.as_bytes())?;
+    stream.flush()?;
 
-    let leftover = read_101(&mut tcp, &addr)?;
+    let leftover = read_101(&mut stream, &addr)?;
     debug!(leftover = leftover.len(), "control.upgrade.complete");
-    Ok(UpgradedSocket { tcp, leftover })
+    Ok(UpgradedSocket {
+        tcp: stream,
+        leftover,
+    })
 }
 
 /// Read the `101 Switching Protocols` response off `tcp`. Returns any
 /// trailing bytes that came in the same read after `\r\n\r\n`.
-fn read_101(tcp: &mut TcpStream, addr: &SocketAddr) -> Result<Vec<u8>, ControlError> {
+fn read_101(tcp: &mut ControlStream, addr: &SocketAddr) -> Result<Vec<u8>, ControlError> {
     let mut buf = Vec::with_capacity(2048);
     let mut tmp = [0u8; 1024];
     let mut header_end: Option<usize> = None;
