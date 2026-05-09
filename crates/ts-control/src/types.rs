@@ -26,6 +26,7 @@ pub fn generate_machine_keypair() -> Result<(MachinePrivate, MachinePublic), Con
 pub const MKEY_PREFIX: &str = "mkey:";
 pub const NODEKEY_PREFIX: &str = "nodekey:";
 pub const DISCOKEY_PREFIX: &str = "discokey:";
+pub const NLKEY_PREFIX: &str = "nlpub:";
 
 /// Server's Noise static public key (Curve25519). 32 raw bytes; serialized
 /// as `mkey:<64hex>`.
@@ -133,6 +134,29 @@ impl Drop for DiscoPrivate {
     }
 }
 
+/// Tailnet-Lock public key. Modern (capver ≥ ~120) Tailscale registers
+/// expect this even when TKA is disabled — upstream tailscale-rs sends
+/// `nl_key: Some(<NLPublic>)` unconditionally. Same Curve25519 wire
+/// shape as NodePublic / DiscoPublic, but serialized as `nlpub:<hex>`.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub struct NLPublic(pub [u8; 32]);
+
+impl NLPublic {
+    pub fn to_nlkey_string(&self) -> String {
+        format!("{}{}", NLKEY_PREFIX, encode_hex(&self.0))
+    }
+}
+
+pub struct NLPrivate(pub [u8; 32]);
+
+impl Drop for NLPrivate {
+    fn drop(&mut self) {
+        for b in &mut self.0 {
+            *b = 0;
+        }
+    }
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -171,12 +195,32 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+/// serde helper: accept JSON `null` as `T::default()` (e.g. an empty
+/// `Vec`). Tailscale at capver≥138 returns some sequence-shaped fields
+/// as JSON `null` rather than `[]`; the default `Vec<T>` deserializer
+/// rejects null with "invalid type: null, expected a sequence". Apply
+/// via `#[serde(default, deserialize_with = "null_or_default")]`.
+fn null_or_default<'de, D, T>(de: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    let opt = Option::<T>::deserialize(de)?;
+    Ok(opt.unwrap_or_default())
+}
+
 #[derive(Serialize)]
 pub(crate) struct MapRequestWire {
     #[serde(rename = "Version")]
     pub version: u32,
     #[serde(rename = "Compress")]
     pub compress: String, // "" — Headscale gzips the HTTP layer regardless
+    /// Upstream Tailscale Go client sets `KeepAlive: true` on every
+    /// streaming MapRequest. Tells the server to inject KeepAlive
+    /// frames to keep the long-poll alive across NAT timeouts. We
+    /// match upstream.
+    #[serde(rename = "KeepAlive")]
+    pub keep_alive: bool,
     #[serde(rename = "NodeKey")]
     pub node_key: String, // "nodekey:<hex>"
     #[serde(rename = "DiscoKey")]
@@ -201,12 +245,41 @@ pub(crate) struct MapRequestWire {
 pub(crate) struct MapHostinfoWire {
     #[serde(rename = "IPNVersion")]
     pub ipn_version: String,
+    /// Logtail-style session ID. Upstream Go client hard-errors if
+    /// missing — even a random 32-hex placeholder is enough to look
+    /// like a real client.
+    #[serde(rename = "BackendLogID")]
+    pub backend_log_id: String,
     #[serde(rename = "Hostname")]
     pub hostname: String,
     #[serde(rename = "OS")]
     pub os: String,
     #[serde(rename = "OSVersion")]
     pub os_version: String,
+    /// Modern Tailscale (capver 138+) appears to gate `Node.DiscoKey`
+    /// acceptance on the presence of `Hostinfo.NetInfo` in MapRequest.
+    /// Without it the server records `Node.DiscoKey = zeros` even
+    /// though the top-level `MapRequest.DiscoKey` is correct on the
+    /// wire. Sending a minimal NetInfo (all-zero / "no signals yet")
+    /// is enough to flip the gate.
+    #[serde(rename = "NetInfo")]
+    pub net_info: NetInfoWire,
+}
+
+#[derive(Serialize, Default)]
+pub(crate) struct NetInfoWire {
+    /// 0 means "client hasn't picked a home region yet"; perfectly
+    /// valid for first MapRequest.
+    #[serde(rename = "PreferredDERP")]
+    pub preferred_derp: i32,
+    #[serde(rename = "LinkType")]
+    pub link_type: String,
+    #[serde(rename = "WorkingUDP", skip_serializing_if = "Option::is_none")]
+    pub working_udp: Option<bool>,
+    #[serde(rename = "WorkingIPv6", skip_serializing_if = "Option::is_none")]
+    pub working_ipv6: Option<bool>,
+    #[serde(rename = "HavePortMap", skip_serializing_if = "std::ops::Not::not")]
+    pub have_port_map: bool,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]
@@ -249,9 +322,9 @@ pub(crate) struct NodeWire {
     pub key: String, // "nodekey:<hex>"
     #[serde(rename = "DiscoKey", default)]
     pub disco_key: String, // "discokey:<hex>"
-    #[serde(rename = "Addresses", default)]
+    #[serde(rename = "Addresses", default, deserialize_with = "null_or_default")]
     pub addresses: Vec<String>, // "100.64.0.1/32"
-    #[serde(rename = "AllowedIPs", default)]
+    #[serde(rename = "AllowedIPs", default, deserialize_with = "null_or_default")]
     pub allowed_ips: Vec<String>,
     #[serde(rename = "HomeDERP", default)]
     pub home_derp: u16,
@@ -262,7 +335,7 @@ pub(crate) struct NodeWire {
     /// M12: peer's advertised direct-path candidates ("ip:port" strings;
     /// IPv4 or "[v6]:port"). Headscale forwards what each peer sent in
     /// its `MapRequest.Endpoints`.
-    #[serde(rename = "Endpoints", default)]
+    #[serde(rename = "Endpoints", default, deserialize_with = "null_or_default")]
     pub endpoints: Vec<String>,
 }
 
@@ -281,7 +354,7 @@ pub(crate) struct DerpRegionWire {
     pub region_code: String,
     #[serde(rename = "RegionName", default)]
     pub region_name: String,
-    #[serde(rename = "Nodes", default)]
+    #[serde(rename = "Nodes", default, deserialize_with = "null_or_default")]
     pub nodes: Vec<DerpNodeWire>,
 }
 
@@ -364,13 +437,16 @@ mod tests {
         let req = MapRequestWire {
             version: 90,
             compress: String::new(),
+            keep_alive: true,
             node_key: "nodekey:01".repeat(32),
             disco_key: "discokey:02".repeat(32),
             hostinfo: MapHostinfoWire {
                 ipn_version: "tailscale-vita/0.1.0".into(),
+                backend_log_id: "test-backend-log".into(),
                 hostname: "vita".into(),
                 os: "linux".into(),
                 os_version: "vita-3.74".into(),
+                net_info: NetInfoWire::default(),
             },
             stream: true,
             omit_peers: false,

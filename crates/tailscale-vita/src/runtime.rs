@@ -124,10 +124,18 @@ impl Runtime {
         let auth_key = config.auth_key.trim();
         info!(len = auth_key.len(), "control.auth_key.loaded");
 
+        // Generate a per-process BackendLogID — upstream Go client
+        // hard-errors without one and the modern Tailscale coordinator
+        // appears to use it as a session disambiguator. 32 hex chars.
+        let backend_log_id = generate_backend_log_id();
+        info!(backend_log_id = %backend_log_id, "control.backend_log_id.generated");
+
         let outcome = ts_control::register(
             &mut conn,
             auth_key,
             &ks.node_pub,
+            &ks.nl_pub,
+            &backend_log_id,
             &config.hostname,
             &host_authority,
         )?;
@@ -184,6 +192,7 @@ impl Runtime {
             ks.node_pub,
             ks.disco_pub,
             config.hostname.clone(),
+            backend_log_id.clone(),
             host_authority.clone(),
             state_dir.clone(),
             local_endpoints,
@@ -555,28 +564,56 @@ fn bind_magicsock(
     }
 }
 
+/// Generate a 32-hex-char `BackendLogID` for the lifetime of this
+/// runtime. Upstream uses logtail's session ID; we just need
+/// something unique-per-process that *looks* like a real client.
+fn generate_backend_log_id() -> String {
+    use rand_core::RngCore;
+    let mut bytes = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    let mut s = String::with_capacity(32);
+    use std::fmt::Write as _;
+    for b in &bytes {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
 /// Discover our LAN IP via the connect-trick (ask the kernel which
 /// local IP would route to a given external address; no packet sent).
 /// Returns the formatted endpoint strings to advertise in
 /// MapRequest.Endpoints. Empty vec on discovery failure — better to
 /// send nothing than wrong addresses.
+///
+/// **Important**: an empty Endpoints list appears to be the silent
+/// gate that causes real Tailscale (capver 138) to refuse to commit
+/// our `Node.DiscoKey` to its database. The connect-trick used to
+/// silently fail on `https://` control URLs because the URL has no
+/// port and `UdpSocket::connect(&str)` requires `host:port` form, so
+/// MapRequest went out with `Endpoints: []`. We now parse out
+/// host+port (defaulting 443 for https, 80 for http) before probing.
 fn build_local_endpoints(control_url: &str, magic_local: SocketAddr) -> Vec<String> {
-    // Strip scheme + path from the control URL; we only need host:port
-    // for the connect trick.
-    let host = match control_url
-        .strip_prefix("https://")
-        .or_else(|| control_url.strip_prefix("http://"))
-    {
-        Some(rest) => rest.split('/').next().unwrap_or(rest),
-        None => control_url,
+    let (host, default_port) = if let Some(rest) = control_url.strip_prefix("https://") {
+        (rest, 443u16)
+    } else if let Some(rest) = control_url.strip_prefix("http://") {
+        (rest, 80u16)
+    } else {
+        (control_url, 443u16)
+    };
+    let host = host.split('/').next().unwrap_or(host);
+    let host_port = if host.contains(':') {
+        // Already has explicit port (e.g. Headscale on `192.168.8.147:8080`).
+        host.to_string()
+    } else {
+        format!("{host}:{default_port}")
     };
     let probe = match UdpSocket::bind(("0.0.0.0", 0)).and_then(|s| {
-        s.connect(host)?;
+        s.connect(host_port.as_str())?;
         s.local_addr()
     }) {
         Ok(addr) => addr,
         Err(e) => {
-            warn!(error = %e, %host, "lan_ip.probe.failed");
+            warn!(error = %e, %host_port, "lan_ip.probe.failed");
             return vec![];
         }
     };

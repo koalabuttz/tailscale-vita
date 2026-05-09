@@ -1616,6 +1616,7 @@ dependencies = [
  "http",
  "netstack",
  "parking_lot",
+ "rand_core",
  "serde",
  "smoltcp",
  "thiserror 1.0.69",

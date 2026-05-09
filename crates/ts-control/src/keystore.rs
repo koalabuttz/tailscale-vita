@@ -19,13 +19,15 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::persist::atomic_write;
 use crate::types::{
-    DiscoPrivate, DiscoPublic, MachinePrivate, MachinePublic, NodePrivate, NodePublic,
+    DiscoPrivate, DiscoPublic, MachinePrivate, MachinePublic, NLPrivate, NLPublic, NodePrivate,
+    NodePublic,
 };
 use crate::ControlError;
 
 const MACHINE_FILE: &str = "machine.priv";
 const NODE_FILE: &str = "node.priv";
 const DISCO_FILE: &str = "disco.priv";
+const NL_FILE: &str = "nl.priv";
 
 pub struct KeyStore {
     pub machine_priv: MachinePrivate,
@@ -34,6 +36,13 @@ pub struct KeyStore {
     pub node_pub: NodePublic,
     pub disco_priv: DiscoPrivate,
     pub disco_pub: DiscoPublic,
+    /// Tailnet-Lock keypair. Generated and persisted but unused
+    /// otherwise (we don't participate in TKA); tailscale-rs sends the
+    /// pubkey in RegisterRequest.NLKey unconditionally, and modern
+    /// real-Tailscale appears to gate `Node.DiscoKey` acceptance on
+    /// the register having an NLKey present — so we match parity.
+    pub nl_priv: NLPrivate,
+    pub nl_pub: NLPublic,
 }
 
 impl KeyStore {
@@ -44,10 +53,12 @@ impl KeyStore {
         let machine_priv_bytes = load_or_generate_priv(dir, MACHINE_FILE)?;
         let node_priv_bytes = load_or_generate_priv(dir, NODE_FILE)?;
         let disco_priv_bytes = load_or_generate_priv(dir, DISCO_FILE)?;
+        let nl_priv_bytes = load_or_generate_priv(dir, NL_FILE)?;
 
         let machine_pub_bytes = derive_pub(&machine_priv_bytes);
         let node_pub_bytes = derive_pub(&node_priv_bytes);
         let disco_pub_bytes = derive_pub(&disco_priv_bytes);
+        let nl_pub_bytes = derive_pub(&nl_priv_bytes);
 
         let ks = KeyStore {
             machine_priv: MachinePrivate(machine_priv_bytes),
@@ -56,15 +67,19 @@ impl KeyStore {
             node_pub: NodePublic(node_pub_bytes),
             disco_priv: DiscoPrivate(disco_priv_bytes),
             disco_pub: DiscoPublic(disco_pub_bytes),
+            nl_priv: NLPrivate(nl_priv_bytes),
+            nl_pub: NLPublic(nl_pub_bytes),
         };
 
         let mpub = ks.machine_pub.to_mkey_string();
         let npub = ks.node_pub.to_nodekey_string();
         let dpub = ks.disco_pub.to_discokey_string();
+        let nlpub = ks.nl_pub.to_nlkey_string();
         info!(
             machine_pub = %mpub,
             node_pub = %npub,
             disco_pub = %dpub,
+            nl_pub = %nlpub,
             "control.keystore.loaded"
         );
         Ok(ks)

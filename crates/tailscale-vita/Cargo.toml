@@ -23,6 +23,7 @@ toml        = { workspace = true }
 tracing     = { workspace = true }
 parking_lot = { workspace = true }
 x25519-dalek = { workspace = true }
+rand_core    = { workspace = true }
 smoltcp     = { workspace = true }
 http        = "1"
 thiserror   = { workspace = true }

@@ -34,11 +34,17 @@ use crate::http2::{ChunkOutcome, Http2Conn};
 use crate::netmap::{NetMap, NetMapDelta};
 use crate::persist::atomic_write;
 use crate::types::{
-    DiscoPublic, MapHostinfoWire, MapRequestWire, MapResponseWire, NodePublic,
+    DiscoPublic, MapHostinfoWire, MapRequestWire, MapResponseWire, NetInfoWire, NodePublic,
 };
 use crate::ControlError;
 
-const MAP_VERSION: u32 = 90;
+// Upstream's `tailcfg.CurrentCapabilityVersion` was 138 as of
+// 2026-03-31. We started at 90 (Headscale 0.26 compat band), but
+// real Tailscale at capver 138 may treat capver-90 clients as
+// degraded — the open DiscoKey-zero issue is the prime suspect for
+// that. Bumping to 138 to test. Headscale 0.26 may push back on
+// this; if so, reintroduce a per-control_url override.
+const MAP_VERSION: u32 = 138;
 const IPN_VERSION: &str = "tailscale-vita/0.1.0";
 const HOSTINFO_OS: &str = "linux";
 const HOSTINFO_OS_VERSION: &str = "vita-3.74";
@@ -53,6 +59,9 @@ pub struct MapClient {
     node_pub: NodePublic,
     disco_pub: DiscoPublic,
     hostname: String,
+    /// Per-process logtail-style ID echoed in every MapRequest's
+    /// Hostinfo for parity with upstream.
+    backend_log_id: String,
     authority: String,
     state_dir: PathBuf,
     netmap: NetMap,
@@ -100,6 +109,7 @@ impl MapClient {
         node_pub: NodePublic,
         disco_pub: DiscoPublic,
         hostname: String,
+        backend_log_id: String,
         authority: String,
         state_dir: PathBuf,
         local_endpoints: Vec<String>,
@@ -116,6 +126,7 @@ impl MapClient {
             &node_pub,
             &disco_pub,
             &hostname,
+            &backend_log_id,
             last_seq,
             &session_handle,
             &local_endpoints,
@@ -124,6 +135,7 @@ impl MapClient {
         info!(
             body_len = body.len(),
             seq = last_seq,
+            body = %String::from_utf8_lossy(&body),
             "control.map.request.send"
         );
 
@@ -160,6 +172,7 @@ impl MapClient {
             node_pub,
             disco_pub,
             hostname,
+            backend_log_id,
             authority,
             state_dir,
             netmap,
@@ -262,6 +275,7 @@ impl MapClient {
             &self.node_pub,
             &self.disco_pub,
             &self.hostname,
+            &self.backend_log_id,
             self.netmap.last_seq,
             &self.netmap.session_handle,
             &self.local_endpoints,
@@ -308,6 +322,7 @@ fn build_map_request(
     node_pub: &NodePublic,
     disco_pub: &DiscoPublic,
     hostname: &str,
+    backend_log_id: &str,
     last_seq: i64,
     session_handle: &str,
     endpoints: &[String],
@@ -315,13 +330,28 @@ fn build_map_request(
     MapRequestWire {
         version: MAP_VERSION,
         compress: String::new(),
+        keep_alive: true,
         node_key: node_pub.to_nodekey_string(),
         disco_key: disco_pub.to_discokey_string(),
         hostinfo: MapHostinfoWire {
             ipn_version: IPN_VERSION.into(),
+            backend_log_id: backend_log_id.into(),
             hostname: hostname.into(),
             os: HOSTINFO_OS.into(),
             os_version: HOSTINFO_OS_VERSION.into(),
+            net_info: NetInfoWire {
+                // PreferredDERP=0 means "haven't picked a home region
+                // yet" — valid for the first MapRequest. The runtime
+                // can call `set_preferred_derp` after derp probing
+                // settles to refresh this on the next reissue. Not
+                // currently wired (no observable difference vs 0
+                // tested against real Tailscale; see M14B notes).
+                preferred_derp: 0,
+                link_type: String::new(),
+                working_udp: Some(true),
+                working_ipv6: Some(false),
+                have_port_map: false,
+            },
         },
         stream: true,
         omit_peers: false,

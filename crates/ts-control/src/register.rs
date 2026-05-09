@@ -20,13 +20,18 @@ use time::format_description::well_known::Rfc3339;
 use tracing::{info, warn};
 
 use crate::http2::Http2Conn;
-use crate::types::NodePublic;
+use crate::types::{NLPublic, NetInfoWire, NodePublic};
 use crate::ControlError;
 
 const IPN_VERSION: &str = "tailscale-vita/0.1.0";
 const HOSTINFO_OS: &str = "linux";
 const HOSTINFO_OS_VERSION: &str = "vita-3.74";
-const REGISTER_VERSION: u32 = 90;
+// Bumped to match `map::MAP_VERSION` (see comment there). Real
+// Tailscale at capver 138 sends MapResponse fields like `Addresses`
+// and `AllowedIPs` as JSON `null` rather than `[]`; we now tolerate
+// both. Keeping register/map in lockstep avoids any capver-mismatch
+// state divergence on the server.
+const REGISTER_VERSION: u32 = 138;
 
 pub struct RegistrationOutcome {
     pub machine_authorized: bool,
@@ -41,6 +46,8 @@ pub fn register(
     conn: &mut Http2Conn,
     auth_key: &str,
     node_pub: &NodePublic,
+    nl_pub: &NLPublic,
+    backend_log_id: &str,
     hostname: &str,
     host_authority: &str,
 ) -> Result<RegistrationOutcome, ControlError> {
@@ -51,14 +58,23 @@ pub fn register(
     let req = RegisterRequestWire {
         version: REGISTER_VERSION,
         node_key: node_pub.to_nodekey_string(),
+        nl_key: nl_pub.to_nlkey_string(),
         auth: RegisterAuthWire {
             auth_key: auth_key.to_string(),
         },
         hostinfo: HostinfoWire {
             ipn_version: IPN_VERSION.to_string(),
+            backend_log_id: backend_log_id.to_string(),
             hostname: hostname.to_string(),
             os: HOSTINFO_OS.to_string(),
             os_version: HOSTINFO_OS_VERSION.to_string(),
+            net_info: NetInfoWire {
+                preferred_derp: 0,
+                link_type: String::new(),
+                working_udp: Some(true),
+                working_ipv6: Some(false),
+                have_port_map: false,
+            },
         },
         timestamp,
     };
@@ -128,6 +144,11 @@ struct RegisterRequestWire {
     version: u32,
     #[serde(rename = "NodeKey")]
     node_key: String,
+    /// Tailnet-Lock public key. Sent unconditionally for parity with
+    /// upstream tailscale-rs / Go clients; the tailnet may not have
+    /// TKA enabled but the field's still expected.
+    #[serde(rename = "NLKey")]
+    nl_key: String,
     #[serde(rename = "Auth")]
     auth: RegisterAuthWire,
     #[serde(rename = "Hostinfo")]
@@ -146,12 +167,21 @@ struct RegisterAuthWire {
 struct HostinfoWire {
     #[serde(rename = "IPNVersion")]
     ipn_version: String,
+    /// Logtail-style session ID for the client backend. Upstream Go
+    /// client hard-errors if missing; sending parity-empty isn't an
+    /// option. Random 32-hex per process.
+    #[serde(rename = "BackendLogID")]
+    backend_log_id: String,
     #[serde(rename = "Hostname")]
     hostname: String,
     #[serde(rename = "OS")]
     os: String,
     #[serde(rename = "OSVersion")]
     os_version: String,
+    /// Match MapRequest's Hostinfo shape; modern Tailscale appears to
+    /// derive Disco-acceptance state from the register-time Hostinfo.
+    #[serde(rename = "NetInfo")]
+    net_info: NetInfoWire,
 }
 
 #[derive(Deserialize, Default)]
@@ -173,17 +203,21 @@ mod tests {
     #[test]
     fn request_serializes_with_expected_fields() {
         let node_pub = NodePublic([0x11u8; 32]);
+        let nl_pub = NLPublic([0x33u8; 32]);
         let req = RegisterRequestWire {
             version: 90,
             node_key: node_pub.to_nodekey_string(),
+            nl_key: nl_pub.to_nlkey_string(),
             auth: RegisterAuthWire {
                 auth_key: "abcd1234".into(),
             },
             hostinfo: HostinfoWire {
                 ipn_version: "tailscale-vita/0.1.0".into(),
+                backend_log_id: "test-backend-log-id".into(),
                 hostname: "vita".into(),
                 os: "linux".into(),
                 os_version: "vita-3.74".into(),
+                net_info: NetInfoWire::default(),
             },
             timestamp: "2026-05-04T00:00:00Z".into(),
         };
@@ -195,6 +229,8 @@ mod tests {
         assert_eq!(v["Hostinfo"]["IPNVersion"], "tailscale-vita/0.1.0");
         assert_eq!(v["Hostinfo"]["Hostname"], "vita");
         assert_eq!(v["Timestamp"], "2026-05-04T00:00:00Z");
+        assert!(v["NLKey"].as_str().unwrap().starts_with("nlpub:"));
+        assert_eq!(v["Hostinfo"]["BackendLogID"], "test-backend-log-id");
     }
 
     #[test]

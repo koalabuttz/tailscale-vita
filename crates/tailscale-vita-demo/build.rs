@@ -18,5 +18,9 @@ fn main() {
     // monotonic string. Output looks like: "20180.18:48:32" — readable enough.
     println!("cargo::rustc-env=BUILD_TIMESTAMP={}.{:02}:{:02}:{:02}", days, h, m, s);
     println!("cargo::rustc-env=BUILD_UNIX={}", now);
-    println!("cargo::rerun-if-changed=src");
+    // No `rerun-if-changed` directive ⇒ Cargo re-runs build.rs every
+    // build. We want that: BUILD_UNIX is a diagnostic tracer for
+    // "which compile is on the Vita right now", and a stale value
+    // from cargo's cache (because edits land in dep crates, not the
+    // demo crate's `src/`) caused real confusion in M14 bringup.
 }

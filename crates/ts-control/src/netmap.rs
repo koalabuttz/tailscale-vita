@@ -116,6 +116,17 @@ impl NetMap {
         }
 
         if let Some(node) = &resp.node {
+            // Diagnostic for the M14 DiscoKey-zero issue: dump what
+            // Tailscale's server says our own Node record looks like.
+            // If our disco_key is zeros here, it confirms server-side
+            // rejection of our MapRequest's DiscoKey field.
+            info!(
+                key = %node.key,
+                disco_key = %node.disco_key,
+                online = ?node.online,
+                addr_count = node.addresses.len(),
+                "control.map.our_node.recv"
+            );
             let new_addrs = parse_addrs(&node.addresses);
             if !new_addrs.is_empty() && new_addrs != self.our_addrs {
                 info!(addrs = ?new_addrs, "control.map.our_addrs.set");
