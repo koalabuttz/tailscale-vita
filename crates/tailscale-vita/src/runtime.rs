@@ -171,7 +171,17 @@ impl Runtime {
         // our LAN IP via the connect-trick (kernel routing decision —
         // no packet actually sent).
         let local_endpoints = build_local_endpoints(&config.control_url, magic_local);
-        info!(?local_endpoints, "magicsock.endpoints.advertise");
+        // M14E: parallel `tailcfg.EndpointType` codes. Every endpoint
+        // we build via the connect-trick is a LAN IP (Vita's WiFi
+        // address), so type 1 = `EndpointLocal`. Real Tailscale
+        // requires this paired array to non-Unknown-classify our
+        // advertised endpoints.
+        let local_endpoint_types: Vec<u8> = vec![1u8; local_endpoints.len()];
+        info!(
+            ?local_endpoints,
+            ?local_endpoint_types,
+            "magicsock.endpoints.advertise"
+        );
 
         let engine = Arc::new(Engine::new(EngineConfig {
             our_static_secret: our_secret,
@@ -196,6 +206,7 @@ impl Runtime {
             host_authority.clone(),
             state_dir.clone(),
             local_endpoints,
+            local_endpoint_types,
         )?;
         info!("control.map.started");
 

@@ -25,6 +25,12 @@ use tracing::{debug, info};
 use crate::async_io::AsyncNoiseStream;
 use crate::ControlError;
 
+/// User-Agent stamped on every `/machine/*` HTTP/2 request over the
+/// Noise tunnel (M14F). Kept identical to the value we send on the
+/// HTTP/1.1 `/ts2021` upgrade — a single string lets server-side log
+/// joiners correlate the upgrade and the post-upgrade requests.
+const USER_AGENT: &str = "tailscale-vita/0.1";
+
 /// One opened HTTP/2 connection over a Noise tunnel.
 pub struct Http2Conn {
     rt: Runtime,
@@ -137,7 +143,14 @@ impl Http2Conn {
         let mut builder = Request::builder()
             .method(method)
             .uri(path)
-            .header("host", authority);
+            .header("host", authority)
+            // M14F: Cloudflare/Tailscale-edge appears to soft-degrade
+            // HTTP/2 requests with no User-Agent (treats as bot-like).
+            // Go's stdlib `http.Client` always sets one (defaults to
+            // `Go-http-client/1.1`); we match the *intent* by sending
+            // an explicit Vita-flavored UA so we look like a real
+            // client at the WAF layer.
+            .header("user-agent", USER_AGENT);
         for (k, v) in extra_headers {
             builder = builder.header(*k, *v);
         }
@@ -262,7 +275,9 @@ impl Http2Conn {
         let mut builder = Request::builder()
             .method(method)
             .uri(path)
-            .header("host", authority);
+            .header("host", authority)
+            // M14F: see request_stream() for User-Agent rationale.
+            .header("user-agent", USER_AGENT);
         for (k, v) in extra_headers {
             builder = builder.header(*k, *v);
         }

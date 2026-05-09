@@ -84,6 +84,11 @@ serde_json = "1"
 # the unstable `stdarch_arm_neon_intrinsics` feature and fails to cross-compile
 # to `armv7-sony-vita-newlibeabihf`. zlib-rs avoids that dep entirely.
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# --- zstd (real-Tailscale's MapResponse inner-frame compression; M14G) ---
+# `ruzstd` is a pure-Rust zstd decoder (no C bindings, no_std-capable).
+# We only need to decode — the request body's `Compress: "zstd"` field
+# tells the server to use zstd for outgoing frames; we never encode.
+ruzstd = { version = "0.7", default-features = false, features = ["std"] }
 
 # --- Logging ---
 tracing            = "0.1"

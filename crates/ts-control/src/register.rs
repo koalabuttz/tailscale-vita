@@ -26,12 +26,10 @@ use crate::ControlError;
 const IPN_VERSION: &str = "tailscale-vita/0.1.0";
 const HOSTINFO_OS: &str = "linux";
 const HOSTINFO_OS_VERSION: &str = "vita-3.74";
-// Bumped to match `map::MAP_VERSION` (see comment there). Real
-// Tailscale at capver 138 sends MapResponse fields like `Addresses`
-// and `AllowedIPs` as JSON `null` rather than `[]`; we now tolerate
-// both. Keeping register/map in lockstep avoids any capver-mismatch
-// state divergence on the server.
-const REGISTER_VERSION: u32 = 138;
+// Single source of truth (M14C): `crate::CAPVER`. Keeps register, map,
+// noise envelope, and `/key?v=` all matching upstream's
+// `tailcfg.CurrentCapabilityVersion`.
+const REGISTER_VERSION: u32 = crate::CAPVER as u32;
 
 pub struct RegistrationOutcome {
     pub machine_authorized: bool,
@@ -80,18 +78,31 @@ pub fn register(
     };
 
     let body = serde_json::to_vec(&req)?;
+    let lb = node_pub.to_nodekey_string();
     info!(
-        node_key = %node_pub.to_nodekey_string(),
+        node_key = %lb,
         hostname,
         body_len = body.len(),
         "control.register.sent"
     );
 
+    // M14D: `Ts-Lb: nodekey:<hex>` is the load-balancer hint header
+    // upstream Go (`tailcfg.LBHeader = "Ts-Lb"`) and tailscale-rs both
+    // attach to every `/machine/*` request. Real Tailscale's edge
+    // appears to use it for sticky-session routing across multiple
+    // control backends; without it our register may write state to
+    // backend A while the streaming map lands on backend B, losing
+    // cross-shard state writes (DiscoKey, HomeDERP, Endpoints) to a
+    // race. Header name is lowercase per HTTP/2 conventions; h2 would
+    // lowercase it on the wire either way.
     let resp = conn.request(
         Method::POST,
         "/machine/register",
         &body,
-        &[("content-type", "application/json")],
+        &[
+            ("content-type", "application/json"),
+            ("ts-lb", &lb),
+        ],
         host_authority,
     )?;
 

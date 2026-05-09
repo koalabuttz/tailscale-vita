@@ -18,9 +18,13 @@ fn main() {
     // monotonic string. Output looks like: "20180.18:48:32" — readable enough.
     println!("cargo::rustc-env=BUILD_TIMESTAMP={}.{:02}:{:02}:{:02}", days, h, m, s);
     println!("cargo::rustc-env=BUILD_UNIX={}", now);
-    // No `rerun-if-changed` directive ⇒ Cargo re-runs build.rs every
-    // build. We want that: BUILD_UNIX is a diagnostic tracer for
-    // "which compile is on the Vita right now", and a stale value
-    // from cargo's cache (because edits land in dep crates, not the
-    // demo crate's `src/`) caused real confusion in M14 bringup.
+    // Force build.rs to run every invocation regardless of source-file
+    // changes — Cargo treats nonexistent rerun-if-changed paths as
+    // "always rerun" (per cargo docs). The previous claim in this
+    // file ("no directive ⇒ runs every build") was wrong: with no
+    // directives, Cargo only reruns the script when files inside the
+    // demo crate change, so edits in dep crates (ts-control, etc.)
+    // produced binaries with a stale BUILD_UNIX. The diagnostic was
+    // useless precisely when we needed it (M14C bringup).
+    println!("cargo::rerun-if-changed=NONEXISTENT_FORCE_RERUN");
 }

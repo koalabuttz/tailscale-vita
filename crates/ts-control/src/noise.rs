@@ -131,11 +131,12 @@ fn prologue() -> Vec<u8> {
 }
 
 /// The wire envelope's protocol version is unified with Tailscale's
-/// `CapabilityVersion` — Headscale 0.26 enforces `>=88`. Pick 90 to clear
-/// the floor with margin and unlock the modern fields (PacketFilters
-/// plural at 81, Node.CapMap at 87, multi-DERP at 89). PLAN-V1.md docs
-/// this in §"Wire protocols summary".
-const PROTOCOL_VERSION: u16 = 90;
+/// `CapabilityVersion`. M14C bumped to crate-level `CAPVER` (138) so the
+/// envelope, prologue, body `Version` field, and `/key?v=` query all match
+/// upstream Go (`control/ts2021/client.go` defaults this to
+/// `tailcfg.CurrentCapabilityVersion`). Headscale 0.26 still accepts since
+/// its only check is `>=88`.
+const PROTOCOL_VERSION: u16 = crate::CAPVER;
 
 const MSG_TYPE_INIT: u8 = 0x01;
 const MSG_TYPE_RESP: u8 = 0x02;
@@ -299,7 +300,7 @@ mod tests {
     #[test]
     fn prologue_bytes() {
         let p = prologue();
-        assert_eq!(p, b"Tailscale Control Protocol v90");
+        assert_eq!(p, b"Tailscale Control Protocol v138");
     }
 
     /// End-to-end snow handshake: build initiator + responder with the

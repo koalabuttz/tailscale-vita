@@ -38,13 +38,11 @@ use crate::types::{
 };
 use crate::ControlError;
 
-// Upstream's `tailcfg.CurrentCapabilityVersion` was 138 as of
-// 2026-03-31. We started at 90 (Headscale 0.26 compat band), but
-// real Tailscale at capver 138 may treat capver-90 clients as
-// degraded — the open DiscoKey-zero issue is the prime suspect for
-// that. Bumping to 138 to test. Headscale 0.26 may push back on
-// this; if so, reintroduce a per-control_url override.
-const MAP_VERSION: u32 = 138;
+// Single source of truth (M14C): `crate::CAPVER`. The body `Version`,
+// the noise envelope `PROTOCOL_VERSION`, the `/key?v=` query, and
+// `RegisterRequest.Version` must all agree, matching upstream Go's
+// `tailcfg.CurrentCapabilityVersion`.
+const MAP_VERSION: u32 = crate::CAPVER as u32;
 const IPN_VERSION: &str = "tailscale-vita/0.1.0";
 const HOSTINFO_OS: &str = "linux";
 const HOSTINFO_OS_VERSION: &str = "vita-3.74";
@@ -73,6 +71,12 @@ pub struct MapClient {
     /// known. Sent in `MapRequest.Endpoints` on the next dial /
     /// reissue. Empty until M12F wires the runtime hook.
     local_endpoints: Vec<String>,
+    /// M14E: parallel `tailcfg.EndpointType` codes for each
+    /// `local_endpoints[i]` (1 = Local, 2 = STUN, 3 = Portmapped, ...).
+    /// Upstream Go always sends Endpoints + EndpointTypes as a paired
+    /// pair; missing this is suspected to make the server reject our
+    /// endpoint advertisements as "untyped".
+    local_endpoint_types: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -104,6 +108,10 @@ impl MapClient {
     ///
     /// `local_endpoints` is the M12 direct-paths candidate list — pass
     /// `Vec::new()` to omit (Headscale tolerates empty Endpoints).
+    /// `local_endpoint_types` (M14E) MUST be parallel: same length, with
+    /// each `tailcfg.EndpointType` code (typically `1` = Local) describing
+    /// the corresponding endpoint. Length mismatch panics in debug builds
+    /// to catch wiring bugs early.
     pub fn start(
         mut conn: Http2Conn,
         node_pub: NodePublic,
@@ -113,7 +121,13 @@ impl MapClient {
         authority: String,
         state_dir: PathBuf,
         local_endpoints: Vec<String>,
+        local_endpoint_types: Vec<u8>,
     ) -> Result<Self, ControlError> {
+        debug_assert_eq!(
+            local_endpoints.len(),
+            local_endpoint_types.len(),
+            "Endpoints and EndpointTypes must be parallel arrays"
+        );
         let (last_seq, session_handle) = load_session_state(&state_dir)?;
         info!(
             last_seq,
@@ -130,6 +144,7 @@ impl MapClient {
             last_seq,
             &session_handle,
             &local_endpoints,
+            &local_endpoint_types,
         );
         let body = serde_json::to_vec(&request)?;
         info!(
@@ -139,6 +154,9 @@ impl MapClient {
             "control.map.request.send"
         );
 
+        // M14D: see register.rs for `Ts-Lb` rationale — sticky-session
+        // hint that real Tailscale's edge uses for backend routing.
+        let lb = node_pub.to_nodekey_string();
         let head = conn.request_stream(
             Method::POST,
             "/machine/map",
@@ -146,6 +164,7 @@ impl MapClient {
             &[
                 ("content-type", "application/json"),
                 ("accept-encoding", "gzip"),
+                ("ts-lb", &lb),
             ],
             &authority,
         )?;
@@ -157,11 +176,8 @@ impl MapClient {
             });
         }
 
-        let gzipped = head
-            .headers
-            .iter()
-            .any(|(k, v)| k.eq_ignore_ascii_case("content-encoding") && v.contains("gzip"));
-        info!(gzipped, "control.map.stream.opened");
+        let compression = pick_compression(&head.headers, REQUESTED_COMPRESS);
+        info!(?compression, "control.map.stream.opened");
 
         let mut netmap = NetMap::default();
         netmap.last_seq = last_seq;
@@ -176,21 +192,28 @@ impl MapClient {
             authority,
             state_dir,
             netmap,
-            framer: Framer::new(gzipped),
+            framer: Framer::new(compression),
             last_frame_at: Instant::now(),
             local_endpoints,
+            local_endpoint_types,
         })
     }
 
     /// Replace the local-endpoint candidate list. Takes effect on the
     /// next `reissue()` (the open long-poll continues to advertise the
     /// previous set until it cycles).
-    pub fn set_local_endpoints(&mut self, endpoints: Vec<String>) {
+    pub fn set_local_endpoints(&mut self, endpoints: Vec<String>, endpoint_types: Vec<u8>) {
+        debug_assert_eq!(
+            endpoints.len(),
+            endpoint_types.len(),
+            "Endpoints and EndpointTypes must be parallel arrays"
+        );
         info!(
             count = endpoints.len(),
             "control.map.local_endpoints.set"
         );
         self.local_endpoints = endpoints;
+        self.local_endpoint_types = endpoint_types;
     }
 
     /// Drive the long-poll for one event with a per-call deadline. The
@@ -269,7 +292,9 @@ impl MapClient {
             "control.map.reissue"
         );
         self.conn.drop_stream();
-        self.framer = Framer::new(true); // assume gzip; will re-detect from head
+        // Placeholder — replaced after we read the response head's
+        // content-encoding (and infer the inner compression mode) below.
+        self.framer = Framer::new(Compression::Plain);
 
         let request = build_map_request(
             &self.node_pub,
@@ -279,8 +304,11 @@ impl MapClient {
             self.netmap.last_seq,
             &self.netmap.session_handle,
             &self.local_endpoints,
+            &self.local_endpoint_types,
         );
         let body = serde_json::to_vec(&request)?;
+        // M14D: Ts-Lb sticky-session hint, same as initial start().
+        let lb = self.node_pub.to_nodekey_string();
         let head = self.conn.request_stream(
             Method::POST,
             "/machine/map",
@@ -288,6 +316,7 @@ impl MapClient {
             &[
                 ("content-type", "application/json"),
                 ("accept-encoding", "gzip"),
+                ("ts-lb", &lb),
             ],
             &self.authority,
         )?;
@@ -297,11 +326,9 @@ impl MapClient {
                 body: "reissue /machine/map non-200".into(),
             });
         }
-        let gzipped = head
-            .headers
-            .iter()
-            .any(|(k, v)| k.eq_ignore_ascii_case("content-encoding") && v.contains("gzip"));
-        self.framer = Framer::new(gzipped);
+        let compression = pick_compression(&head.headers, REQUESTED_COMPRESS);
+        info!(?compression, "control.map.stream.reopened");
+        self.framer = Framer::new(compression);
         self.last_frame_at = Instant::now();
         Ok(())
     }
@@ -326,10 +353,11 @@ fn build_map_request(
     last_seq: i64,
     session_handle: &str,
     endpoints: &[String],
+    endpoint_types: &[u8],
 ) -> MapRequestWire {
     MapRequestWire {
         version: MAP_VERSION,
-        compress: String::new(),
+        compress: REQUESTED_COMPRESS.to_string(),
         keep_alive: true,
         node_key: node_pub.to_nodekey_string(),
         disco_key: disco_pub.to_discokey_string(),
@@ -357,12 +385,45 @@ fn build_map_request(
         omit_peers: false,
         read_only: false,
         endpoints: endpoints.to_vec(),
+        endpoint_types: endpoint_types.to_vec(),
         map_session_handle: session_handle.to_string(),
         map_session_seq: last_seq,
     }
 }
 
-// ---------- Framer: gzip + length-prefix accumulator ----------------------
+/// M14G: tell the server we want each MapResponse frame compressed with
+/// zstd. Upstream Go (`control/tsp/map.go::Map`, `SendMapUpdate`) always
+/// sets this. Real Tailscale's coordination server may use this as a
+/// "client modernity" signal that gates DiscoKey/HomeDERP/Endpoints
+/// state-commit code paths. Headscale ignores the field and always
+/// HTTP-gzips its responses; we still detect that via the response
+/// `content-encoding` header (see `pick_compression`).
+const REQUESTED_COMPRESS: &str = "zstd";
+
+/// Choose the inner-frame compression mode based on what we asked for
+/// (`requested`, sent in `MapRequest.Compress`) and what the server's
+/// response head reveals (HTTP-layer `content-encoding`).
+///
+/// Decision matrix:
+/// - response is HTTP-gzipped → Gzip (Headscale-style: gzip wraps the
+///   entire frame stream; inside is `[u32_le len][JSON]` repeating).
+/// - else if we requested zstd → Zstd (real-Tailscale-style: each frame
+///   is `[u32_le len][zstd-frame(JSON)]`).
+/// - else → Plain (`[u32_le len][JSON]` raw).
+fn pick_compression(headers: &[(String, String)], requested: &str) -> Compression {
+    let gzipped = headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("content-encoding") && v.contains("gzip"));
+    if gzipped {
+        Compression::Gzip
+    } else if requested == "zstd" {
+        Compression::Zstd
+    } else {
+        Compression::Plain
+    }
+}
+
+// ---------- Framer: gzip / zstd / plain length-prefix accumulator ---------
 
 enum FrameOutcome {
     Frame(MapResponseWire),
@@ -370,9 +431,27 @@ enum FrameOutcome {
     Timeout,
 }
 
-/// Streams gzip-compressed or identity bytes from `Http2Conn` into a
-/// running buffer, then peels off `[u32_le len][body]` frames as they
-/// become available.
+/// Inner-frame compression mode the Framer should expect on the wire.
+///
+/// - `Plain`: `[u32_le len][JSON]` repeating, raw.
+/// - `Gzip`: HTTP-layer gzip wraps the *entire* frame stream — the
+///   length prefixes live INSIDE the gzip stream. (Headscale path.)
+/// - `Zstd`: HTTP body is `[u32_le len][zstd-frame(JSON)]` repeating —
+///   length prefix outside, each body is one independent zstd frame
+///   that decodes to a JSON MapResponse. (Real Tailscale path when
+///   we requested `MapRequest.Compress = "zstd"`.)
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum Compression {
+    Plain,
+    Gzip,
+    Zstd,
+}
+
+/// Streams chunk bytes from `Http2Conn` into a running buffer, then
+/// peels off `[u32_le len][body]` frames as they become available. For
+/// gzip mode, decompression is a streaming worker thread that wraps the
+/// chunk stream BEFORE framing; for zstd mode, each per-frame body is
+/// independently decompressed AFTER framing.
 ///
 /// **Why threaded gzip**: flate2's `write::GzDecoder<Vec<u8>>` and
 /// `write::DeflateDecoder<Vec<u8>>` both buffer their output internally
@@ -387,19 +466,17 @@ enum FrameOutcome {
 /// decompressed bytes onto a second channel. Same pattern as M5's
 /// `noise_pump` thread.
 struct Framer {
+    compression: Compression,
     decoder: Option<GzipWorker>,
-    plain_buf: Vec<u8>, // accumulator for identity-encoded streams
+    plain_buf: Vec<u8>, // accumulator for identity OR zstd streams
     gzip_buf: Vec<u8>,  // accumulator for gzip-decompressed bytes from worker
 }
 
 impl Framer {
-    fn new(gzipped: bool) -> Self {
+    fn new(compression: Compression) -> Self {
         Self {
-            decoder: if gzipped {
-                Some(GzipWorker::spawn())
-            } else {
-                None
-            },
+            compression,
+            decoder: matches!(compression, Compression::Gzip).then(GzipWorker::spawn),
             plain_buf: Vec::with_capacity(64 * 1024),
             gzip_buf: Vec::with_capacity(64 * 1024),
         }
@@ -466,6 +543,7 @@ impl Framer {
     }
 
     fn try_extract(&mut self) -> Result<Option<MapResponseWire>, ControlError> {
+        let compression = self.compression;
         let buf = self.buffer_mut();
         if buf.len() < 4 {
             return Ok(None);
@@ -481,11 +559,37 @@ impl Framer {
             return Ok(None);
         }
         let body_slice = &buf[4..4 + len];
-        let resp: MapResponseWire = serde_json::from_slice(body_slice)
-            .map_err(|e| ControlError::MapDecode(format!("json: {e}")))?;
+        let resp: MapResponseWire = match compression {
+            Compression::Zstd => {
+                let decoded = decompress_zstd_frame(body_slice)?;
+                serde_json::from_slice(&decoded)
+                    .map_err(|e| ControlError::MapDecode(format!("json (zstd): {e}")))?
+            }
+            // Gzip path also lands here: by the time we reach
+            // `try_extract`, the `gzip_buf` already contains plaintext
+            // bytes (the worker decompressed them). Both Plain and Gzip
+            // therefore feed the JSON parser raw.
+            Compression::Plain | Compression::Gzip => serde_json::from_slice(body_slice)
+                .map_err(|e| ControlError::MapDecode(format!("json: {e}")))?,
+        };
         buf.drain(..4 + len);
         Ok(Some(resp))
     }
+}
+
+/// One-shot zstd frame decode. M14G assumes one MapResponse per
+/// length-prefixed frame on the wire, which matches the upstream
+/// `tsp/map.go` framing where each `[u32_le len][zstd-payload]` is an
+/// independent zstd frame containing one JSON object.
+fn decompress_zstd_frame(input: &[u8]) -> Result<Vec<u8>, ControlError> {
+    use std::io::Read;
+    let mut decoder = ruzstd::StreamingDecoder::new(input)
+        .map_err(|e| ControlError::MapDecode(format!("zstd init: {e}")))?;
+    let mut out = Vec::with_capacity(input.len() * 4);
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| ControlError::MapDecode(format!("zstd read: {e}")))?;
+    Ok(out)
 }
 
 // ---------- Threaded gzip decompressor ------------------------------------
@@ -646,7 +750,9 @@ fn short_handle(s: &str) -> String {
 mod tests {
     use super::*;
     use flate2::write::GzEncoder;
-    use flate2::Compression;
+    // Renamed to avoid colliding with our newly-introduced
+    // `super::Compression` enum (Plain / Gzip / Zstd).
+    use flate2::Compression as GzLevel;
     use std::io::Write;
 
     /// Drive the framer's gzip worker until either a frame is ready,
@@ -684,11 +790,11 @@ mod tests {
             wire.extend_from_slice(&(f.len() as u32).to_le_bytes());
             wire.extend_from_slice(f);
         }
-        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        let mut gz = GzEncoder::new(Vec::new(), GzLevel::default());
         gz.write_all(&wire).unwrap();
         let compressed = gz.finish().unwrap();
 
-        let mut framer = Framer::new(true);
+        let mut framer = Framer::new(Compression::Gzip);
         framer.feed(Bytes::from(compressed)).unwrap();
 
         let extract_deadline = || Instant::now() + Duration::from_secs(2);
@@ -714,11 +820,11 @@ mod tests {
         let mut wire = Vec::new();
         wire.extend_from_slice(&(frame.len() as u32).to_le_bytes());
         wire.extend_from_slice(&frame);
-        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        let mut gz = GzEncoder::new(Vec::new(), GzLevel::default());
         gz.write_all(&wire).unwrap();
         let compressed = gz.finish().unwrap();
 
-        let mut framer = Framer::new(true);
+        let mut framer = Framer::new(Compression::Gzip);
         // Feed in small slices to exercise streaming decompression.
         for slice in compressed.chunks(3) {
             framer.feed(Bytes::copy_from_slice(slice)).unwrap();
@@ -735,12 +841,82 @@ mod tests {
         let mut wire = Vec::new();
         wire.extend_from_slice(&(16u32 * 1024 * 1024).to_le_bytes());
         // No body bytes are needed; the cap check fires before we read body.
-        let mut framer = Framer::new(false);
+        let mut framer = Framer::new(Compression::Plain);
         framer.feed(Bytes::from(wire)).unwrap();
         assert!(matches!(
             framer.try_extract(),
             Err(ControlError::MapFrameTooLarge { len: _, cap: _ })
         ));
+    }
+
+    /// M14G: round-trip a synthetic zstd-framed wire stream through
+    /// the Framer's Zstd path. Validates that one
+    /// `[u32_le len][zstd-frame(JSON)]` per MapResponse decodes correctly.
+    #[test]
+    fn frame_decoder_zstd_per_frame() {
+        use std::io::Write;
+        // Helper: encode `body` as a single zstd frame using `zstd::Encoder`
+        // — ruzstd is decode-only, so we lean on a roundtrip-safe test
+        // fixture. Two options: vendor a tiny encoder, or hand-craft a
+        // minimal "no-compression" zstd frame. We do the latter because
+        // we can't add zstd-encoder deps just for tests.
+        //
+        // RFC 8478 minimal frame:
+        //   4 B  magic = 0x28 0xB5 0x2F 0xFD
+        //   1 B  Frame_Header_Descriptor — 0b0010_0000 (single uncompressed
+        //         block, content size flag=0, single segment flag=1, no checksum)
+        //   N B  block_header(3 B) + block_data
+        //
+        // We use Block_Type=0 (Raw), Block_Size = N (last bit of header = Last_Block).
+        fn make_zstd_raw_frame(body: &[u8]) -> Vec<u8> {
+            assert!(body.len() < 256, "fixture only handles 1-byte FCS");
+            let mut out = Vec::with_capacity(body.len() + 16);
+            // Magic
+            out.extend_from_slice(&[0x28, 0xB5, 0x2F, 0xFD]);
+            // Frame_Header_Descriptor:
+            //   bits[7:6] = Frame_Content_Size_flag = 00
+            //   bit[5]    = Single_Segment_flag    = 1
+            //   bit[4]    = Unused                 = 0
+            //   bit[3]    = Reserved               = 0
+            //   bit[2]    = Content_Checksum_flag  = 0
+            //   bits[1:0] = Dictionary_ID_flag     = 00
+            // = 0b0010_0000 = 0x20
+            out.push(0x20);
+            // Window_Descriptor is omitted because Single_Segment_flag=1.
+            // Frame_Content_Size IS NOT omitted in single-segment mode:
+            // RFC 8478 §3.1.1.1.4 says FCS_Field_Size = 1 byte when
+            // FCS_flag=00 ∧ Single_Segment_flag=1. Emit the 1-byte FCS
+            // (= decompressed body length, no offset).
+            out.push(body.len() as u8);
+            // One block: 3-byte header
+            //   bit 0     : Last_Block = 1
+            //   bits 1-2  : Block_Type = 0 (Raw)
+            //   bits 3-23 : Block_Size = body.len()
+            // packed LE.
+            let bs: u32 = (body.len() as u32) << 3 | 0x01; // last_block=1, type=0
+            out.push((bs & 0xFF) as u8);
+            out.push(((bs >> 8) & 0xFF) as u8);
+            out.push(((bs >> 16) & 0xFF) as u8);
+            out.extend_from_slice(body);
+            out
+        }
+        // Sanity-check our hand-rolled fixture with ruzstd before
+        // testing the framer.
+        let json = br#"{"Seq":99,"Domain":"zstd-test"}"#;
+        let zframe = make_zstd_raw_frame(json);
+        let decoded = decompress_zstd_frame(&zframe).unwrap();
+        assert_eq!(decoded, json);
+
+        // Now wrap in a length prefix and feed the Framer.
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&(zframe.len() as u32).to_le_bytes());
+        wire.extend_from_slice(&zframe);
+
+        let mut framer = Framer::new(Compression::Zstd);
+        framer.feed(Bytes::from(wire)).unwrap();
+        let f = framer.try_extract().unwrap().unwrap();
+        assert_eq!(f.seq, 99);
+        assert_eq!(f.domain, "zstd-test");
     }
 
     #[test]

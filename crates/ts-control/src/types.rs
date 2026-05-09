@@ -235,6 +235,15 @@ pub(crate) struct MapRequestWire {
     pub read_only: bool,
     #[serde(rename = "Endpoints")]
     pub endpoints: Vec<String>, // empty for v1 (no magicsock)
+    /// M14E: parallel array describing each `Endpoints[i]`'s type
+    /// (`tailcfg.EndpointType`: 0=Unknown, 1=Local, 2=STUN,
+    /// 3=Portmapped, 4=STUN4LocalPort, 5=ExplicitConf). Upstream Go
+    /// `controlclient/direct.go` always sends the two arrays as a
+    /// matched pair; missing this is suspected to make the server
+    /// classify our endpoints as "untyped" → drop them. `omitempty`
+    /// behavior preserves backwards compat (Headscale tolerates absent).
+    #[serde(rename = "EndpointTypes", skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_types: Vec<u8>,
     #[serde(rename = "MapSessionHandle")]
     pub map_session_handle: String,
     #[serde(rename = "MapSessionSeq")]
@@ -452,6 +461,7 @@ mod tests {
             omit_peers: false,
             read_only: false,
             endpoints: vec![],
+            endpoint_types: vec![],
             map_session_handle: "abc123".into(),
             map_session_seq: 42,
         };
@@ -471,6 +481,10 @@ mod tests {
         // populated from MapRequest, so the wire path works at this
         // shape — kept this assertion to guard against regressions.
         assert!(v["DiscoKey"].as_str().unwrap().starts_with("discokey:"));
+        // M14E: empty EndpointTypes is omitted from the wire
+        // (skip_serializing_if = "Vec::is_empty"), preserving
+        // backwards-compat with Headscale and earlier capvers.
+        assert!(v.get("EndpointTypes").is_none());
     }
 
     #[test]

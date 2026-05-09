@@ -136,8 +136,11 @@ listener_pool_size  = 4
 # exits the eboot.
 # run_window_secs   = 120
 
-# Don't change unless you know what you're doing.
-capver              = 90
+# Don't change unless you know what you're doing. Must match
+# `ts_control::CAPVER` (the noise envelope/prologue version) so the
+# server sees a single coherent capability version across `/key?v=`,
+# the noise upgrade, and the JSON bodies.
+capver              = 138
 
 # M11 Phase 2: set true when the SUPRX (`tailscale-vita-plugin.suprx`)
 # is loaded under *TVIT00010 — the demo eboot then skips its own
@@ -165,7 +168,7 @@ fn default_listener_pool() -> usize {
     4
 }
 fn default_capver() -> u32 {
-    90
+    ts_control::CAPVER as u32
 }
 
 #[cfg(test)]
@@ -181,7 +184,7 @@ mod tests {
         assert_eq!(cfg.demo_port, 8080);
         assert_eq!(cfg.max_derp_conns, 8);
         assert_eq!(cfg.listener_pool_size, 4);
-        assert_eq!(cfg.capver, 90);
+        assert_eq!(cfg.capver, 138);
         assert_eq!(cfg.run_window_secs, None);
         assert!(!cfg.suprx_host_only);
     }
@@ -198,7 +201,7 @@ mod tests {
             max_derp_conns: 8,
             listener_pool_size: 4,
             run_window_secs: None,
-            capver: 90,
+            capver: 138,
             suprx_host_only: false,
         };
         assert_eq!(cfg.host_authority(), "192.168.8.147:8080");
@@ -216,7 +219,7 @@ mod tests {
             max_derp_conns: 8,
             listener_pool_size: 4,
             run_window_secs: None,
-            capver: 90,
+            capver: 138,
             suprx_host_only: false,
         };
         assert_eq!(cfg.host_authority(), "controlplane.tailscale.com");
@@ -232,6 +235,6 @@ mod tests {
         assert_eq!(cfg.hostname, "vita");
         assert_eq!(cfg.demo_port, 8080);
         assert_eq!(cfg.max_derp_conns, 8);
-        assert_eq!(cfg.capver, 90);
+        assert_eq!(cfg.capver, 138);
     }
 }
