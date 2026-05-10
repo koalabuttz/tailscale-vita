@@ -24,10 +24,8 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use base64::Engine as _;
 use bytes::Bytes;
 use http::Method;
-use rand_core::{OsRng, RngCore};
 use tracing::{debug, info, warn};
 
 use crate::http2::{ChunkOutcome, Http2Conn};
@@ -48,7 +46,6 @@ const HOSTINFO_OS: &str = "linux";
 const HOSTINFO_OS_VERSION: &str = "vita-3.74";
 const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
 const WATCHDOG: Duration = Duration::from_secs(120);
-const SESSION_HANDLE_BYTES: usize = 16;
 const LAST_SEQ_FILE: &str = "last_seq";
 const SESSION_HANDLE_FILE: &str = "session_handle";
 
@@ -163,7 +160,6 @@ impl MapClient {
             &body,
             &[
                 ("content-type", "application/json"),
-                ("accept-encoding", "gzip"),
                 ("ts-lb", &lb),
             ],
             &authority,
@@ -315,7 +311,6 @@ impl MapClient {
             &body,
             &[
                 ("content-type", "application/json"),
-                ("accept-encoding", "gzip"),
                 ("ts-lb", &lb),
             ],
             &self.authority,
@@ -330,6 +325,97 @@ impl MapClient {
         info!(?compression, "control.map.stream.reopened");
         self.framer = Framer::new(compression);
         self.last_frame_at = Instant::now();
+        Ok(())
+    }
+
+    /// Send a non-streaming "lite" MapRequest with NetInfo
+    /// (PreferredDERP + DerpLatency). This is the call upstream Go's
+    /// `controlclient.Direct.SetDerpHomeRegion` issues — it triggers
+    /// the server to commit DiscoKey / HomeDERP / Endpoints to its
+    /// persistent state for our node. Without this lite call, the
+    /// streaming long-poll alone leaves DiscoKey/HomeDERP/Endpoints
+    /// unwritten on the server.
+    ///
+    /// Body:
+    ///
+    /// ```json
+    /// {
+    ///   "Version": 130,
+    ///   "NodeKey": "nodekey:...",
+    ///   "DiscoKey": "discokey:...",
+    ///   "Hostinfo": {
+    ///     "Hostname": "...",
+    ///     "NetInfo": {
+    ///       "PreferredDERP": 1,
+    ///       "DerpLatency": {"1-v4": 0.033, ...}
+    ///     }
+    ///   },
+    ///   "OmitPeers": true
+    /// }
+    /// ```
+    ///
+    /// No `Stream`, no `KeepAlive`, no `Compress`. Server replies with
+    /// an empty 200 OK (we don't need to parse — the streaming
+    /// long-poll already drives the netmap).
+    pub fn send_netinfo_update(
+        &mut self,
+        preferred_derp: u16,
+        derp_latency: Vec<(String, f64)>,
+    ) -> Result<(), ControlError> {
+        use serde_json::json;
+
+        let mut latencies = serde_json::Map::new();
+        for (region, latency) in &derp_latency {
+            latencies.insert(region.clone(), json!(*latency));
+        }
+
+        let body_json = json!({
+            "Version": MAP_VERSION,
+            "NodeKey": self.node_pub.to_nodekey_string(),
+            "DiscoKey": self.disco_pub.to_discokey_string(),
+            "Hostinfo": {
+                "Hostname": self.hostname,
+                "NetInfo": {
+                    "PreferredDERP": preferred_derp,
+                    "DerpLatency": latencies,
+                }
+            },
+            "OmitPeers": true,
+        });
+        let body = serde_json::to_vec(&body_json)?;
+        info!(
+            body_len = body.len(),
+            preferred_derp,
+            latency_count = derp_latency.len(),
+            "control.map.netinfo_update.send"
+        );
+
+        let lb = self.node_pub.to_nodekey_string();
+        let resp = self.conn.request(
+            Method::POST,
+            "/machine/map",
+            &body,
+            &[
+                ("content-type", "application/json"),
+                ("ts-lb", &lb),
+            ],
+            &self.authority,
+        )?;
+        if resp.status != 200 {
+            warn!(
+                status = resp.status,
+                body = %String::from_utf8_lossy(&resp.body),
+                "control.map.netinfo_update.fail"
+            );
+            return Err(ControlError::Http {
+                status: resp.status,
+                body: "/machine/map netinfo update non-200".into(),
+            });
+        }
+        info!(
+            resp_len = resp.body.len(),
+            "control.map.netinfo_update.ok"
+        );
         Ok(())
     }
 
@@ -355,6 +441,29 @@ fn build_map_request(
     endpoints: &[String],
     endpoint_types: &[u8],
 ) -> MapRequestWire {
+    // M14K: revert from M14J's tsrs-minimum body. The minimal-body
+    // diagnostic produced a stub response from real Tailscale (no peers,
+    // no DERPMap, our_node with empty fields), even with brand-new keys
+    // and an admin-deleted prior node record. Conclusion: the
+    // ts-control body shape isn't the gate; tsrs's minimal body works
+    // for it (an ephemeral fresh node) but not for us. So go back to
+    // matching upstream Go's `tailcfg.MapRequest` shape verbatim:
+    // Compress=zstd, full Hostinfo (IPNVersion, BackendLogID, OS,
+    // OSVersion, Hostname, NetInfo), Endpoints+EndpointTypes paired.
+    //
+    // The remaining suspected divergences are at the HTTP-header layer
+    // (Accept-Encoding presence, User-Agent value) — fixed in
+    // map.rs::start/reissue and http2.rs respectively (this commit).
+    // MapRequest body matching what real Tailscale's coord server
+    // actually accepts and commits DiscoKey for. Phase 11 bisection
+    // found:
+    //   - OS / OSVersion: MUST be omitted (setting OS="linux" or any
+    //     value breaks the DiscoKey-commit path on the server).
+    //   - NetInfo: MUST be omitted from the streaming MapRequest;
+    //     sent via the follow-up `send_netinfo_update` lite call
+    //     instead.
+    //   - IPNVersion / BackendLogID / App: safe to include.
+    //   - Compress="zstd": safe (Go-canonical).
     MapRequestWire {
         version: MAP_VERSION,
         compress: REQUESTED_COMPRESS.to_string(),
@@ -362,24 +471,13 @@ fn build_map_request(
         node_key: node_pub.to_nodekey_string(),
         disco_key: disco_pub.to_discokey_string(),
         hostinfo: MapHostinfoWire {
-            ipn_version: IPN_VERSION.into(),
-            backend_log_id: backend_log_id.into(),
+            ipn_version: Some(IPN_VERSION.into()),
+            backend_log_id: Some(backend_log_id.into()),
             hostname: hostname.into(),
-            os: HOSTINFO_OS.into(),
-            os_version: HOSTINFO_OS_VERSION.into(),
-            net_info: NetInfoWire {
-                // PreferredDERP=0 means "haven't picked a home region
-                // yet" — valid for the first MapRequest. The runtime
-                // can call `set_preferred_derp` after derp probing
-                // settles to refresh this on the next reissue. Not
-                // currently wired (no observable difference vs 0
-                // tested against real Tailscale; see M14B notes).
-                preferred_derp: 0,
-                link_type: String::new(),
-                working_udp: Some(true),
-                working_ipv6: Some(false),
-                have_port_map: false,
-            },
+            os: None,
+            os_version: None,
+            net_info: None,
+            app: Some(APP_NAME.into()),
         },
         stream: true,
         omit_peers: false,
@@ -391,13 +489,11 @@ fn build_map_request(
     }
 }
 
-/// M14G: tell the server we want each MapResponse frame compressed with
-/// zstd. Upstream Go (`control/tsp/map.go::Map`, `SendMapUpdate`) always
-/// sets this. Real Tailscale's coordination server may use this as a
-/// "client modernity" signal that gates DiscoKey/HomeDERP/Endpoints
-/// state-commit code paths. Headscale ignores the field and always
-/// HTTP-gzips its responses; we still detect that via the response
-/// `content-encoding` header (see `pick_compression`).
+const APP_NAME: &str = "tailscale-vita/0.1.0";
+
+/// Match upstream Go's `controlclient.Direct.sendMapRequest` which
+/// sets `request.Compress = "zstd"`. Server responds with
+/// `[u32_le len][zstd-frame(JSON)]` framing per response chunk.
 const REQUESTED_COMPRESS: &str = "zstd";
 
 /// Choose the inner-frame compression mode based on what we asked for
@@ -712,22 +808,20 @@ fn load_session_state(dir: &Path) -> Result<(i64, String), ControlError> {
         Ok(b) if b.len() == 8 => i64::from_le_bytes(b.try_into().unwrap()),
         _ => 0,
     };
+    // M14I: empty handle on a fresh session, server allocates one on
+    // its first MapResponse and we persist whatever it gives us. Sending
+    // a client-generated random handle with `Seq=0` looks to the server
+    // like "client wants to resume session X starting at seq=0" — server
+    // has no record of session X, so the request may be silently
+    // downgraded. Match upstream Go (`omitzero` on both fields).
     let session_handle = match std::fs::read(dir.join(SESSION_HANDLE_FILE)) {
         Ok(b) => String::from_utf8(b)
             .map(|s| s.trim().to_string())
             .unwrap_or_default(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => generate_session_handle(dir)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(ControlError::Io(e)),
     };
     Ok((last_seq, session_handle))
-}
-
-fn generate_session_handle(dir: &Path) -> Result<String, ControlError> {
-    let mut bytes = [0u8; SESSION_HANDLE_BYTES];
-    OsRng.fill_bytes(&mut bytes);
-    let handle = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-    persist_session_handle(dir, &handle)?;
-    Ok(handle)
 }
 
 fn persist_last_seq(dir: &Path, seq: i64) -> Result<(), ControlError> {

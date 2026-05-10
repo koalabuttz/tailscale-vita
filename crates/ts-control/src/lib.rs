@@ -43,16 +43,20 @@ mod types;
 pub mod upgrade;
 pub mod url;
 
+pub use async_io::AsyncNoiseStream;
 pub use control_stream::{wrap_tls, ControlStream};
 pub use error::ControlError;
+pub use http2::Http2Conn;
 pub use keystore::KeyStore;
 pub use map::{MapClient, MapEvent, NetMapSnapshot};
 pub use netmap::{AllowedIp, NetMap, NetMapDelta, PeerSnapshot, RekeyedPeer};
 pub use noise::{NoiseHandshaker, NoiseTransport};
 pub use persist::{atomic_write, pin_or_load_server_key};
+pub use record::NoiseStream;
 pub use register::{register, RegistrationOutcome};
 pub use server_key::fetch_server_key;
 pub use types::{
     generate_machine_keypair, DiscoPrivate, DiscoPublic, MachinePrivate, MachinePublic,
     NodePrivate, NodePublic, DISCOKEY_PREFIX, MKEY_PREFIX, NODEKEY_PREFIX,
 };
+pub use upgrade::{dial_and_upgrade, UpgradedSocket};

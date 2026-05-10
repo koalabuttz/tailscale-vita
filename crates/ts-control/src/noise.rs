@@ -299,8 +299,12 @@ mod tests {
 
     #[test]
     fn prologue_bytes() {
+        // Tracks `crate::CAPVER` (currently 130 — see lib.rs for the
+        // diagnostic rationale). Keeping the assertion dynamic so a
+        // future capver bump doesn't require touching this test.
+        let expected = format!("Tailscale Control Protocol v{}", crate::CAPVER);
         let p = prologue();
-        assert_eq!(p, b"Tailscale Control Protocol v138");
+        assert_eq!(p, expected.as_bytes());
     }
 
     /// End-to-end snow handshake: build initiator + responder with the

@@ -11,4 +11,5 @@ target/
 # Local dev state
 .idea/
 .vscode/
+.claude/
 *.log

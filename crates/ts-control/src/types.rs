@@ -213,28 +213,31 @@ where
 pub(crate) struct MapRequestWire {
     #[serde(rename = "Version")]
     pub version: u32,
-    #[serde(rename = "Compress")]
-    pub compress: String, // "" — Headscale gzips the HTTP layer regardless
-    /// Upstream Tailscale Go client sets `KeepAlive: true` on every
+    /// "zstd" or "" (no compression). `omitzero` semantics — empty
+    /// string is dropped from the wire.
+    #[serde(rename = "Compress", skip_serializing_if = "String::is_empty")]
+    pub compress: String,
+    /// Upstream Go's controlclient sets `KeepAlive: true` on every
     /// streaming MapRequest. Tells the server to inject KeepAlive
-    /// frames to keep the long-poll alive across NAT timeouts. We
-    /// match upstream.
-    #[serde(rename = "KeepAlive")]
+    /// frames to keep the long-poll alive across NAT timeouts.
+    #[serde(rename = "KeepAlive", skip_serializing_if = "std::ops::Not::not")]
     pub keep_alive: bool,
     #[serde(rename = "NodeKey")]
     pub node_key: String, // "nodekey:<hex>"
     #[serde(rename = "DiscoKey")]
     pub disco_key: String, // "discokey:<hex>"
+    /// Field order matches Go's `tailcfg.MapRequest` (Stream serializes
+    /// before Hostinfo).
+    #[serde(rename = "Stream", skip_serializing_if = "std::ops::Not::not")]
+    pub stream: bool,
     #[serde(rename = "Hostinfo")]
     pub hostinfo: MapHostinfoWire,
-    #[serde(rename = "Stream")]
-    pub stream: bool,
-    #[serde(rename = "OmitPeers")]
+    #[serde(rename = "OmitPeers", skip_serializing_if = "std::ops::Not::not")]
     pub omit_peers: bool,
-    #[serde(rename = "ReadOnly")]
+    #[serde(rename = "ReadOnly", skip_serializing_if = "std::ops::Not::not")]
     pub read_only: bool,
-    #[serde(rename = "Endpoints")]
-    pub endpoints: Vec<String>, // empty for v1 (no magicsock)
+    #[serde(rename = "Endpoints", skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<String>,
     /// M14E: parallel array describing each `Endpoints[i]`'s type
     /// (`tailcfg.EndpointType`: 0=Unknown, 1=Local, 2=STUN,
     /// 3=Portmapped, 4=STUN4LocalPort, 5=ExplicitConf). Upstream Go
@@ -244,35 +247,47 @@ pub(crate) struct MapRequestWire {
     /// behavior preserves backwards compat (Headscale tolerates absent).
     #[serde(rename = "EndpointTypes", skip_serializing_if = "Vec::is_empty")]
     pub endpoint_types: Vec<u8>,
-    #[serde(rename = "MapSessionHandle")]
+    /// M14I: only serialize when non-empty. Upstream Go uses
+    /// `json:",omitzero"` on this field; empty handle ⇒ "client is
+    /// starting a fresh session" (server allocates a new one).
+    /// Sending an arbitrary client-generated handle with `Seq=0` looks
+    /// to the server like "I want to resume session X starting at
+    /// seq=0", which is nonsense if the server has no record of session
+    /// X — suspected silent-reject for state writes.
+    #[serde(rename = "MapSessionHandle", skip_serializing_if = "String::is_empty")]
     pub map_session_handle: String,
-    #[serde(rename = "MapSessionSeq")]
+    /// M14I: same — `omitzero` semantics. Only meaningful when
+    /// resuming an existing session (paired with non-empty handle).
+    #[serde(rename = "MapSessionSeq", skip_serializing_if = "is_zero_i64")]
     pub map_session_seq: i64,
 }
 
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}
+
+/// Mirrors `tailcfg.Hostinfo` on the wire. All fields are
+/// `Option<...>` (Hostname excepted) and serde drops `None`s — callers
+/// pick which fields to populate.
 #[derive(Serialize)]
 pub(crate) struct MapHostinfoWire {
-    #[serde(rename = "IPNVersion")]
-    pub ipn_version: String,
-    /// Logtail-style session ID. Upstream Go client hard-errors if
-    /// missing — even a random 32-hex placeholder is enough to look
-    /// like a real client.
-    #[serde(rename = "BackendLogID")]
-    pub backend_log_id: String,
+    #[serde(rename = "IPNVersion", skip_serializing_if = "Option::is_none")]
+    pub ipn_version: Option<String>,
+    /// `App` identifies the client variant (e.g. `tailscale-vita/...`).
+    /// Tsrs sends it; required for our DiscoKey-commit path on real
+    /// Tailscale (Phase 11 bisection — TBD whether load-bearing).
+    #[serde(rename = "App", skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(rename = "BackendLogID", skip_serializing_if = "Option::is_none")]
+    pub backend_log_id: Option<String>,
     #[serde(rename = "Hostname")]
     pub hostname: String,
-    #[serde(rename = "OS")]
-    pub os: String,
-    #[serde(rename = "OSVersion")]
-    pub os_version: String,
-    /// Modern Tailscale (capver 138+) appears to gate `Node.DiscoKey`
-    /// acceptance on the presence of `Hostinfo.NetInfo` in MapRequest.
-    /// Without it the server records `Node.DiscoKey = zeros` even
-    /// though the top-level `MapRequest.DiscoKey` is correct on the
-    /// wire. Sending a minimal NetInfo (all-zero / "no signals yet")
-    /// is enough to flip the gate.
-    #[serde(rename = "NetInfo")]
-    pub net_info: NetInfoWire,
+    #[serde(rename = "OS", skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    #[serde(rename = "OSVersion", skip_serializing_if = "Option::is_none")]
+    pub os_version: Option<String>,
+    #[serde(rename = "NetInfo", skip_serializing_if = "Option::is_none")]
+    pub net_info: Option<NetInfoWire>,
 }
 
 #[derive(Serialize, Default)]
@@ -450,12 +465,13 @@ mod tests {
             node_key: "nodekey:01".repeat(32),
             disco_key: "discokey:02".repeat(32),
             hostinfo: MapHostinfoWire {
-                ipn_version: "tailscale-vita/0.1.0".into(),
-                backend_log_id: "test-backend-log".into(),
+                ipn_version: Some("tailscale-vita/0.1.0".into()),
+                app: None,
+                backend_log_id: Some("test-backend-log".into()),
                 hostname: "vita".into(),
-                os: "linux".into(),
-                os_version: "vita-3.74".into(),
-                net_info: NetInfoWire::default(),
+                os: Some("linux".into()),
+                os_version: Some("vita-3.74".into()),
+                net_info: Some(NetInfoWire::default()),
             },
             stream: true,
             omit_peers: false,
@@ -468,12 +484,19 @@ mod tests {
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["Version"], 90);
         assert_eq!(v["Stream"], true);
-        assert_eq!(v["OmitPeers"], false);
+        // M14J: OmitPeers/ReadOnly default-false → omitted from wire
+        // (matches upstream Go `omitzero`). Their absence here
+        // proves the skip_serializing_if is wired correctly.
+        assert!(v.get("OmitPeers").is_none());
+        assert!(v.get("ReadOnly").is_none());
+        // Empty Compress/Endpoints from this test fixture → omitted.
+        // (Production sends Compress="zstd" and a populated Endpoints
+        // vec — see map.rs::build_map_request.)
+        assert!(v.get("Endpoints").is_none());
+        assert!(v.get("Compress").is_none());
         assert_eq!(v["MapSessionSeq"], 42);
         assert_eq!(v["MapSessionHandle"], "abc123");
         assert_eq!(v["Hostinfo"]["IPNVersion"], "tailscale-vita/0.1.0");
-        assert!(v["Endpoints"].is_array());
-        assert_eq!(v["Endpoints"].as_array().unwrap().len(), 0);
         // M14 verification: top-level DiscoKey is the canonical place
         // (matches upstream tailcfg.MapRequest.DiscoKey, JSON-encoded
         // as the MarshalText form `"discokey:<hex>"`). Pixel9a's

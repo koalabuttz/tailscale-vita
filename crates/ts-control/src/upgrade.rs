@@ -85,16 +85,18 @@ pub fn dial_and_upgrade(
         ControlStream::Plain(tcp)
     };
 
+    // Mixed-case headers (Go-canonical), UA + Content-Length: 0.
     let req = format!(
         "POST {PATH} HTTP/1.1\r\n\
-         Host: {host_header}\r\n\
+         Host: {host}\r\n\
+         User-Agent: tailscale-vita/0.1.0\r\n\
          Connection: Upgrade\r\n\
          Upgrade: {UPGRADE_TOKEN}\r\n\
          {HANDSHAKE_HEADER}: {handshake_b64}\r\n\
-         User-Agent: tailscale-vita/0.1\r\n\
          Content-Length: 0\r\n\
          \r\n"
     );
+    let _ = host_header;
     stream.write_all(req.as_bytes())?;
     stream.flush()?;
 

@@ -82,9 +82,19 @@ impl Write for ControlStream {
 pub fn wrap_tls(tcp: TcpStream, server_name: &str) -> Result<ControlStream, ControlError> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder()
+    let mut config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    // ALPN `http/1.1` matches what Cloudflare's edge expects from
+    // clients dialing `controlplane.tailscale.com` over HTTPS for the
+    // 101 Upgrade flow. Go's `crypto/tls` always advertises ALPN
+    // matching the next protocol.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // Honor `SSLKEYLOGFILE` for debugging — emits TLS session secrets
+    // in NSS keylog format so Wireshark can decrypt captured traffic.
+    // Equivalent to Go's `tls.Config.KeyLogWriter`. No-op when the
+    // env var is unset.
+    config.key_log = std::sync::Arc::new(rustls::KeyLogFile::new());
     let server_name: ServerName<'static> = ServerName::try_from(server_name.to_owned())
         .map_err(|e| ControlError::Tls(format!("bad ServerName '{server_name}': {e}")))?;
     let conn = ClientConnection::new(Arc::new(config), server_name)

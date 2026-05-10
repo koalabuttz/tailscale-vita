@@ -35,3 +35,9 @@ ruzstd       = { workspace = true }
 rustls           = { workspace = true }
 rustls-pki-types = { workspace = true }
 webpki-roots     = { workspace = true }
+
+# Phase 9 host-diagnostic example (`examples/host_diagnostic.rs`).
+# Built only by `cargo run --example host_diagnostic` — does NOT bloat
+# the production library or the Vita VPK.
+[dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

@@ -25,11 +25,8 @@ use tracing::{debug, info};
 use crate::async_io::AsyncNoiseStream;
 use crate::ControlError;
 
-/// User-Agent stamped on every `/machine/*` HTTP/2 request over the
-/// Noise tunnel (M14F). Kept identical to the value we send on the
-/// HTTP/1.1 `/ts2021` upgrade — a single string lets server-side log
-/// joiners correlate the upgrade and the post-upgrade requests.
-const USER_AGENT: &str = "tailscale-vita/0.1";
+/// User-Agent stamped on every `/machine/*` HTTP/2 request.
+const USER_AGENT: &str = "tailscale-vita/0.1.0";
 
 /// One opened HTTP/2 connection over a Noise tunnel.
 pub struct Http2Conn {
@@ -59,7 +56,24 @@ pub enum ChunkOutcome {
 
 /// Newtype so we can implement `AsyncRead + AsyncWrite` for the move into
 /// h2 without the orphan-rules problems of impl'ing on a foreign type.
+///
+/// M14M Phase 10 diagnostic: every `poll_read` / `poll_write` call emits a
+/// `tracing::trace!` event (target = `h2_wire`) carrying the direction and
+/// the hex-encoded chunk bytes. These are the post-Noise-plaintext h2
+/// frames the h2 crate sees — exactly the bytes we want to byte-diff
+/// against tailscale-rs's working `peer_ping` flow. Enable via
+/// `RUST_LOG=h2_wire=trace`. With nothing in the filter, the events are
+/// elided cheaply by tracing's static-level check.
 struct AsyncNoiseStreamPin(AsyncNoiseStream);
+
+fn hex_chunk(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
 
 impl AsyncRead for AsyncNoiseStreamPin {
     fn poll_read(
@@ -67,7 +81,21 @@ impl AsyncRead for AsyncNoiseStreamPin {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
+        let before = buf.filled().len();
+        let res = Pin::new(&mut self.0).poll_read(cx, buf);
+        if matches!(res, Poll::Ready(Ok(()))) {
+            let now = buf.filled().len();
+            if now > before {
+                tracing::trace!(
+                    target: "h2_wire",
+                    dir = "rx",
+                    n = now - before,
+                    hex = %hex_chunk(&buf.filled()[before..now]),
+                    "h2.wire"
+                );
+            }
+        }
+        res
     }
 }
 
@@ -77,7 +105,19 @@ impl AsyncWrite for AsyncNoiseStreamPin {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
+        let res = Pin::new(&mut self.0).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &res {
+            if *n > 0 {
+                tracing::trace!(
+                    target: "h2_wire",
+                    dir = "tx",
+                    n = *n,
+                    hex = %hex_chunk(&buf[..*n]),
+                    "h2.wire"
+                );
+            }
+        }
+        res
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -104,8 +144,40 @@ impl Http2Conn {
 
         let stream = AsyncNoiseStreamPin(stream);
 
+        // M14M Phase 10 wire-fingerprint fix. Configure h2's client
+        // Builder to match what tailscale-rs's `hyper::client::conn::http2`
+        // emits (verified by side-by-side h2-trace capture):
+        //
+        // - `enable_push(false)` → emits `enable_push: 0` in SETTINGS.
+        //   Default `h2::client::handshake` leaves the field unset
+        //   (server push allowed). Real-world clients (Chrome, Go's
+        //   http2.Transport, hyper) all explicitly disable it.
+        // - `initial_window_size(2 MiB)` → matches hyper's 2,097,152.
+        //   h2's bare default is 65535.
+        // - `initial_connection_window_size(5 MiB)` → makes h2 emit a
+        //   connection-level WINDOW_UPDATE of `5_177_345 = 5_242_880 -
+        //   65_535` right after the handshake, matching tsrs/hyper
+        //   byte-for-byte.
+        // - `max_frame_size(16 KiB)` and `max_header_list_size(16 KiB)`
+        //   → explicit values match tsrs.
+        //
+        // Why this matters: a SETTINGS frame with no fields is a fairly
+        // unusual fingerprint. Cloudflare's edge in front of
+        // controlplane.tailscale.com classifies clients on h2 SETTINGS +
+        // WINDOW_UPDATE shape (Akamai-style h2 fingerprinting). An
+        // unfamiliar fingerprint may pass the request through but skip
+        // the post-write commit hooks server-side.
         let (send, conn_fut) = rt
-            .block_on(async move { h2::client::handshake(stream).await })
+            .block_on(async move {
+                h2::client::Builder::new()
+                    .enable_push(false)
+                    .initial_window_size(2 * 1024 * 1024)
+                    .initial_connection_window_size(5 * 1024 * 1024)
+                    .max_frame_size(16 * 1024)
+                    .max_header_list_size(16 * 1024)
+                    .handshake(stream)
+                    .await
+            })
             .map_err(|e| ControlError::Transport(format!("h2 handshake: {e}")))?;
         info!("control.http2.handshake.complete");
 
@@ -140,16 +212,15 @@ impl Http2Conn {
         // Drop any pending body before starting a new stream.
         self.body = None;
 
+        // Pass full `https://...` URL so h2 emits `:scheme: https` +
+        // `:authority: <host>` from the URI. No `host` header (HTTP/2
+        // uses `:authority`), no `user-agent` (breaks DiscoKey commit
+        // — see Phase 11 notes above). Caller passes additional
+        // headers (e.g. ts-lb) via `extra_headers`.
+        let full_url = format!("https://{}{}", authority, path);
         let mut builder = Request::builder()
             .method(method)
-            .uri(path)
-            .header("host", authority)
-            // M14F: Cloudflare/Tailscale-edge appears to soft-degrade
-            // HTTP/2 requests with no User-Agent (treats as bot-like).
-            // Go's stdlib `http.Client` always sets one (defaults to
-            // `Go-http-client/1.1`); we match the *intent* by sending
-            // an explicit Vita-flavored UA so we look like a real
-            // client at the WAF layer.
+            .uri(&full_url)
             .header("user-agent", USER_AGENT);
         for (k, v) in extra_headers {
             builder = builder.header(*k, *v);
@@ -272,11 +343,11 @@ impl Http2Conn {
         extra_headers: &[(&str, &str)],
         authority: &str,
     ) -> Result<Http2Response, ControlError> {
+        // Same shape as `request_stream` — see comments there.
+        let full_url = format!("https://{}{}", authority, path);
         let mut builder = Request::builder()
             .method(method)
-            .uri(path)
-            .header("host", authority)
-            // M14F: see request_stream() for User-Agent rationale.
+            .uri(&full_url)
             .header("user-agent", USER_AGENT);
         for (k, v) in extra_headers {
             builder = builder.header(*k, *v);

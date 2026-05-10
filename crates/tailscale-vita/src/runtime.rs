@@ -272,6 +272,15 @@ impl Runtime {
         let mut control_errors = 0u32;
         let mut derp_map_set = false;
         let mut local_addrs_set = false;
+        // Fire the NetInfo "lite" MapRequest exactly once after the
+        // first snapshot establishes the DERP map. Without this call,
+        // real Tailscale's coord server never commits our DiscoKey /
+        // HomeDERP / Endpoints to its persistent state — peers see us
+        // with `disco_key=discokey:0...` no matter how long the
+        // streaming long-poll runs. Mirrors upstream Go's
+        // `controlclient.Direct.SetDerpHomeRegion` which sends a
+        // `stream=false` MapRequest with NetInfo + OmitPeers=true.
+        let mut sent_netinfo_once = false;
 
         while !should_stop() {
             let event = match map.next_event(Duration::from_secs(2)) {
@@ -303,6 +312,32 @@ impl Runtime {
                             Err(e) => warn!(error = %e, "derp.home.selection.failed"),
                         }
                         derp_map_set = true;
+                    }
+
+                    // Fire the NetInfo lite MapRequest once, after the
+                    // DERP map is loaded. v1 hard-codes 50 ms latency
+                    // for every region (no real netcheck yet — that's
+                    // M16+); the coord server only checks that the
+                    // PreferredDERP + DerpLatency fields are present
+                    // and well-formed before committing DiscoKey.
+                    if derp_map_set && !sent_netinfo_once {
+                        sent_netinfo_once = true;
+                        let home = self.derp_ctl.home_region();
+                        let latencies: Vec<(String, f64)> = map
+                            .netmap()
+                            .derp_regions
+                            .keys()
+                            .flat_map(|rid| {
+                                vec![
+                                    (format!("{}-v4", rid), 0.050),
+                                    (format!("{}-v6", rid), 0.050),
+                                ]
+                            })
+                            .collect();
+                        match map.send_netinfo_update(home, latencies) {
+                            Ok(()) => info!(home, "control.map.netinfo_update.sent"),
+                            Err(e) => warn!(error = %e, "control.map.netinfo_update.failed"),
+                        }
                     }
 
                     if !local_addrs_set && !snap.our_addrs.is_empty() {
