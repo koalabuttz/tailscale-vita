@@ -36,6 +36,22 @@ pub use error::MagicError;
 /// Default Tailscale UDP port for direct paths.
 pub const DEFAULT_PORT: u16 = 41641;
 
+/// Format the first 8 hex chars of a 32-byte key for compact log output.
+fn hex32(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(8);
+    for b in &bytes[..4] {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+/// Format the first 8 hex chars of a `DiscoPublicKey` for compact log
+/// output.
+fn hex32_disco(d: &DiscoPublicKey) -> String {
+    hex32(&d.0)
+}
+
 /// Period between Ping bursts for each peer-endpoint pair.
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 /// A direct path is "alive" if we've received a Pong for it within
@@ -194,6 +210,17 @@ impl MagicSocketCtl {
         disco_pub: DiscoPublicKey,
         endpoints: Vec<SocketAddr>,
     ) {
+        let endpoint_count = endpoints.len();
+        let endpoint_summary: Vec<String> =
+            endpoints.iter().map(|a| a.to_string()).collect();
+        info!(
+            peer_pub = %hex32(&node_pub),
+            disco_pub = %hex32_disco(&disco_pub),
+            count = endpoint_count,
+            endpoints = ?endpoint_summary,
+            "magicsock.peer.endpoints"
+        );
+
         let mut s = self.state.lock();
         // Re-link disco_to_node: drop any stale mapping for this node.
         s.disco_to_node
@@ -398,14 +425,27 @@ fn handle_disco(
                             .last_ping_at
                             .map(|t| now.duration_since(t))
                             .unwrap_or_default();
+                        let first_pong = path.last_pong_at.is_none();
                         path.last_pong_at = Some(now);
                         path.rtt = Some(rtt);
                         path.outstanding_tx_id = None;
-                        info!(
-                            %src,
-                            rtt_ms = rtt.as_millis() as u64,
-                            "magicsock.disco.pong.alive"
-                        );
+                        if first_pong {
+                            // Direct path from "untested" → "alive" —
+                            // worth surfacing at info level.
+                            info!(
+                                peer_pub = %hex32(&node_pub),
+                                %src,
+                                rtt_ms = rtt.as_millis() as u64,
+                                "magicsock.disco.pong.alive (first)"
+                            );
+                        } else {
+                            debug!(
+                                peer_pub = %hex32(&node_pub),
+                                %src,
+                                rtt_ms = rtt.as_millis() as u64,
+                                "magicsock.disco.pong.alive"
+                            );
+                        }
                     } else {
                         trace!(%src, "magicsock.disco.pong.tx_mismatch");
                     }

@@ -93,16 +93,39 @@ pub(crate) fn run<T: Transport + ?Sized>(
 /// Disco-validated direct UDP path if the optional hint says one is
 /// alive; otherwise falls back to the peer's cached `transport_addr`
 /// (typically Derp).
+///
+/// Emits a `debug!` log per call describing the chosen variant — set
+/// `RUST_LOG=wg_engine=debug` to observe whether direct paths are
+/// being used vs falling back to DERP. Default (`info`) is silent
+/// since `pick_addr` is on the hot path.
 fn pick_addr(
     peer: &Peer,
     hint: Option<&dyn DirectPathHint>,
 ) -> Option<TransportAddr> {
-    if let Some(h) = hint {
+    let pick = if let Some(h) = hint {
         if let Some(udp) = h.alive_endpoint(&peer.pubkey) {
-            return Some(TransportAddr::Udp(udp));
+            Some(TransportAddr::Udp(udp))
+        } else {
+            peer.transport_addr_load()
+        }
+    } else {
+        peer.transport_addr_load()
+    };
+    if let Some(addr) = &pick {
+        match addr {
+            TransportAddr::Udp(sa) => debug!(
+                peer_pub = %short_hex(&peer.pubkey),
+                addr = %sa,
+                "wg.path.choose variant=udp"
+            ),
+            TransportAddr::Derp { region, .. } => debug!(
+                peer_pub = %short_hex(&peer.pubkey),
+                region,
+                "wg.path.choose variant=derp"
+            ),
         }
     }
-    peer.transport_addr_load()
+    pick
 }
 
 fn prime_handshakes<T: Transport + ?Sized>(
