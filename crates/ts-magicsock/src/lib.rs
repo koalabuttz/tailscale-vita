@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::Mutex;
 use rand_core::{OsRng, RngCore};
 use tracing::{debug, info, trace, warn};
@@ -31,6 +31,8 @@ use ts_disco::keys::{DiscoPrivateKey, DiscoPublicKey, NodePublicKey};
 use ts_disco::{Header, MessageType, Packet, Ping, Pong};
 
 mod error;
+pub mod netcheck;
+pub mod stun;
 pub use error::MagicError;
 
 /// Default Tailscale UDP port for direct paths.
@@ -104,6 +106,16 @@ struct PeerState {
     paths: HashMap<SocketAddr, PathState>,
 }
 
+/// In-flight STUN binding-request awaiting a response on this magicsock.
+struct StunInflight {
+    sent_at: Instant,
+    result_tx: Sender<StunResult>,
+}
+
+/// Outcome of a STUN binding probe: the public-mapped reflected
+/// address as seen by the STUN server, plus round-trip time.
+pub type StunResult = Result<(SocketAddr, Duration), MagicError>;
+
 #[derive(Default)]
 struct MagicState {
     peers: HashMap<NodeKey, PeerState>,
@@ -112,6 +124,11 @@ struct MagicState {
     /// sent it; this map resolves to the node identity for the
     /// `peers` lookup.
     disco_to_node: HashMap<DiscoPublicKey, NodeKey>,
+    /// STUN binding-requests awaiting reply. Keyed by 12-byte
+    /// transaction ID. `MagicSocketCtl::stun_probe` registers a sender;
+    /// `handle_recv` matches incoming STUN responses by tx_id and
+    /// fulfills the channel.
+    stun_outstanding: HashMap<[u8; 12], StunInflight>,
 }
 
 /// Public handle. Cloneable; runtime + wg-engine both hold copies.
@@ -270,11 +287,60 @@ impl MagicSocketCtl {
         self.socket.send_to(bytes, addr)
     }
 
+    /// Issue a STUN binding-request to `target` (typically a DERP
+    /// region's `:3478` address) via this magic socket. Returns a
+    /// receiver that resolves to the public-mapped reflected address
+    /// + RTT once the response arrives, or `MagicError` on send failure
+    /// (timeouts are the caller's responsibility — `recv_timeout()`).
+    ///
+    /// The reflected address represents how the STUN server saw our
+    /// source UDP endpoint — i.e., our public-mapped IP + port for
+    /// MapRequest.Endpoints advertisement. Issued via the magicsock's
+    /// own UDP socket (NOT a fresh ephemeral port) so the reflected
+    /// port matches the one peers can actually direct-connect to.
+    pub fn stun_probe(&self, target: SocketAddr) -> Result<Receiver<StunResult>, MagicError> {
+        // Random 12-byte transaction ID.
+        let mut tx_id = [0u8; 12];
+        OsRng.fill_bytes(&mut tx_id);
+        // bounded(1) — we only ever send one response per probe.
+        let (tx, rx) = bounded(1);
+        let req = stun::encode_binding_request(&tx_id);
+        // Register BEFORE sending so the RX worker can route the
+        // response even if we race.
+        {
+            let mut s = self.state.lock();
+            s.stun_outstanding.insert(
+                tx_id,
+                StunInflight {
+                    sent_at: Instant::now(),
+                    result_tx: tx,
+                },
+            );
+        }
+        if let Err(e) = self.socket.send_to(&req, target) {
+            // Roll back the registration so the entry doesn't leak.
+            self.state.lock().stun_outstanding.remove(&tx_id);
+            return Err(e.into());
+        }
+        debug!(%target, tx_id = %short_hex_tx(&tx_id), "magicsock.stun.probe.sent");
+        Ok(rx)
+    }
+
     /// Best-effort: signal the worker to exit. Returns immediately;
     /// the receive thread polls the flag at most every `RECV_TIMEOUT`.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
     }
+}
+
+/// 8-hex-char short form of a 12-byte STUN tx_id, for log compactness.
+fn short_hex_tx(tx: &[u8; 12]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(8);
+    for b in &tx[..4] {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
 }
 
 /// wg-engine's path-selection oracle. The pump asks per send.
@@ -346,6 +412,12 @@ fn handle_recv(
     our_disco_priv: &DiscoPrivateKey,
     non_disco_tx: &Sender<NonDiscoPacket>,
 ) {
+    // Three-way demux: STUN response → netcheck; Disco → handler;
+    // anything else → wg-engine.
+    if stun::looks_like_stun(bytes) {
+        handle_stun_response(bytes, src, state);
+        return;
+    }
     if !ts_disco::is_disco_message(bytes) {
         // Forward raw bytes for wg-engine. If the channel is full or
         // disconnected, drop — wg's existing retransmits cover it.
@@ -353,6 +425,52 @@ fn handle_recv(
         return;
     }
     handle_disco(bytes, src, socket, state, our_disco_priv);
+}
+
+/// Match a STUN binding-success response against the
+/// `stun_outstanding` table by transaction ID; if found, parse the
+/// XOR-MAPPED-ADDRESS and fulfill the probe's result channel.
+fn handle_stun_response(
+    bytes: &[u8],
+    src: SocketAddr,
+    state: &Mutex<MagicState>,
+) {
+    let tx_id = match stun::tx_id_from(bytes) {
+        Some(id) => id,
+        None => return,
+    };
+    // Lock briefly to remove the inflight entry; release before
+    // touching the channel.
+    let inflight = {
+        let mut s = state.lock();
+        s.stun_outstanding.remove(&tx_id)
+    };
+    let inflight = match inflight {
+        Some(i) => i,
+        None => {
+            trace!(%src, "magicsock.stun.unknown_tx_id");
+            return;
+        }
+    };
+    let rtt = inflight.sent_at.elapsed();
+    let parsed = stun::parse_binding_response(bytes);
+    match parsed {
+        Some(reflected) => {
+            info!(
+                %src,
+                %reflected,
+                rtt_ms = rtt.as_millis() as u64,
+                "magicsock.stun.response"
+            );
+            let _ = inflight.result_tx.try_send(Ok((reflected, rtt)));
+        }
+        None => {
+            warn!(%src, "magicsock.stun.parse_failed");
+            let _ = inflight
+                .result_tx
+                .try_send(Err(MagicError::StunParseFailed));
+        }
+    }
 }
 
 fn handle_disco(

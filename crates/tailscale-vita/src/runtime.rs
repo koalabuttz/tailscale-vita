@@ -315,27 +315,56 @@ impl Runtime {
                     }
 
                     // Fire the NetInfo lite MapRequest once, after the
-                    // DERP map is loaded. v1 hard-codes 50 ms latency
-                    // for every region (no real netcheck yet — that's
-                    // M16+); the coord server only checks that the
-                    // PreferredDERP + DerpLatency fields are present
-                    // and well-formed before committing DiscoKey.
+                    // DERP map is loaded. M14M-Phase11 found that the
+                    // server's persistent-state write path (DiscoKey,
+                    // home region, endpoints) only triggers on a
+                    // non-streaming MapRequest carrying NetInfo with
+                    // real DerpLatency.
+                    //
+                    // Stage 3 (M12 prereq): probe each DERP region's
+                    // STUN port (UDP/3478) via our magicsock to
+                    // discover (a) our public-mapped endpoint for
+                    // peers behind different NATs and (b) real
+                    // round-trip times to populate DerpLatency. Falls
+                    // back to stub 50 ms latencies if every probe
+                    // fails (e.g. UDP egress blocked).
                     if derp_map_set && !sent_netinfo_once {
                         sent_netinfo_once = true;
-                        let home = self.derp_ctl.home_region();
-                        let latencies: Vec<(String, f64)> = map
-                            .netmap()
-                            .derp_regions
-                            .keys()
-                            .flat_map(|rid| {
-                                vec![
-                                    (format!("{}-v4", rid), 0.050),
-                                    (format!("{}-v6", rid), 0.050),
-                                ]
-                            })
+                        let report = run_netcheck(&self.magic_ctl, map.netmap());
+                        let preferred_derp = if report.preferred_derp != 0 {
+                            report.preferred_derp
+                        } else {
+                            self.derp_ctl.home_region()
+                        };
+                        let latencies: Vec<(String, f64)> = if !report.derp_latency.is_empty() {
+                            report
+                                .derp_latency
+                                .iter()
+                                .map(|(rid, secs)| (format!("{}-v4", rid), *secs))
+                                .collect()
+                        } else {
+                            // Fallback: stub 50 ms for every known region.
+                            map.netmap()
+                                .derp_regions
+                                .keys()
+                                .flat_map(|rid| {
+                                    vec![
+                                        (format!("{}-v4", rid), 0.050),
+                                        (format!("{}-v6", rid), 0.050),
+                                    ]
+                                })
+                                .collect()
+                        };
+                        let extra: Vec<String> = report
+                            .public_endpoint
+                            .into_iter()
+                            .map(|sa| sa.to_string())
                             .collect();
-                        match map.send_netinfo_update(home, latencies) {
-                            Ok(()) => info!(home, "control.map.netinfo_update.sent"),
+                        match map.send_netinfo_update(preferred_derp, latencies, extra) {
+                            Ok(()) => info!(
+                                preferred_derp,
+                                "control.map.netinfo_update.sent"
+                            ),
                             Err(e) => warn!(error = %e, "control.map.netinfo_update.failed"),
                         }
                     }
@@ -413,6 +442,48 @@ impl Drop for Runtime {
         self.map = None;
         let _ = self.stack.take();
     }
+}
+
+/// Run STUN-based netcheck against every region in the netmap's
+/// DERPMap. Returns aggregated reflected endpoint + per-region RTT.
+///
+/// Each region's first node is probed at `<ipv4>:3478` (the standard
+/// STUN port that all Tailscale DERP servers run). Probes go in
+/// parallel via `MagicSocketCtl::stun_probe`; aggregation waits up to
+/// `DEFAULT_PROBE_TIMEOUT` for responses.
+///
+/// Skipping a region is benign — its absence from the report just
+/// means that region won't appear in `DerpLatency` (and the server
+/// won't consider it for our home selection).
+fn run_netcheck(magic_ctl: &MagicSocketCtl, nm: &NetMap) -> ts_magicsock::netcheck::NetcheckReport {
+    let mut targets: Vec<ts_magicsock::netcheck::StunTarget> = Vec::new();
+    for (region_id, region) in &nm.derp_regions {
+        let Some(node) = region.nodes.first() else {
+            continue;
+        };
+        // Each DERP node's `ipv4` field is the resolved IP of the
+        // relay; STUN uses UDP/3478. Skip nodes with empty / unparseable
+        // ipv4 (rare — control server populates this).
+        let target_str = format!("{}:{}", node.ipv4, ts_magicsock::netcheck::STUN_PORT);
+        match target_str.parse::<std::net::SocketAddr>() {
+            Ok(addr) => targets.push(ts_magicsock::netcheck::StunTarget {
+                region_id: *region_id,
+                ipv4_addr: addr,
+            }),
+            Err(_) => {
+                warn!(
+                    region_id,
+                    ipv4 = %node.ipv4,
+                    "netcheck.target.parse_failed"
+                );
+            }
+        }
+    }
+    ts_magicsock::netcheck::probe_targets(
+        magic_ctl,
+        &targets,
+        ts_magicsock::netcheck::DEFAULT_PROBE_TIMEOUT,
+    )
 }
 
 /// Translate ts-control's `NetMap.derp_regions` into ts-derp's

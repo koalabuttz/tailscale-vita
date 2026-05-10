@@ -10,4 +10,6 @@ pub enum MagicError {
     TransportMismatch,
     #[error("unknown peer; upsert_peer first")]
     UnknownPeer,
+    #[error("stun response did not parse (bad cookie or attribute layout)")]
+    StunParseFailed,
 }

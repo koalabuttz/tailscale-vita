@@ -361,6 +361,7 @@ impl MapClient {
         &mut self,
         preferred_derp: u16,
         derp_latency: Vec<(String, f64)>,
+        extra_endpoints: Vec<String>,
     ) -> Result<(), ControlError> {
         use serde_json::json;
 
@@ -369,24 +370,49 @@ impl MapClient {
             latencies.insert(region.clone(), json!(*latency));
         }
 
-        let body_json = json!({
-            "Version": MAP_VERSION,
-            "NodeKey": self.node_pub.to_nodekey_string(),
-            "DiscoKey": self.disco_pub.to_discokey_string(),
-            "Hostinfo": {
-                "Hostname": self.hostname,
-                "NetInfo": {
-                    "PreferredDERP": preferred_derp,
-                    "DerpLatency": latencies,
-                }
-            },
-            "OmitPeers": true,
-        });
+        // If the caller passes additional endpoints (e.g. a STUN-
+        // discovered public-mapped IP:port), merge them with our
+        // existing local endpoints. Server applies the union as the
+        // node's advertised endpoints. Skip if empty (server keeps
+        // existing). EndpointTypes is parallel — type 1 = "Local"
+        // for connect-trick LANs, type 2 = "STUN" for reflected.
+        let mut all_endpoints: Vec<String> = self.local_endpoints.clone();
+        let mut all_endpoint_types: Vec<u8> = self.local_endpoint_types.clone();
+        for ep in &extra_endpoints {
+            if !all_endpoints.contains(ep) {
+                all_endpoints.push(ep.clone());
+                all_endpoint_types.push(2u8); // STUN
+            }
+        }
+
+        let mut hostinfo = serde_json::Map::new();
+        hostinfo.insert("Hostname".into(), json!(self.hostname));
+        hostinfo.insert(
+            "NetInfo".into(),
+            json!({
+                "PreferredDERP": preferred_derp,
+                "DerpLatency": latencies,
+            }),
+        );
+
+        let mut body_map = serde_json::Map::new();
+        body_map.insert("Version".into(), json!(MAP_VERSION));
+        body_map.insert("NodeKey".into(), json!(self.node_pub.to_nodekey_string()));
+        body_map.insert("DiscoKey".into(), json!(self.disco_pub.to_discokey_string()));
+        body_map.insert("Hostinfo".into(), serde_json::Value::Object(hostinfo));
+        if !all_endpoints.is_empty() {
+            body_map.insert("Endpoints".into(), json!(all_endpoints));
+            body_map.insert("EndpointTypes".into(), json!(all_endpoint_types));
+        }
+        body_map.insert("OmitPeers".into(), json!(true));
+        let body_json = serde_json::Value::Object(body_map);
+
         let body = serde_json::to_vec(&body_json)?;
         info!(
             body_len = body.len(),
             preferred_derp,
             latency_count = derp_latency.len(),
+            endpoint_count = all_endpoints.len(),
             "control.map.netinfo_update.send"
         );
 

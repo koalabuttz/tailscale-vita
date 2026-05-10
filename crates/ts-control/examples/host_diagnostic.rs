@@ -252,12 +252,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !sent_netinfo_update {
                     sent_netinfo_update = true;
                     info!("host_diagnostic.netinfo_update.start");
+                    // host_diagnostic is control-plane-only — no
+                    // magicsock and no netcheck; pass stub latencies +
+                    // empty extra_endpoints. The Vita runtime does
+                    // real STUN-based netcheck.
                     let latencies: Vec<(String, f64)> = vec![
                         ("1-v4".into(), 0.040),
                         ("21-v4".into(), 0.060),
                         ("27-v4".into(), 0.050),
                     ];
-                    if let Err(e) = map.send_netinfo_update(1, latencies) {
+                    if let Err(e) = map.send_netinfo_update(1, latencies, Vec::new()) {
                         info!(error = %e, "host_diagnostic.netinfo_update.fail");
                     }
                 }
