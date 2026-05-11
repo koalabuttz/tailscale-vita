@@ -30,6 +30,23 @@ fn alloc_local_port() -> u16 {
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_RW_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Max time `Drop` waits for the smoltcp socket to drain its TX queue
+/// and complete the FIN handshake before tearing the socket down.
+/// Without this wait, large responses get truncated mid-flight — the
+/// SocketSet removal severs the buffer before the poll thread can
+/// emit the queued bytes.
+///
+/// Bound chosen for tailnet RTTs (~300 ms typical, up to ~1 s on
+/// cross-country DERP-relayed paths) + small safety margin. A silent
+/// peer that never ACKs our FIN still wakes the dropping caller in
+/// at most this duration.
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Poll interval when waiting on smoltcp state transitions in Drop.
+/// We can't subscribe to "reached FinWait2" — only `is_active()`
+/// transitions emit slot events, and FinWait2 is still active. So
+/// poll the socket state at this cadence as a fallback.
+const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 pub struct TcpStream {
     inner: Arc<StackInner>,
     handle: SocketHandle,
@@ -247,13 +264,91 @@ impl TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
+        // Step 1: initiate close if the caller hasn't already.
+        // `shutdown(Both)` calls smoltcp's `tcp::Socket::close()`,
+        // which transitions state Established → FinWait1 and queues
+        // a FIN to be sent after the TX buffer drains.
         if !self.closed {
             let _ = self.shutdown(std::net::Shutdown::Both);
         }
+
+        // Step 2: wait (bounded) for the close to make progress on
+        // the wire. Without this, the SocketSet removal below would
+        // discard the smoltcp socket while it still has unsent bytes
+        // — observed truncating ~800 bytes off an 11 KB tailnet
+        // response in the M14 LocalAPI proxy.
+        //
+        // We're done waiting when state reaches FinWait2 (our FIN was
+        // ACK'd, so all queued bytes + the FIN itself made it to the
+        // peer) or any later state. Closing/TimeWait/LastAck/Closed
+        // are all "our side of the close is complete." If the timeout
+        // elapses first we tear down anyway — better to lose the tail
+        // of a stuck stream than block the dropping thread forever.
+        wait_for_drain(&self.inner, self.handle, &self.slot);
+
         self.inner.handles.unregister(self.handle);
-        // Remove from SocketSet.
         let mut sockets = self.inner.sockets.lock();
         let _ = sockets.remove(self.handle);
+    }
+}
+
+/// Block until the socket's TX is drained + FIN handshake complete,
+/// or `CLOSE_DRAIN_TIMEOUT` elapses. Pure read-only inspection — no
+/// mutation. Safe to call after `close()` has been issued. See
+/// `CLOSE_DRAIN_TIMEOUT` doc for the rationale.
+fn wait_for_drain(
+    inner: &Arc<StackInner>,
+    handle: SocketHandle,
+    slot: &Arc<HandleSlot>,
+) {
+    let deadline = Instant::now() + CLOSE_DRAIN_TIMEOUT;
+    loop {
+        let done = {
+            let sockets = inner.sockets.lock();
+            // The socket may have been removed already (e.g., RST
+            // tore it down). Treat absence as "done."
+            //
+            // SocketSet doesn't expose a `try_get` that returns
+            // Option, so we use `iter().find()` which returns an
+            // immutable Socket ref — sufficient for state inspection.
+            let socket_state = sockets
+                .iter()
+                .find(|(h, _)| *h == handle)
+                .and_then(|(_, sock)| match sock {
+                    smoltcp::socket::Socket::Tcp(s) => Some(s.state()),
+                    _ => None,
+                });
+            match socket_state {
+                Some(state) => {
+                    use tcp::State;
+                    matches!(
+                        state,
+                        State::FinWait2
+                            | State::Closing
+                            | State::TimeWait
+                            | State::LastAck
+                            | State::Closed
+                    )
+                }
+                None => true, // socket gone / non-TCP — nothing to wait for
+            }
+        };
+        if done {
+            trace!(?handle, "tcp.drop.drain.done");
+            return;
+        }
+        if Instant::now() >= deadline {
+            trace!(?handle, "tcp.drop.drain.timeout");
+            return;
+        }
+        // The slot's `closed` event fires when `is_active()` flips
+        // false (i.e., on TimeWait/Closed). FinWait2 is still active,
+        // so we wouldn't get a notify from there — short polling
+        // window catches it.
+        slot.wait_until(
+            deadline.min(Instant::now() + CLOSE_POLL_INTERVAL),
+            |ev| ev.closed,
+        );
     }
 }
 
