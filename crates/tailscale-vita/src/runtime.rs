@@ -355,8 +355,19 @@ impl Runtime {
                                 })
                                 .collect()
                         };
-                        let extra: Vec<String> = report
-                            .public_endpoint
+                        // Public-endpoint discovery: prefer the DERP-
+                        // probe's reflection if any DERP responded;
+                        // else fall back to public STUN (Google /
+                        // Cloudflare / Twilio). Tailscale's own DERPs
+                        // sometimes refuse STUN from clients without
+                        // recent activity history.
+                        let public_endpoint = report.public_endpoint.or_else(|| {
+                            ts_magicsock::netcheck::discover_public_endpoint(
+                                &self.magic_ctl,
+                                ts_magicsock::netcheck::DEFAULT_PROBE_TIMEOUT,
+                            )
+                        });
+                        let extra: Vec<String> = public_endpoint
                             .into_iter()
                             .map(|sa| sa.to_string())
                             .collect();

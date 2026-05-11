@@ -10,7 +10,7 @@
 //! collects results with a per-probe timeout, and aggregates.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use crossbeam_channel::Receiver;
@@ -22,8 +22,21 @@ use crate::{MagicSocketCtl, StunResult};
 /// short enough to fail fast.
 pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// Standard STUN UDP port. All Tailscale DERP servers run STUN here.
+/// Standard STUN UDP port. All Tailscale DERP servers run STUN here
+/// (the value can be overridden per-node via `DerpNode.STUNPort`, but
+/// in practice every region uses 3478).
 pub const STUN_PORT: u16 = 3478;
+
+/// Public STUN servers to use as a fallback when Tailscale's DERPs
+/// don't respond (some networks / Tailscale-side IP-history ACLs
+/// block fresh sources). Resolved at runtime since these hostnames
+/// have multiple A records. We only need ONE successful probe to
+/// learn our public-mapped endpoint.
+pub const PUBLIC_STUN_FALLBACKS: &[&str] = &[
+    "stun.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+    "global.stun.twilio.com:3478",
+];
 
 /// Per-region probe result.
 #[derive(Debug, Clone)]
@@ -153,4 +166,70 @@ pub fn probe_targets(
         public_endpoint,
         probes,
     }
+}
+
+/// Best-effort public-endpoint discovery via well-known third-party
+/// STUN servers. Used when `probe_targets` against Tailscale DERPs
+/// produces no responses (e.g., Tailscale's IP-history ACL blocks us,
+/// or the ISP filters outbound UDP/3478 to DERP IPs).
+///
+/// Tries each fallback in order; returns on the first response. The
+/// reflected endpoint reflects our public-mapped IP:port from this
+/// magicsock's UDP socket — the same port peers will direct-connect
+/// to, so the result is usable as `MapRequest.Endpoints` directly.
+pub fn discover_public_endpoint(
+    magic: &MagicSocketCtl,
+    timeout: Duration,
+) -> Option<SocketAddr> {
+    for target_str in PUBLIC_STUN_FALLBACKS {
+        // Resolve hostname → SocketAddr (first A record).
+        let resolved: Option<SocketAddr> = match target_str.to_socket_addrs() {
+            Ok(mut it) => it.find(|a| a.is_ipv4()),
+            Err(e) => {
+                debug!(
+                    target = *target_str,
+                    error = %e,
+                    "magicsock.netcheck.fallback.dns_failed"
+                );
+                None
+            }
+        };
+        let Some(target) = resolved else {
+            continue;
+        };
+        let rx = match magic.stun_probe(target) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(
+                    %target,
+                    error = %e,
+                    "magicsock.netcheck.fallback.send_failed"
+                );
+                continue;
+            }
+        };
+        match rx.recv_timeout(timeout) {
+            Ok(Ok((reflected, rtt))) => {
+                info!(
+                    target = *target_str,
+                    %target,
+                    %reflected,
+                    rtt_ms = rtt.as_millis() as u64,
+                    "magicsock.netcheck.fallback.ok"
+                );
+                return Some(reflected);
+            }
+            Ok(Err(e)) => debug!(
+                target = *target_str,
+                error = %e,
+                "magicsock.netcheck.fallback.parse_failed"
+            ),
+            Err(_elapsed) => debug!(
+                target = *target_str,
+                "magicsock.netcheck.fallback.timeout"
+            ),
+        }
+    }
+    warn!("magicsock.netcheck.fallback.exhausted");
+    None
 }
