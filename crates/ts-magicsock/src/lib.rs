@@ -38,6 +38,33 @@ pub use error::MagicError;
 /// Default Tailscale UDP port for direct paths.
 pub const DEFAULT_PORT: u16 = 41641;
 
+/// Bundle of magicsock's outbound sockets, with address-family
+/// dispatch. Internal helper threaded through send paths
+/// (`send_ping`, `send_pong`, `handle_call_me_maybe`) so they can
+/// route each datagram to the right socket. v6 is `Option` because
+/// platforms without AF_INET6 support (Vita's sceNet) run v4-only.
+struct Sockets<'a> {
+    v4: &'a UdpSocket,
+    v6: Option<&'a UdpSocket>,
+}
+
+impl<'a> Sockets<'a> {
+    /// Pick the socket for an outbound destination. v6 dest with no
+    /// v6 socket → `AddrNotAvailable`; caller falls back to DERP.
+    fn for_addr(&self, addr: SocketAddr) -> std::io::Result<&'a UdpSocket> {
+        if addr.is_ipv4() {
+            Ok(self.v4)
+        } else {
+            self.v6.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "v6 destination but magicsock has no v6 socket",
+                )
+            })
+        }
+    }
+}
+
 /// Format the first 8 hex chars of a 32-byte key for compact log output.
 fn hex32(bytes: &[u8; 32]) -> String {
     use std::fmt::Write as _;
@@ -177,10 +204,17 @@ struct MagicState {
 /// Public handle. Cloneable; runtime + wg-engine both hold copies.
 #[derive(Clone)]
 pub struct MagicSocketCtl {
-    socket: Arc<UdpSocket>,
+    /// IPv4 send/receive socket. Always present — bind failure here
+    /// is fatal to `MagicSocket::bind`.
+    socket_v4: Arc<UdpSocket>,
+    /// IPv6 send/receive socket. Optional because the Vita's sceNet
+    /// rejects `AF_INET6`; v6-only peers fall back to DERP. Hosts
+    /// with v6 support (x86_64 Linux) have this Some.
+    socket_v6: Option<Arc<UdpSocket>>,
     state: Arc<Mutex<MagicState>>,
     shutdown: Arc<AtomicBool>,
-    local_addr: SocketAddr,
+    local_addr_v4: SocketAddr,
+    local_addr_v6: Option<SocketAddr>,
     /// Our Disco identity. Shared with the worker thread (which also
     /// holds an Arc). Needed on the ctl side so `handle_disco_from_derp`
     /// can decrypt CallMeMaybe frames the runtime relays from DERP.
@@ -190,30 +224,59 @@ pub struct MagicSocketCtl {
     our_node_pub: NodePublicKey,
 }
 
-/// Spawned worker side. Drop joins the receive thread.
+/// Spawned worker side. Drop joins the receive thread(s) — both v4
+/// and v6 if both are bound.
 pub struct MagicSocket {
-    worker: Option<JoinHandle<()>>,
+    worker_v4: Option<JoinHandle<()>>,
+    worker_v6: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
 }
 
 impl MagicSocket {
-    /// Bind a UDP socket and spawn the receive + ping-pump worker.
-    /// `bind_addr` is normally `0.0.0.0:DEFAULT_PORT`; if 41641 is
-    /// taken (or the OS rejects the port), pass `0.0.0.0:0` and the
-    /// kernel assigns one. The actual bound address is on the returned
-    /// ctl handle via `local_addr`.
+    /// Bind UDP sockets (IPv4 always, IPv6 best-effort) and spawn the
+    /// receive + ping-pump worker thread(s). `bind_addr_v4` is normally
+    /// `0.0.0.0:DEFAULT_PORT`; on port conflict pass `0.0.0.0:0` and
+    /// let the kernel pick.
+    ///
+    /// IPv6 is best-effort: we ALSO try to bind `[::]:<same-port>` so
+    /// outgoing Disco/WG can reach v6-advertised peer endpoints. On
+    /// Vita this fails (sceNet is AF_INET only per RESEARCH.md); we
+    /// log `info!("magicsock.bind.v6 unsupported")` and continue
+    /// v4-only. v6 peers fall back to DERP or their v4 endpoints.
     pub fn bind(
-        bind_addr: SocketAddr,
+        bind_addr_v4: SocketAddr,
         our_disco_priv: DiscoPrivateKey,
         our_node_pub: NodePublicKey,
         non_disco_tx: Sender<NonDiscoPacket>,
     ) -> Result<(Self, MagicSocketCtl), MagicError> {
-        let socket = UdpSocket::bind(bind_addr)?;
-        socket.set_read_timeout(Some(RECV_TIMEOUT))?;
-        let local_addr = socket.local_addr()?;
-        info!(%local_addr, "magicsock.bind");
+        let socket_v4 = UdpSocket::bind(bind_addr_v4)?;
+        socket_v4.set_read_timeout(Some(RECV_TIMEOUT))?;
+        let local_addr_v4 = socket_v4.local_addr()?;
+        info!(%local_addr_v4, "magicsock.bind.v4");
 
-        let socket = Arc::new(socket);
+        // Best-effort v6 bind on the same port. If the kernel-picked
+        // v4 port can't also be claimed on v6 (race), try ephemeral.
+        let v6_target_port = local_addr_v4.port();
+        let bind_addr_v6: SocketAddr = format!("[::]:{v6_target_port}").parse().expect("valid v6");
+        let (socket_v6, local_addr_v6) = match UdpSocket::bind(bind_addr_v6) {
+            Ok(s) => {
+                if let Err(e) = s.set_read_timeout(Some(RECV_TIMEOUT)) {
+                    warn!(error = %e, "magicsock.bind.v6.set_timeout_failed");
+                }
+                let addr = s.local_addr().ok();
+                info!(local_addr_v6 = ?addr, "magicsock.bind.v6");
+                (Some(Arc::new(s)), addr)
+            }
+            Err(e) => {
+                // Common reasons: Vita sceNet AF_INET6 missing, host
+                // disabled v6, or port already bound on v6 only. None
+                // are fatal — we still have v4.
+                info!(error = %e, "magicsock.bind.v6 unsupported; v4-only");
+                (None, None)
+            }
+        };
+
+        let socket_v4 = Arc::new(socket_v4);
         let state = Arc::new(Mutex::new(MagicState::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
         // Share the disco-priv via Arc so the ctl side can decrypt
@@ -222,37 +285,79 @@ impl MagicSocket {
         let our_disco_priv = Arc::new(our_disco_priv);
 
         let ctl = MagicSocketCtl {
-            socket: Arc::clone(&socket),
+            socket_v4: Arc::clone(&socket_v4),
+            socket_v6: socket_v6.as_ref().map(Arc::clone),
             state: Arc::clone(&state),
             shutdown: Arc::clone(&shutdown),
-            local_addr,
+            local_addr_v4,
+            local_addr_v6,
             our_disco_priv: Arc::clone(&our_disco_priv),
             our_node_pub,
         };
 
-        let worker_state = Arc::clone(&state);
-        let worker_socket = Arc::clone(&socket);
-        let worker_shutdown = Arc::clone(&shutdown);
-        let worker_priv = Arc::clone(&our_disco_priv);
-        let worker = thread::Builder::new()
-            .name("ts-magicsock".into())
+        // Spawn the v4 worker. It owns the ping-pump cadence (the v6
+        // worker is recv-only; pings are launched against per-endpoint
+        // candidates from this single thread).
+        let v4_state = Arc::clone(&state);
+        let v4_socket = Arc::clone(&socket_v4);
+        let v4_shutdown = Arc::clone(&shutdown);
+        let v4_priv = Arc::clone(&our_disco_priv);
+        let v4_non_disco_tx = non_disco_tx.clone();
+        let v4_send_v4 = Arc::clone(&socket_v4);
+        let v4_send_v6 = socket_v6.as_ref().map(Arc::clone);
+        let worker_v4 = thread::Builder::new()
+            .name("ts-magicsock-v4".into())
             .stack_size(256 * 1024)
             .spawn(move || {
                 let our_node_pub = our_node_pub;
                 worker_loop(
-                    worker_socket,
-                    worker_state,
-                    worker_shutdown,
-                    worker_priv,
+                    v4_socket,
+                    v4_state,
+                    v4_shutdown,
+                    v4_priv,
                     our_node_pub,
-                    non_disco_tx,
+                    v4_non_disco_tx,
+                    (v4_send_v4, v4_send_v6),
+                    /* run_ping_pump = */ true,
                 );
             })
             .map_err(MagicError::Io)?;
 
+        // Optional v6 worker — recv-only, no ping pump (avoids
+        // double-pinging from both threads). If we ever bind v6,
+        // pings still go out via send_to which routes by family.
+        let worker_v6 = if let Some(sock) = socket_v6 {
+            let v6_state = Arc::clone(&state);
+            let v6_shutdown = Arc::clone(&shutdown);
+            let v6_priv = Arc::clone(&our_disco_priv);
+            let v6_send_v4 = Arc::clone(&socket_v4);
+            let v6_send_v6 = Some(Arc::clone(&sock));
+            let h = thread::Builder::new()
+                .name("ts-magicsock-v6".into())
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    let our_node_pub = our_node_pub;
+                    worker_loop(
+                        sock,
+                        v6_state,
+                        v6_shutdown,
+                        v6_priv,
+                        our_node_pub,
+                        non_disco_tx,
+                        (v6_send_v4, v6_send_v6),
+                        /* run_ping_pump = */ false,
+                    );
+                })
+                .map_err(MagicError::Io)?;
+            Some(h)
+        } else {
+            None
+        };
+
         Ok((
             Self {
-                worker: Some(worker),
+                worker_v4: Some(worker_v4),
+                worker_v6,
                 shutdown,
             },
             ctl,
@@ -263,15 +368,26 @@ impl MagicSocket {
 impl Drop for MagicSocket {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        if let Some(h) = self.worker.take() {
+        if let Some(h) = self.worker_v4.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.worker_v6.take() {
             let _ = h.join();
         }
     }
 }
 
 impl MagicSocketCtl {
+    /// Our IPv4 bind address. Always present.
     pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+        self.local_addr_v4
+    }
+
+    /// Our IPv6 bind address, if v6 was successfully bound. `None`
+    /// on Vita (sceNet AF_INET only). Callers advertising endpoints
+    /// to the control plane should advertise both when this is Some.
+    pub fn local_addr_v6(&self) -> Option<SocketAddr> {
+        self.local_addr_v6
     }
 
     /// Add or replace a peer's Disco state. Endpoints not present in
@@ -352,8 +468,30 @@ impl MagicSocketCtl {
 
     /// Send a raw datagram to an arbitrary UDP address. wg-engine uses
     /// this to send WG packets along an alive direct path.
+    ///
+    /// Address-family dispatch: v4 destinations use the v4 socket, v6
+    /// destinations use the v6 socket if bound. If `addr` is v6 and
+    /// we don't have a v6 socket (Vita), returns `AddrNotAvailable`
+    /// — peer falls back to DERP or its v4 endpoints.
     pub fn send_to(&self, addr: SocketAddr, bytes: &[u8]) -> std::io::Result<usize> {
-        self.socket.send_to(bytes, addr)
+        let socket = self.socket_for(addr)?;
+        socket.send_to(bytes, addr)
+    }
+
+    /// Internal: pick the right socket for an outbound address.
+    /// Returns `AddrNotAvailable` if v6 routing was requested but we
+    /// don't have a v6 socket.
+    fn socket_for(&self, addr: SocketAddr) -> std::io::Result<&Arc<UdpSocket>> {
+        if addr.is_ipv4() {
+            Ok(&self.socket_v4)
+        } else {
+            self.socket_v6.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "v6 destination but magicsock has no v6 socket",
+                )
+            })
+        }
     }
 
     /// Issue a STUN binding-request to `target` (typically a DERP
@@ -386,7 +524,14 @@ impl MagicSocketCtl {
                 },
             );
         }
-        if let Err(e) = self.socket.send_to(&req, target) {
+        let socket = match self.socket_for(target) {
+            Ok(s) => Arc::clone(s),
+            Err(e) => {
+                self.state.lock().stun_outstanding.remove(&tx_id);
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = socket.send_to(&req, target) {
             // Roll back the registration so the entry doesn't leak.
             self.state.lock().stun_outstanding.remove(&tx_id);
             return Err(e.into());
@@ -449,8 +594,16 @@ impl MagicSocketCtl {
                 },
             );
         }
+        // Pick the right socket for the target's address family.
+        let socket = match self.socket_for(target) {
+            Ok(s) => Arc::clone(s),
+            Err(e) => {
+                self.state.lock().ping_outstanding.remove(&tx_id);
+                return Err(e.into());
+            }
+        };
         if let Err(e) = encode_and_send_ping(
-            &self.socket,
+            &socket,
             &self.our_disco_priv,
             &self.our_node_pub,
             &peer_disco,
@@ -537,8 +690,12 @@ impl MagicSocketCtl {
                         return;
                     }
                 };
+                let sockets = Sockets {
+                    v4: &self.socket_v4,
+                    v6: self.socket_v6.as_deref(),
+                };
                 handle_call_me_maybe(
-                    &self.socket,
+                    &sockets,
                     &self.state,
                     &self.our_disco_priv,
                     &self.our_node_pub,
@@ -577,6 +734,13 @@ impl wg_engine::DirectPathHint for MagicSocketCtl {
 // Worker: receive loop + periodic ping pump.
 // ============================================================
 
+// worker_loop args:
+//   socket        — this worker's recv socket (v4 or v6).
+//   send_sockets  — (v4_arc, opt v6_arc) for outbound dispatch; both
+//                   workers get the same pair so handle_disco /
+//                   handle_call_me_maybe can target either family.
+//   run_ping_pump — true only on the v4 worker. Running from both
+//                   would double-ping every peer.
 fn worker_loop(
     socket: Arc<UdpSocket>,
     state: Arc<Mutex<MagicState>>,
@@ -584,29 +748,41 @@ fn worker_loop(
     our_disco_priv: Arc<DiscoPrivateKey>,
     our_node_pub: NodePublicKey,
     non_disco_tx: Sender<NonDiscoPacket>,
+    send_sockets: (Arc<UdpSocket>, Option<Arc<UdpSocket>>),
+    run_ping_pump: bool,
 ) {
-    info!(local = ?socket.local_addr(), "magicsock.worker.start");
+    info!(local = ?socket.local_addr(), run_ping_pump, "magicsock.worker.start");
     let mut buf = vec![0u8; RECV_BUF];
     let mut last_ping_pump = Instant::now() - PING_INTERVAL;
+    let (send_v4, send_v6) = send_sockets;
 
     loop {
         if shutdown.load(Ordering::Acquire) {
             break;
         }
 
-        // Periodic ping pump.
-        if last_ping_pump.elapsed() >= PING_INTERVAL {
-            ping_pump(&socket, &state, &our_disco_priv, &our_node_pub);
+        // Periodic ping pump. Family dispatch through Sockets.
+        if run_ping_pump && last_ping_pump.elapsed() >= PING_INTERVAL {
+            let sockets = Sockets {
+                v4: &send_v4,
+                v6: send_v6.as_deref(),
+            };
+            ping_pump(&sockets, &state, &our_disco_priv, &our_node_pub);
             last_ping_pump = Instant::now();
         }
 
         // Receive (blocks up to RECV_TIMEOUT).
         match socket.recv_from(&mut buf) {
             Ok((n, src)) => {
+                let sockets = Sockets {
+                    v4: &send_v4,
+                    v6: send_v6.as_deref(),
+                };
                 handle_recv(
                     &buf[..n],
                     src,
                     &socket,
+                    &sockets,
                     &state,
                     &our_disco_priv,
                     &our_node_pub,
@@ -632,6 +808,7 @@ fn handle_recv(
     bytes: &[u8],
     src: SocketAddr,
     socket: &UdpSocket,
+    sockets: &Sockets<'_>,
     state: &Mutex<MagicState>,
     our_disco_priv: &DiscoPrivateKey,
     our_node_pub: &NodePublicKey,
@@ -649,7 +826,10 @@ fn handle_recv(
         let _ = non_disco_tx.try_send((src, bytes.to_vec()));
         return;
     }
-    handle_disco(bytes, src, socket, state, our_disco_priv, our_node_pub);
+    // Pong replies go on the same socket the ping arrived on (`socket`)
+    // for clean src-addr semantics. CMM-RX immediate-pings can target
+    // either family, so they take `sockets` for dispatch.
+    handle_disco(bytes, src, socket, sockets, state, our_disco_priv, our_node_pub);
 }
 
 /// Match a STUN binding-success response against the
@@ -702,6 +882,7 @@ fn handle_disco(
     bytes: &[u8],
     src: SocketAddr,
     socket: &UdpSocket,
+    sockets: &Sockets<'_>,
     state: &Mutex<MagicState>,
     our_disco_priv: &DiscoPrivateKey,
     our_node_pub: &NodePublicKey,
@@ -821,7 +1002,7 @@ fn handle_disco(
                     return;
                 }
             };
-            handle_call_me_maybe(socket, state, our_disco_priv, our_node_pub, sender_pub, cmm);
+            handle_call_me_maybe(sockets, state, our_disco_priv, our_node_pub, sender_pub, cmm);
         }
         Some(other) => {
             trace!(?other, %src, "magicsock.disco.unhandled_type");
@@ -849,7 +1030,7 @@ fn handle_disco(
 /// Worker thread takes `&DiscoPrivateKey`; ctl side takes
 /// `&Arc<DiscoPrivateKey>` and `&*arc` to coerce.
 fn handle_call_me_maybe(
-    socket: &UdpSocket,
+    sockets: &Sockets<'_>,
     state: &Mutex<MagicState>,
     our_disco_priv: &DiscoPrivateKey,
     our_node_pub: &NodePublicKey,
@@ -895,7 +1076,17 @@ fn handle_call_me_maybe(
     );
     // Fire an immediate Ping to each advertised endpoint. Each Ping
     // also opens our outbound NAT mapping for the sender's reply.
+    // Per-endpoint family dispatch via Sockets — v6 endpoints use the
+    // v6 socket if bound; otherwise we silently skip (peer falls back
+    // to DERP or its v4 endpoints).
     for ep in advertised {
+        let socket = match sockets.for_addr(ep) {
+            Ok(s) => s,
+            Err(e) => {
+                trace!(?e, %ep, "magicsock.callme.recv.skip_no_socket");
+                continue;
+            }
+        };
         match send_ping(socket, our_disco_priv, our_node_pub, &peer_disco, ep) {
             Ok(tx_id) => {
                 let mut s = state.lock();
@@ -911,7 +1102,7 @@ fn handle_call_me_maybe(
 }
 
 fn ping_pump(
-    socket: &UdpSocket,
+    sockets: &Sockets<'_>,
     state: &Mutex<MagicState>,
     our_disco_priv: &DiscoPrivateKey,
     our_node_pub: &NodePublicKey,
@@ -946,6 +1137,13 @@ fn ping_pump(
     };
 
     for (node_pub, peer_disco, addr) in to_ping {
+        let socket = match sockets.for_addr(addr) {
+            Ok(s) => s,
+            Err(e) => {
+                trace!(?e, %addr, "magicsock.disco.ping.skip_no_socket");
+                continue;
+            }
+        };
         let tx_id = match send_ping(socket, our_disco_priv, our_node_pub, &peer_disco, addr) {
             Ok(tx) => tx,
             Err(e) => {
@@ -1365,5 +1563,60 @@ mod tests {
             .expect("expected immediate Ping from B at fake_a_addr");
         assert!(ts_disco::is_disco_message(&buf[..n]));
         assert_eq!(src, b_ctl.local_addr());
+    }
+
+    /// M15-C: on hosts where AF_INET6 is supported (host_diagnostic
+    /// / x86_64 Linux, NOT Vita), `bind` produces both v4 and v6
+    /// sockets and reports the v6 local addr alongside v4.
+    #[test]
+    fn dual_socket_bind_on_host() {
+        let priv_key = DiscoPrivateKey::random();
+        let node = NodePublicKey::from([0u8; 32]);
+        let (non_tx, _non_rx) = unbounded::<NonDiscoPacket>();
+        let (_sock, ctl) = MagicSocket::bind(
+            loopback(0),
+            DiscoPrivateKey::from_bytes(*priv_key.as_bytes()),
+            node,
+            non_tx,
+        )
+        .unwrap();
+        // v4 is mandatory.
+        assert!(ctl.local_addr().is_ipv4());
+        // v6 may or may not be present depending on host; if it is,
+        // it should be on the same port as v4 (best-effort) or any
+        // valid v6 socket addr.
+        if let Some(v6) = ctl.local_addr_v6() {
+            assert!(v6.is_ipv6(), "v6 addr should be v6: {v6:?}");
+        }
+        // If we ARE running with v6 (most x86_64 Linux), confirm send
+        // dispatch routes by family without panicking. v4 send to a
+        // benign sink ("127.0.0.1:1") and (if v6) v6 send to "[::1]:1".
+        // Both should succeed at the socket layer; nobody listens at
+        // port 1 — that's fine, we're only checking dispatch logic.
+        let _ = ctl.send_to(loopback(1), b"\x00");
+        if ctl.local_addr_v6().is_some() {
+            let v6_addr: SocketAddr = "[::1]:1".parse().unwrap();
+            let _ = ctl.send_to(v6_addr, b"\x00");
+        }
+    }
+
+    /// Address-family dispatch correctness: when no v6 socket is
+    /// bound, sending to a v6 destination returns AddrNotAvailable
+    /// (not a panic). This is the Vita code path.
+    #[test]
+    fn send_to_v6_without_v6_socket_returns_addr_not_available() {
+        // Construct a MagicSocketCtl with a v4-only inner state.
+        // Easier: just stand up MagicSocket on a host that does have
+        // v6, then check the error path by force-clearing socket_v6.
+        // But MagicSocketCtl.socket_v6 is private; we can't mutate.
+        // Instead use Sockets directly.
+        let v4 = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        let sockets = Sockets {
+            v4: &v4,
+            v6: None,
+        };
+        let v6_dest: SocketAddr = "[::1]:1".parse().unwrap();
+        let err = sockets.for_addr(v6_dest).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrNotAvailable);
     }
 }

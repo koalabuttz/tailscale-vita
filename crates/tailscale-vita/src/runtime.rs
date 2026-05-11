@@ -619,25 +619,46 @@ impl Runtime {
                         // recent activity history.
                         // Update the outer-scope `public_endpoint` so
                         // every snapshot republish carries the latest
-                        // STUN-discovered address.
-                        public_endpoint = report.public_endpoint.or_else(|| {
-                            ts_magicsock::netcheck::discover_public_endpoint(
+                        // STUN-discovered address. Now dual-family
+                        // (M15-C): if any v6 reflection came back from
+                        // the DERP probes, advertise it alongside v4;
+                        // fall back to public-STUN for both families.
+                        public_endpoint = report.public_endpoint;
+                        let mut public_endpoint_v6 = report.public_endpoint_v6;
+                        if public_endpoint.is_none() || public_endpoint_v6.is_none() {
+                            let (v4, v6) = ts_magicsock::netcheck::discover_public_endpoints_dual(
                                 &self.magic_ctl,
                                 ts_magicsock::netcheck::DEFAULT_PROBE_TIMEOUT,
-                            )
-                        });
-                        let extra: Vec<String> = public_endpoint
-                            .into_iter()
-                            .map(|sa| sa.to_string())
-                            .collect();
+                            );
+                            if public_endpoint.is_none() {
+                                public_endpoint = v4;
+                            }
+                            if public_endpoint_v6.is_none() {
+                                public_endpoint_v6 = v6;
+                            }
+                        }
+                        let mut extra: Vec<String> = Vec::new();
+                        if let Some(sa) = public_endpoint {
+                            extra.push(sa.to_string());
+                        }
+                        if let Some(sa) = public_endpoint_v6 {
+                            extra.push(sa.to_string());
+                        }
                         // Tell magicsock which endpoints to advertise
                         // in any CallMeMaybe we send: our LAN binding
-                        // plus the STUN-reflected public address.
-                        // These are what peers will dial back to. If
-                        // STUN failed, we still advertise the LAN.
+                        // plus the STUN-reflected public address(es).
+                        // These are what peers will dial back to.
                         let mut local_eps: Vec<SocketAddr> =
                             vec![self.magic_ctl.local_addr()];
+                        if let Some(v6_local) = self.magic_ctl.local_addr_v6() {
+                            local_eps.push(v6_local);
+                        }
                         if let Some(pe) = public_endpoint {
+                            if !local_eps.contains(&pe) {
+                                local_eps.push(pe);
+                            }
+                        }
+                        if let Some(pe) = public_endpoint_v6 {
                             if !local_eps.contains(&pe) {
                                 local_eps.push(pe);
                             }
@@ -849,23 +870,40 @@ fn run_netcheck(magic_ctl: &MagicSocketCtl, nm: &NetMap) -> ts_magicsock::netche
         let Some(node) = region.nodes.first() else {
             continue;
         };
-        // Each DERP node's `ipv4` field is the resolved IP of the
-        // relay; STUN uses UDP/3478. Skip nodes with empty / unparseable
-        // ipv4 (rare — control server populates this).
-        let target_str = format!("{}:{}", node.ipv4, ts_magicsock::netcheck::STUN_PORT);
-        match target_str.parse::<std::net::SocketAddr>() {
-            Ok(addr) => targets.push(ts_magicsock::netcheck::StunTarget {
-                region_id: *region_id,
-                ipv4_addr: addr,
-            }),
-            Err(_) => {
-                warn!(
-                    region_id,
-                    ipv4 = %node.ipv4,
-                    "netcheck.target.parse_failed"
-                );
-            }
+        // Each DERP node carries both `ipv4` and `ipv6` fields; the
+        // server populates them. STUN runs on UDP/3478 for both
+        // families. Skip empty / unparseable values rather than
+        // synthesizing a "0.0.0.0" target.
+        let stun_port = ts_magicsock::netcheck::STUN_PORT;
+        let ipv4_addr = if node.ipv4.is_empty() {
+            None
+        } else {
+            format!("{}:{}", node.ipv4, stun_port)
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| {
+                    warn!(region_id, ipv4 = %node.ipv4, "netcheck.target.v4.parse_failed");
+                })
+                .ok()
+        };
+        let ipv6_addr = if node.ipv6.is_empty() {
+            None
+        } else {
+            // IPv6 addresses need brackets in `[v6]:port` form.
+            format!("[{}]:{}", node.ipv6, stun_port)
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| {
+                    debug!(region_id, ipv6 = %node.ipv6, "netcheck.target.v6.parse_failed");
+                })
+                .ok()
+        };
+        if ipv4_addr.is_none() && ipv6_addr.is_none() {
+            continue;
         }
+        targets.push(ts_magicsock::netcheck::StunTarget {
+            region_id: *region_id,
+            ipv4_addr,
+            ipv6_addr,
+        });
     }
     ts_magicsock::netcheck::probe_targets(
         magic_ctl,
