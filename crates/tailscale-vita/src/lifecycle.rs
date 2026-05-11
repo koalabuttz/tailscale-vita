@@ -27,6 +27,7 @@
 
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use tracing::{info, warn};
 
 const DEGRADED_AFTER: Duration = Duration::from_secs(60);
@@ -42,7 +43,7 @@ pub enum FatalKind {
     Security,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum OnlineState {
     /// Initial state — no map event and no DERP rx seen yet.
     Connecting,

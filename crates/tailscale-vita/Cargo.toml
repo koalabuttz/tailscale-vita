@@ -19,6 +19,7 @@ crossbeam-channel = { workspace = true }
 
 # Workspace deps.
 serde       = { workspace = true }
+serde_json  = { workspace = true }
 toml        = { workspace = true }
 tracing     = { workspace = true }
 parking_lot = { workspace = true }
@@ -26,4 +27,5 @@ x25519-dalek = { workspace = true }
 rand_core    = { workspace = true }
 smoltcp     = { workspace = true }
 http        = "1"
+httparse    = { workspace = true }
 thiserror   = { workspace = true }

@@ -12,4 +12,8 @@ pub enum MagicError {
     UnknownPeer,
     #[error("stun response did not parse (bad cookie or attribute layout)")]
     StunParseFailed,
+    #[error("no endpoint candidates registered for this peer")]
+    NoEndpoints,
+    #[error("ping_now timed out (no Pong within window)")]
+    PingTimeout,
 }

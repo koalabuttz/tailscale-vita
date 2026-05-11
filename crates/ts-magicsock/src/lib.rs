@@ -125,6 +125,20 @@ struct StunInflight {
     result_tx: Sender<StunResult>,
 }
 
+/// In-flight Disco ping awaiting a matching Pong on this magicsock.
+/// Used by `MagicSocketCtl::ping_now` (M14) — the LocalAPI `/ping`
+/// endpoint synchronously triggers a ping and awaits the round-trip.
+/// Background ping_pump pings are NOT routed through this map;
+/// they use `PathState.outstanding_tx_id` instead and emit logs only.
+struct PingInflight {
+    sent_at: Instant,
+    target: SocketAddr,
+    result_tx: Sender<PingResult>,
+}
+
+/// Outcome of an active Disco ping: `(endpoint, RTT)` on Pong return.
+pub type PingResult = Result<(SocketAddr, Duration), MagicError>;
+
 /// Outcome of a STUN binding probe: the public-mapped reflected
 /// address as seen by the STUN server, plus round-trip time.
 pub type StunResult = Result<(SocketAddr, Duration), MagicError>;
@@ -142,6 +156,12 @@ struct MagicState {
     /// `handle_recv` matches incoming STUN responses by tx_id and
     /// fulfills the channel.
     stun_outstanding: HashMap<[u8; 12], StunInflight>,
+    /// Active Disco pings awaiting Pong, keyed by tx_id. Populated by
+    /// `MagicSocketCtl::ping_now`; consumed in the Pong arm of
+    /// `handle_disco`. Distinct from `PathState.outstanding_tx_id`
+    /// (background pump tracking) so a synchronous ping_now caller
+    /// gets the actual Pong instead of having to poll alive_endpoint.
+    ping_outstanding: HashMap<[u8; 12], PingInflight>,
     /// Our own endpoints to advertise in outgoing CallMeMaybe. Set by
     /// runtime after netcheck completes; consumed by the CMM trigger
     /// path in `ping_pump`. Empty until set.
@@ -316,6 +336,20 @@ impl MagicSocketCtl {
             .map(|(addr, _)| *addr)
     }
 
+    /// Last-measured RTT on this peer's best alive direct path. None
+    /// when no alive path exists. M14 LocalAPI's snapshot publishes
+    /// this as `PeerView.direct_path_rtt_ms`.
+    pub fn peer_rtt(&self, node_pub: &NodeKey) -> Option<Duration> {
+        let now = Instant::now();
+        let s = self.state.lock();
+        let peer = s.peers.get(node_pub)?;
+        peer.paths
+            .values()
+            .filter(|st| st.alive(now))
+            .filter_map(|st| st.rtt)
+            .min()
+    }
+
     /// Send a raw datagram to an arbitrary UDP address. wg-engine uses
     /// this to send WG packets along an alive direct path.
     pub fn send_to(&self, addr: SocketAddr, bytes: &[u8]) -> std::io::Result<usize> {
@@ -365,6 +399,83 @@ impl MagicSocketCtl {
     /// the receive thread polls the flag at most every `RECV_TIMEOUT`.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+    }
+
+    /// Synchronous Disco ping with caller-provided timeout. Returns
+    /// `(endpoint, RTT)` on Pong return, or `MagicError::PingTimeout`
+    /// if no Pong arrives in `timeout`. Used by M14 LocalAPI's
+    /// `/ping` endpoint — the background pump's own pings DON'T
+    /// route through this channel.
+    ///
+    /// Endpoint selection: prefer the peer's currently-alive direct
+    /// path; else the first registered candidate. Returns
+    /// `MagicError::UnknownPeer` if we have no record of the peer
+    /// (caller didn't call `upsert_peer` first).
+    pub fn ping_now(
+        &self,
+        node_pub: &NodeKey,
+        timeout: Duration,
+    ) -> PingResult {
+        // Pick target endpoint + peer's disco_pub under the lock.
+        let (target, peer_disco) = {
+            let s = self.state.lock();
+            let peer = s
+                .peers
+                .get(node_pub)
+                .ok_or(MagicError::UnknownPeer)?;
+            let alive = peer
+                .paths
+                .iter()
+                .find(|(_, st)| st.alive(Instant::now()))
+                .map(|(addr, _)| *addr);
+            let target = alive
+                .or_else(|| peer.endpoints.first().copied())
+                .ok_or(MagicError::NoEndpoints)?;
+            (target, peer.disco_pub)
+        };
+
+        // Build + send ping + register the inflight slot.
+        let mut tx_id = [0u8; 12];
+        OsRng.fill_bytes(&mut tx_id);
+        let (tx, rx) = bounded(1);
+        {
+            let mut s = self.state.lock();
+            s.ping_outstanding.insert(
+                tx_id,
+                PingInflight {
+                    sent_at: Instant::now(),
+                    target,
+                    result_tx: tx,
+                },
+            );
+        }
+        if let Err(e) = encode_and_send_ping(
+            &self.socket,
+            &self.our_disco_priv,
+            &self.our_node_pub,
+            &peer_disco,
+            target,
+            tx_id,
+        ) {
+            // Send failed; clean up the inflight slot so it doesn't leak.
+            self.state.lock().ping_outstanding.remove(&tx_id);
+            return Err(e);
+        }
+        debug!(
+            target = %target,
+            tx_id = %short_hex_tx(&tx_id),
+            "magicsock.ping_now.sent"
+        );
+        // Wait for the worker thread to fulfill the channel from
+        // handle_disco's Pong arm. On timeout, garbage-collect the
+        // inflight slot.
+        match rx.recv_timeout(timeout) {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                self.state.lock().ping_outstanding.remove(&tx_id);
+                Err(MagicError::PingTimeout)
+            }
+        }
     }
 
     /// Set our own advertise-able endpoints. Used as the body of any
@@ -642,7 +753,19 @@ fn handle_disco(
                 Some(p) => p,
                 None => return,
             };
+            let pong_tx_id = pong.tx_id;
             let now = Instant::now();
+            // First check if a synchronous `ping_now` is waiting on
+            // this tx_id; if so, fulfill it and continue (the same
+            // Pong still updates `PathState` below for the alive-path
+            // selector).
+            {
+                let mut s = state.lock();
+                if let Some(inflight) = s.ping_outstanding.remove(&pong_tx_id) {
+                    let rtt = now.duration_since(inflight.sent_at);
+                    let _ = inflight.result_tx.try_send(Ok((inflight.target, rtt)));
+                }
+            }
             let mut s = state.lock();
             let node_pub = match s.disco_to_node.get(&sender_pub).copied() {
                 Some(n) => n,
@@ -963,7 +1086,8 @@ fn build_call_me_maybe(
     Ok(buf)
 }
 
-/// Build + encrypt + send a Disco Ping. Returns the tx_id used.
+/// Build + encrypt + send a Disco Ping with a freshly-generated
+/// tx_id. Returns the tx_id used for caller-side correlation.
 fn send_ping(
     socket: &UdpSocket,
     our_disco_priv: &DiscoPrivateKey,
@@ -973,6 +1097,30 @@ fn send_ping(
 ) -> Result<[u8; 12], MagicError> {
     let mut tx_id = [0u8; 12];
     OsRng.fill_bytes(&mut tx_id);
+    encode_and_send_ping(
+        socket,
+        our_disco_priv,
+        our_node_pub,
+        peer_disco_pub,
+        addr,
+        tx_id,
+    )?;
+    Ok(tx_id)
+}
+
+/// Build + encrypt + send a Disco Ping with the caller-provided
+/// tx_id. Returns the tx_id (echoed) on success so call sites can
+/// chain without re-binding. Used by both `send_ping` (random tx_id)
+/// and `ping_now` (caller already registered the tx_id in the
+/// inflight map).
+fn encode_and_send_ping(
+    socket: &UdpSocket,
+    our_disco_priv: &DiscoPrivateKey,
+    our_node_pub: &NodePublicKey,
+    peer_disco_pub: &DiscoPublicKey,
+    addr: SocketAddr,
+    tx_id: [u8; 12],
+) -> Result<[u8; 12], MagicError> {
     let mut nonce = [0u8; Header::NONCE_LEN];
     OsRng.fill_bytes(&mut nonce);
 
@@ -989,7 +1137,7 @@ fn send_ping(
             },
         )?;
         pkt.encrypt_in_place(our_disco_priv, peer_disco_pub, nonce)?;
-    } // pkt borrow ends; buf is now the encrypted bytes
+    }
 
     socket.send_to(&buf, addr)?;
     debug!(%addr, "magicsock.disco.ping.sent");
@@ -1096,6 +1244,71 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// M14 ping_now: A calls `ping_now(B)`, B's worker auto-Pongs, A's
+    /// channel resolves with the RTT. Validates that
+    /// `ping_outstanding` lookup + Pong arm fire correctly without
+    /// going through `PathState.outstanding_tx_id`.
+    #[test]
+    fn ping_now_returns_rtt() {
+        let a_priv = DiscoPrivateKey::random();
+        let b_priv = DiscoPrivateKey::random();
+        let a_pub = a_priv.public_key();
+        let b_pub = b_priv.public_key();
+        let a_node_bytes = [0xEE; 32];
+        let b_node_bytes = [0xFF; 32];
+        let a_node = NodePublicKey::from(a_node_bytes);
+        let b_node = NodePublicKey::from(b_node_bytes);
+
+        let (a_non_tx, _a_non_rx) = unbounded::<NonDiscoPacket>();
+        let (b_non_tx, _b_non_rx) = unbounded::<NonDiscoPacket>();
+        let (_a_sock, a_ctl) = MagicSocket::bind(
+            loopback(0),
+            DiscoPrivateKey::from_bytes(*a_priv.as_bytes()),
+            a_node,
+            a_non_tx,
+        )
+        .unwrap();
+        let (_b_sock, b_ctl) = MagicSocket::bind(
+            loopback(0),
+            DiscoPrivateKey::from_bytes(*b_priv.as_bytes()),
+            b_node,
+            b_non_tx,
+        )
+        .unwrap();
+
+        // A must know B's endpoint to ping. B must know A's disco
+        // identity so its Pong addresses A correctly.
+        a_ctl.upsert_peer(b_node_bytes, b_pub, vec![b_ctl.local_addr()]);
+        b_ctl.upsert_peer(a_node_bytes, a_pub, vec![a_ctl.local_addr()]);
+
+        let result = a_ctl.ping_now(&b_node_bytes, Duration::from_secs(3));
+        match result {
+            Ok((endpoint, rtt)) => {
+                assert_eq!(endpoint, b_ctl.local_addr());
+                assert!(rtt < Duration::from_millis(500), "rtt too high: {rtt:?}");
+            }
+            Err(e) => panic!("ping_now failed: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn ping_now_returns_unknown_peer_for_unregistered_node() {
+        let priv_key = DiscoPrivateKey::random();
+        let node = NodePublicKey::from([0u8; 32]);
+        let (non_tx, _non_rx) = unbounded::<NonDiscoPacket>();
+        let (_sock, ctl) = MagicSocket::bind(
+            loopback(0),
+            DiscoPrivateKey::from_bytes(*priv_key.as_bytes()),
+            node,
+            non_tx,
+        )
+        .unwrap();
+        let err = ctl
+            .ping_now(&[0x99; 32], Duration::from_millis(100))
+            .unwrap_err();
+        assert!(matches!(err, MagicError::UnknownPeer), "got: {err:?}");
     }
 
     /// Build CMM bytes via the internal helper and decode them back via

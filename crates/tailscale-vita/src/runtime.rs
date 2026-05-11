@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use smoltcp::wire::Ipv4Cidr as SmolIpv4Cidr;
 use tracing::{debug, info, warn};
 
@@ -38,6 +38,9 @@ use crate::config::Config;
 use crate::dual_transport::DualTransport;
 use crate::error::RuntimeError;
 use crate::lifecycle::{FatalKind, LifecycleTracker, OnlineState};
+use crate::snapshot::{
+    node_key_hex, now_unix, AllowedIpView, PeerView, RuntimeSnapshot,
+};
 use crate::proto::{consume_early_payload, hex_short, read_server_response};
 
 pub struct Runtime {
@@ -71,6 +74,15 @@ pub struct Runtime {
     /// Wrapped in `Option` so `run_event_loop` can `take()` it (mirrors
     /// the `map` / `stack` pattern).
     signal_rx: Option<Receiver<ControlSignal>>,
+    /// M14 published runtime state. Event loop writes on every
+    /// `MapEvent::Snapshot` + lifecycle transition; LocalAPI handlers
+    /// (and any future cross-thread readers) clone the Arc and take a
+    /// read lock. Initial value is the `RuntimeSnapshot::empty(...)`
+    /// placeholder until the first event-loop publish replaces it.
+    snapshot: Arc<RwLock<RuntimeSnapshot>>,
+    /// M14 LocalAPI server handle. `None` if bind failed at startup
+    /// or LocalAPI was disabled in config. Dropped on shutdown.
+    _localapi: Option<crate::localapi::LocalApiServer>,
 }
 
 /// Out-of-band signals the management UI can send to the running
@@ -92,9 +104,14 @@ pub enum ControlSignal {
 /// Sender-side handle for `ControlSignal`. Returned from
 /// `Runtime::controller()`; cloneable and `Send`/`Sync` so the UI
 /// thread can hold it independently of the event-loop thread.
+///
+/// The `tx` field is `pub(crate)` so the M14 LocalAPI module (a
+/// sibling under `tailscale-vita/src/`) can construct one for its
+/// HandlerCtx in tests. External callers should obtain a handle via
+/// `Runtime::controller()` only.
 #[derive(Clone)]
 pub struct ControlHandle {
-    tx: Sender<ControlSignal>,
+    pub(crate) tx: Sender<ControlSignal>,
 }
 
 impl ControlHandle {
@@ -214,6 +231,27 @@ impl Runtime {
         info!("control.map.started");
 
         let (signal_tx, signal_rx) = unbounded();
+        let snapshot = Arc::new(RwLock::new(RuntimeSnapshot::empty(
+            config.hostname.clone(),
+            magic_local,
+        )));
+
+        // M14: spawn LocalAPI server if configured. Bind failure is
+        // non-fatal — the daemon keeps running without LocalAPI.
+        let localapi = match config.localapi_port {
+            Some(port) => crate::localapi::LocalApiServer::spawn(
+                port,
+                Arc::clone(&snapshot),
+                ControlHandle {
+                    tx: signal_tx.clone(),
+                },
+                magic_ctl.clone(),
+            ),
+            None => {
+                info!("localapi.disabled (config.localapi_port = None)");
+                None
+            }
+        };
 
         Ok(Self {
             config,
@@ -229,7 +267,16 @@ impl Runtime {
             lifecycle: Mutex::new(LifecycleTracker::new()),
             signal_tx,
             signal_rx: Some(signal_rx),
+            snapshot,
+            _localapi: localapi,
         })
+    }
+
+    /// Clone the published runtime snapshot handle. Readers should
+    /// `lock.read()` for short windows; the event loop writes to it
+    /// on each `MapEvent::Snapshot` (~once per 2-30 s in steady state).
+    pub fn snapshot(&self) -> Arc<RwLock<RuntimeSnapshot>> {
+        Arc::clone(&self.snapshot)
     }
 
     /// Cloneable handle for sending `ControlSignal` to this runtime.
@@ -290,6 +337,18 @@ impl Runtime {
         let signal_rx = self.signal_rx.take().ok_or_else(|| {
             RuntimeError::Internal("runtime signal_rx already taken".into())
         })?;
+        // Capture the start-time once so /health uptime is stable
+        // across reconnect-induced republishes.
+        let started_at_unix = now_unix();
+        // Latest STUN-discovered public endpoint. Set by `run_netcheck`
+        // before the first MapResponse advertises it. Republished into
+        // the snapshot on every `publish_snapshot` call so consumers
+        // see the same value the server sees.
+        let mut public_endpoint: Option<SocketAddr> = None;
+        // M14: timestamp of the most recent snapshot publish. Drives
+        // the 3-second-cadence refresh loop below so /status doesn't
+        // serve frozen direct-path state between netmap deltas.
+        let mut last_snapshot_publish_at = Instant::now();
 
         let mut snapshots = 0u32;
         let mut keepalives = 0u32;
@@ -385,7 +444,10 @@ impl Runtime {
                     Ok(m) => {
                         info!(attempt = reconnect_attempt + 1, "control.reconnect.ok");
                         map_opt = Some(m);
-                        reconnect_attempt = 0;
+                        // reconnect_attempt is reset below in either
+                        // the next_event Ok arm (line ~325) or the
+                        // transient-error arm — either way, no need
+                        // to clear it here.
                         // Fresh session needs a fresh NetInfo write so
                         // the server re-commits DiscoKey state.
                         sent_netinfo_once = false;
@@ -402,6 +464,10 @@ impl Runtime {
                                 self.lifecycle
                                     .lock()
                                     .mark_fatal(FatalKind::Auth, e.to_string());
+                                publish_fatal_state(
+                                    &self.snapshot,
+                                    &self.lifecycle,
+                                );
                                 return Err(RuntimeError::Control(e));
                             }
                             ErrorClass::SecurityFatal => {
@@ -409,6 +475,10 @@ impl Runtime {
                                 self.lifecycle
                                     .lock()
                                     .mark_fatal(FatalKind::Security, e.to_string());
+                                publish_fatal_state(
+                                    &self.snapshot,
+                                    &self.lifecycle,
+                                );
                                 return Err(RuntimeError::Control(e));
                             }
                             ErrorClass::Transient => {
@@ -436,6 +506,10 @@ impl Runtime {
                             self.lifecycle
                                 .lock()
                                 .mark_fatal(FatalKind::Auth, e.to_string());
+                            publish_fatal_state(
+                                &self.snapshot,
+                                &self.lifecycle,
+                            );
                             return Err(RuntimeError::Control(e));
                         }
                         ErrorClass::SecurityFatal => {
@@ -443,6 +517,10 @@ impl Runtime {
                             self.lifecycle
                                 .lock()
                                 .mark_fatal(FatalKind::Security, e.to_string());
+                            publish_fatal_state(
+                                &self.snapshot,
+                                &self.lifecycle,
+                            );
                             return Err(RuntimeError::Control(e));
                         }
                         ErrorClass::Transient => {
@@ -528,7 +606,10 @@ impl Runtime {
                         // Cloudflare / Twilio). Tailscale's own DERPs
                         // sometimes refuse STUN from clients without
                         // recent activity history.
-                        let public_endpoint = report.public_endpoint.or_else(|| {
+                        // Update the outer-scope `public_endpoint` so
+                        // every snapshot republish carries the latest
+                        // STUN-discovered address.
+                        public_endpoint = report.public_endpoint.or_else(|| {
                             ts_magicsock::netcheck::discover_public_endpoint(
                                 &self.magic_ctl,
                                 ts_magicsock::netcheck::DEFAULT_PROBE_TIMEOUT,
@@ -581,6 +662,26 @@ impl Runtime {
                         &snap,
                         self.derp_ctl.home_region(),
                     );
+                    // M14: republish the LocalAPI-readable snapshot.
+                    // `map` is still in scope as `&mut MapClient` from
+                    // the next_event() result; netmap() is &self.
+                    let (lifecycle, fatal_reason) = {
+                        let lt = self.lifecycle.lock();
+                        (lt.state(), lt.fatal_reason().map(str::to_owned))
+                    };
+                    publish_snapshot(
+                        &self.snapshot,
+                        started_at_unix,
+                        &self.config.hostname,
+                        map.netmap(),
+                        &self.magic_ctl,
+                        self.derp_ctl.home_region(),
+                        self.derp_ctl.alive_regions(),
+                        public_endpoint,
+                        lifecycle,
+                        fatal_reason,
+                    );
+                    last_snapshot_publish_at = Instant::now();
                 }
                 MapEvent::KeepAlive { seq } => {
                     keepalives += 1;
@@ -588,6 +689,33 @@ impl Runtime {
                     info!(seq, count = keepalives, "control.map.keepalive");
                 }
                 MapEvent::Idle => {}
+            }
+
+            // M14: republish the snapshot periodically so direct-path
+            // state (alive/RTT, which changes when magicsock's pump
+            // gets a Pong) freshens between MapEvent::Snapshot frames.
+            // Pure netmap snapshots only fire when peers add/leave;
+            // in steady state we'd otherwise serve a frozen snapshot.
+            // 3 s cadence: cheap (~1 ms snapshot build for ~30 peers)
+            // and matches the expected human-cadence of /status polls.
+            if last_snapshot_publish_at.elapsed() >= Duration::from_secs(3) {
+                let (lifecycle, fatal_reason) = {
+                    let lt = self.lifecycle.lock();
+                    (lt.state(), lt.fatal_reason().map(str::to_owned))
+                };
+                publish_snapshot(
+                    &self.snapshot,
+                    started_at_unix,
+                    &self.config.hostname,
+                    map.netmap(),
+                    &self.magic_ctl,
+                    self.derp_ctl.home_region(),
+                    self.derp_ctl.alive_regions(),
+                    public_endpoint,
+                    lifecycle,
+                    fatal_reason,
+                );
+                last_snapshot_publish_at = Instant::now();
             }
 
             // Drain CallMeMaybe send queue (Stage 4). For each
@@ -1103,6 +1231,116 @@ fn update_peer_regions(
         };
         regions.insert(r.snapshot.node_key, region);
     }
+}
+
+/// Build a fresh `RuntimeSnapshot` from the live netmap + magicsock
+/// + DERP + lifecycle state, and publish it into the shared slot.
+///
+/// Called from the event loop after each `MapEvent::Snapshot` (when
+/// the netmap changes) and at lifecycle transitions. The write is
+/// fast — readers (LocalAPI handlers) take a read lock briefly to
+/// clone, so contention is negligible.
+///
+/// Arguments are kept un-bundled rather than passed via `&self` so
+/// the helper is callable from within the event loop without
+/// borrowing all of `self` at once.
+fn publish_snapshot(
+    out: &Arc<RwLock<RuntimeSnapshot>>,
+    started_at_unix: u64,
+    hostname: &str,
+    netmap: &ts_control::NetMap,
+    magic_ctl: &MagicSocketCtl,
+    derp_home_region: u16,
+    alive_derp_regions: Vec<u16>,
+    public_endpoint: Option<SocketAddr>,
+    lifecycle: OnlineState,
+    fatal_reason: Option<String>,
+) {
+    let mut peers = HashMap::with_capacity(netmap.peers.len());
+    for (node_key, peer) in netmap.peers.iter() {
+        let direct_endpoint = magic_ctl.alive_endpoint(node_key);
+        let direct_rtt = magic_ctl
+            .peer_rtt(node_key)
+            .map(|d| d.as_millis() as u64);
+        // Primary tailnet IP: pick the first /32 entry (typical case
+        // for a node-IP-only peer). Peers with CIDR routes still get
+        // those listed under `allowed_ips`, just no `tailscale_ip`.
+        let tailscale_ip = peer
+            .allowed_ips
+            .iter()
+            .find(|a| a.prefix == 32)
+            .map(|a| a.addr);
+        let allowed_ips: Vec<String> = peer
+            .allowed_ips
+            .iter()
+            .map(|a| format!("{}/{}", a.addr, a.prefix))
+            .collect();
+        let endpoints: Vec<String> =
+            peer.endpoints.iter().map(|sa| sa.to_string()).collect();
+        let hex = node_key_hex(node_key);
+        peers.insert(
+            hex.clone(),
+            PeerView {
+                node_key_hex: hex,
+                node_id: peer.node_id,
+                name: peer.name.clone(),
+                online: peer.online,
+                tailscale_ip,
+                allowed_ips,
+                home_derp: peer.home_derp,
+                endpoints,
+                direct_path_alive: direct_endpoint.is_some(),
+                direct_path_endpoint: direct_endpoint,
+                direct_path_rtt_ms: direct_rtt,
+            },
+        );
+    }
+
+    let our_addrs: Vec<AllowedIpView> = netmap
+        .our_addrs
+        .iter()
+        .map(|a| AllowedIpView {
+            addr: a.addr,
+            prefix: a.prefix,
+        })
+        .collect();
+
+    let new_snap = RuntimeSnapshot {
+        updated_at_unix: now_unix(),
+        started_at_unix,
+        hostname: hostname.to_string(),
+        our_addrs,
+        lifecycle,
+        fatal_reason,
+        peer_count: netmap.peers.len(),
+        derp_home_region,
+        alive_derp_regions,
+        magic_local: magic_ctl.local_addr(),
+        public_endpoint,
+        peers,
+    };
+    *out.write() = new_snap;
+}
+
+/// Patch the published snapshot's lifecycle + fatal_reason without
+/// rebuilding peers/netmap. Used when an event-loop error transitions
+/// us into a terminal state — UI consumers see the new state on the
+/// next read even though we have no fresh netmap to publish.
+///
+/// Optimized for the path where the snapshot is mostly populated;
+/// holds the write lock for a few microseconds.
+fn publish_fatal_state(
+    out: &Arc<RwLock<RuntimeSnapshot>>,
+    lifecycle: &Mutex<LifecycleTracker>,
+) {
+    let lt = lifecycle.lock();
+    let state = lt.state();
+    let reason = lt.fatal_reason().map(str::to_owned);
+    drop(lt);
+    let mut w = out.write();
+    w.lifecycle = state;
+    w.fatal_reason = reason;
+    w.updated_at_unix = now_unix();
 }
 
 /// Plumb each peer's Disco identity + endpoint candidates into the

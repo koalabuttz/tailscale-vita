@@ -1,0 +1,192 @@
+//! `RuntimeSnapshot` — JSON-friendly cross-thread view of the running
+//! tailnet client. Published by the event loop on every `MapEvent`
+//! (and after lifecycle / peer-region changes); read by M14 LocalAPI
+//! handlers running on a dedicated thread.
+//!
+//! Why a snapshot vs. direct state access: the live `NetMap` lives
+//! inside `MapClient` which is consumed by `run_event_loop`. The
+//! LocalAPI server thread can't reach it without coupling. An
+//! `Arc<RwLock<RuntimeSnapshot>>` lets the event loop publish a fresh
+//! copy at a single point per cycle, and any number of readers (HTTP
+//! handlers, debug tooling) snapshot cheaply with bounded lock time.
+//!
+//! Field shapes match the LocalAPI JSON we serve out — keep these
+//! types and their `serde` impls in lockstep with consumer
+//! expectations (the future LiveArea UI parses them directly).
+
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+
+use crate::lifecycle::OnlineState;
+
+/// Top-level published runtime state. Cheap to clone; small enough to
+/// hand out by value when needed.
+#[derive(Clone, Debug, Serialize)]
+pub struct RuntimeSnapshot {
+    /// Unix time the snapshot was last refreshed by the event loop.
+    pub updated_at_unix: u64,
+    /// Unix time the runtime started. Used by `/localapi/v0/health`
+    /// to compute uptime without an extra clock plumbing path.
+    pub started_at_unix: u64,
+    /// Hostname this runtime registered as. Surfaced for UI display.
+    pub hostname: String,
+    /// Our tailnet addresses (typically a single /32 like
+    /// `100.127.67.49/32`).
+    pub our_addrs: Vec<AllowedIpView>,
+    /// Current lifecycle state (Connecting / Online / Degraded /
+    /// Offline / AuthFailed / SecurityFailed).
+    pub lifecycle: OnlineState,
+    /// Human-readable explanation when `lifecycle` is fatal.
+    pub fatal_reason: Option<String>,
+    /// Peer count for quick sanity-check reads.
+    pub peer_count: usize,
+    /// Our chosen DERP home region (legacy field, see netmap.rs).
+    pub derp_home_region: u16,
+    /// DERP regions currently connected. Empty during cold start.
+    pub alive_derp_regions: Vec<u16>,
+    /// Our magicsock UDP bind (typically `0.0.0.0:41641`).
+    pub magic_local: SocketAddr,
+    /// Our public-mapped UDP endpoint discovered via STUN (Stage-3
+    /// netcheck). `None` until netcheck completes.
+    pub public_endpoint: Option<SocketAddr>,
+    /// Per-peer view, keyed by node-key hex.
+    pub peers: HashMap<String, PeerView>,
+}
+
+/// Per-peer info LocalAPI consumers see. Constructed by merging
+/// `PeerSnapshot` (from netmap) with magicsock's direct-path state.
+#[derive(Clone, Debug, Serialize)]
+pub struct PeerView {
+    /// Full 64-char hex node-key (sans `nodekey:` prefix).
+    pub node_key_hex: String,
+    /// Stable server-assigned numeric ID (helpful for cross-referencing
+    /// with `tailscale debug netmap` output on other devices).
+    pub node_id: i64,
+    /// Peer hostname.
+    pub name: String,
+    /// Peer's last-known online state per control plane.
+    pub online: bool,
+    /// The peer's primary tailnet IP, when it has one /32 entry. None
+    /// for peers whose only `allowed_ips` are CIDR routes (rare).
+    pub tailscale_ip: Option<Ipv4Addr>,
+    /// Verbose dotted-quad/CIDR form of every advertised allowed_ip.
+    pub allowed_ips: Vec<String>,
+    /// Peer's home DERP region ID. 0 means unassigned (legacy DERP
+    /// field on the peer carries the actual home).
+    pub home_derp: u16,
+    /// Direct-path UDP endpoint candidates the peer advertised in
+    /// MapRequest.Endpoints. Empty for pre-M12 peers.
+    pub endpoints: Vec<String>,
+    /// Whether we currently have an alive Disco path to this peer.
+    pub direct_path_alive: bool,
+    /// Which of the peer's endpoints answered our last Disco ping (if
+    /// any). Useful for diagnosing "they advertised 5 endpoints; which
+    /// one actually worked?".
+    pub direct_path_endpoint: Option<SocketAddr>,
+    /// Last-measured RTT on the alive path, milliseconds. None when
+    /// no alive path exists.
+    pub direct_path_rtt_ms: Option<u64>,
+}
+
+/// Wire-friendly form of `ts_control::AllowedIp`. Kept as `addr` +
+/// `prefix` rather than collapsed to a string so JSON consumers can
+/// route on either independently.
+#[derive(Clone, Debug, Serialize)]
+pub struct AllowedIpView {
+    pub addr: Ipv4Addr,
+    pub prefix: u8,
+}
+
+impl RuntimeSnapshot {
+    /// Pre-`up()` placeholder. Useful so `Runtime::snapshot()` can
+    /// hand out a non-None value during the brief window between
+    /// `Runtime::up` setup and the first event-loop publish.
+    pub fn empty(hostname: String, magic_local: SocketAddr) -> Self {
+        Self {
+            updated_at_unix: now_unix(),
+            started_at_unix: now_unix(),
+            hostname,
+            our_addrs: Vec::new(),
+            lifecycle: OnlineState::Connecting,
+            fatal_reason: None,
+            peer_count: 0,
+            derp_home_region: 0,
+            alive_derp_regions: Vec::new(),
+            magic_local,
+            public_endpoint: None,
+            peers: HashMap::new(),
+        }
+    }
+}
+
+/// Format a 32-byte node-key as 64 lowercase hex chars. Used for both
+/// snapshot map keys and `PeerView.node_key_hex`.
+pub fn node_key_hex(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
+}
+
+/// Wall-clock unix seconds. Returns 0 if the system clock is before
+/// the epoch (impossible in practice; defensive).
+pub fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_serializes_to_json() {
+        let snap = RuntimeSnapshot::empty(
+            "vita".into(),
+            "0.0.0.0:41641".parse().unwrap(),
+        );
+        let json = serde_json::to_string(&snap).expect("snapshot serialize");
+        // Spot-check a couple of fields are present.
+        assert!(json.contains("\"hostname\":\"vita\""));
+        assert!(json.contains("\"lifecycle\":\"Connecting\""));
+        assert!(json.contains("\"peer_count\":0"));
+    }
+
+    #[test]
+    fn node_key_hex_is_64_lowercase_chars() {
+        let bytes = [0xAB; 32];
+        let s = node_key_hex(&bytes);
+        assert_eq!(s.len(), 64);
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(s.starts_with("abababab"));
+    }
+
+    #[test]
+    fn peer_view_serializes_with_expected_fields() {
+        let peer = PeerView {
+            node_key_hex: "ab".repeat(32),
+            node_id: 42,
+            name: "phone".into(),
+            online: true,
+            tailscale_ip: Some(Ipv4Addr::new(100, 64, 0, 5)),
+            allowed_ips: vec!["100.64.0.5/32".into()],
+            home_derp: 12,
+            endpoints: vec!["166.198.24.1:29944".into()],
+            direct_path_alive: true,
+            direct_path_endpoint: Some("166.198.24.1:29944".parse().unwrap()),
+            direct_path_rtt_ms: Some(68),
+        };
+        let json = serde_json::to_string(&peer).unwrap();
+        assert!(json.contains("\"name\":\"phone\""));
+        assert!(json.contains("\"direct_path_alive\":true"));
+        assert!(json.contains("\"direct_path_rtt_ms\":68"));
+        assert!(json.contains("\"tailscale_ip\":\"100.64.0.5\""));
+    }
+}

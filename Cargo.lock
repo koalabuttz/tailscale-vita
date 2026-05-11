@@ -1629,10 +1629,12 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "http",
+ "httparse",
  "netstack",
  "parking_lot",
  "rand_core",
  "serde",
+ "serde_json",
  "smoltcp",
  "thiserror 1.0.69",
  "toml",

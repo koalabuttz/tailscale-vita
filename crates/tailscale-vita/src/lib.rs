@@ -22,11 +22,15 @@ mod config;
 pub mod dual_transport;
 mod error;
 pub mod lifecycle;
+pub mod localapi;
 mod proto;
 pub mod runtime;
+pub mod snapshot;
 
 pub use config::Config;
 pub use dual_transport::DualTransport;
 pub use error::{ConfigError, RuntimeError};
 pub use lifecycle::{FatalKind, LifecycleTracker, OnlineState};
+pub use localapi::LocalApiServer;
 pub use runtime::{ControlHandle, ControlSignal, RunStats, Runtime};
+pub use snapshot::{AllowedIpView, PeerView, RuntimeSnapshot};

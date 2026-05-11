@@ -66,6 +66,15 @@ pub struct Config {
     /// itself.
     #[serde(default)]
     pub suprx_host_only: bool,
+
+    /// M14 LocalAPI port (loopback). `Some(41112)` is the default and
+    /// matches upstream Go's `tailscale-localapi`. Set to `None` (or
+    /// omit and use `localapi_port = 0` in TOML — currently no way to
+    /// express None in TOML serde) to disable LocalAPI entirely.
+    /// In practice, leave at default unless 41112 conflicts with
+    /// another homebrew on the device.
+    #[serde(default = "default_localapi_port")]
+    pub localapi_port: Option<u16>,
 }
 
 impl Config {
@@ -170,6 +179,9 @@ fn default_listener_pool() -> usize {
 fn default_capver() -> u32 {
     ts_control::CAPVER as u32
 }
+fn default_localapi_port() -> Option<u16> {
+    Some(crate::localapi::DEFAULT_PORT)
+}
 
 #[cfg(test)]
 mod tests {
@@ -203,6 +215,7 @@ mod tests {
             run_window_secs: None,
             capver: 138,
             suprx_host_only: false,
+            localapi_port: Some(crate::localapi::DEFAULT_PORT),
         };
         assert_eq!(cfg.host_authority(), "192.168.8.147:8080");
     }
@@ -221,6 +234,7 @@ mod tests {
             run_window_secs: None,
             capver: 138,
             suprx_host_only: false,
+            localapi_port: Some(crate::localapi::DEFAULT_PORT),
         };
         assert_eq!(cfg.host_authority(), "controlplane.tailscale.com");
     }
