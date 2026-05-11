@@ -115,6 +115,26 @@ impl DerpTransportCtl {
         self.derp_map_set.store(true, Ordering::Release);
     }
 
+    /// Send an opaque datagram to `peer_pubkey` via DERP `region`.
+    ///
+    /// Mirrors `DerpTransport::send` but exposed on the controller so
+    /// non-engine code paths (Stage 4 CallMeMaybe dispatch in
+    /// `Runtime::run_event_loop`) can route Disco frames over DERP
+    /// without going through the wg-engine pump. Dropped (with TRACE
+    /// log) if no DerpMap has been set yet.
+    pub fn send(
+        &self,
+        region: u16,
+        peer_pubkey: NodeKeyBytes,
+        datagram: &[u8],
+    ) -> Result<(), DerpError> {
+        if !self.derp_map_set.load(Ordering::Acquire) {
+            trace!(region, "derp.tx.dropped reason=no_derp_map");
+            return Ok(());
+        }
+        self.mux.send(region, peer_pubkey, datagram)
+    }
+
     /// Probe regions in parallel, pick the lowest RTT, and mark it as
     /// home (sends `NotePreferred(true)` to that region).
     pub fn pick_and_set_home(&self, map: &DerpMap) -> Result<u16, DerpError> {

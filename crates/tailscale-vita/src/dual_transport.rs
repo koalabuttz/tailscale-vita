@@ -11,11 +11,18 @@
 //! gives direct-path bytes priority once they're available, but
 //! doesn't starve DERP — the magic queue empties to `None` quickly,
 //! and the Derp recv consumes the full timeout when it does.
+//!
+//! Stage 4 — Disco-over-DERP: when DERP delivers a frame whose first
+//! 6 bytes are the Disco magic (`TS💬`), the bytes are a CallMeMaybe
+//! relayed by another peer (UDP doesn't work yet, that's the whole
+//! point). We route it into `MagicSocketCtl::handle_disco_from_derp`
+//! and return `None` so wg-engine doesn't try to decap it as a
+//! WireGuard packet. The engine's pump iterates again immediately.
 
 use std::time::Duration;
 
 use crossbeam_channel::Receiver;
-use tracing::trace;
+use tracing::{debug, trace};
 use ts_derp::DerpTransport;
 use ts_magicsock::{MagicSocketCtl, NonDiscoPacket};
 use wg_engine::{Transport, TransportAddr, WgError};
@@ -64,6 +71,27 @@ impl Transport for DualTransport {
         // Otherwise block on Derp for the full timeout. Magic packets
         // that arrive during the wait stay queued (the magic_rx
         // channel is unbounded) and get picked up next tick.
-        self.derp.recv_with_timeout(timeout)
+        match self.derp.recv_with_timeout(timeout)? {
+            Some((addr, bytes)) => {
+                // Stage 4: if a DERP-relayed frame is actually a Disco
+                // message (CallMeMaybe), hand it to magicsock and
+                // swallow it from wg-engine's view.
+                if ts_disco::is_disco_message(&bytes) {
+                    if let TransportAddr::Derp { region, peer_pubkey } = addr {
+                        debug!(
+                            region,
+                            peer = ?&peer_pubkey[..4],
+                            n = bytes.len(),
+                            "dual.rx.derp.disco"
+                        );
+                    }
+                    self.magic.handle_disco_from_derp(&bytes);
+                    Ok(None)
+                } else {
+                    Ok(Some((addr, bytes)))
+                }
+            }
+            None => Ok(None),
+        }
     }
 }

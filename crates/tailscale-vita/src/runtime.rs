@@ -13,6 +13,7 @@
 //!   the tunnel dies.
 //! - `runtime.shutdown()` — drops in the right order.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -272,6 +273,11 @@ impl Runtime {
         let mut control_errors = 0u32;
         let mut derp_map_set = false;
         let mut local_addrs_set = false;
+        // Track each peer's DERP region. Used to dispatch CallMeMaybe
+        // sends queued by magicsock — magicsock owns the encryption
+        // half; the runtime owns DERP transport, so we need to know
+        // which region to relay through.
+        let mut peer_regions: HashMap<[u8; 32], u16> = HashMap::new();
         // Fire the NetInfo "lite" MapRequest exactly once after the
         // first snapshot establishes the DERP map. Without this call,
         // real Tailscale's coord server never commits our DiscoKey /
@@ -371,6 +377,19 @@ impl Runtime {
                             .into_iter()
                             .map(|sa| sa.to_string())
                             .collect();
+                        // Tell magicsock which endpoints to advertise
+                        // in any CallMeMaybe we send: our LAN binding
+                        // plus the STUN-reflected public address.
+                        // These are what peers will dial back to. If
+                        // STUN failed, we still advertise the LAN.
+                        let mut local_eps: Vec<SocketAddr> =
+                            vec![self.magic_ctl.local_addr()];
+                        if let Some(pe) = public_endpoint {
+                            if !local_eps.contains(&pe) {
+                                local_eps.push(pe);
+                            }
+                        }
+                        self.magic_ctl.set_local_endpoints(local_eps);
                         match map.send_netinfo_update(preferred_derp, latencies, extra) {
                             Ok(()) => info!(
                                 preferred_derp,
@@ -396,6 +415,11 @@ impl Runtime {
 
                     push_delta_to_engine(&self.engine, &snap, self.derp_ctl.home_region());
                     push_delta_to_magicsock(&self.magic_ctl, &snap);
+                    update_peer_regions(
+                        &mut peer_regions,
+                        &snap,
+                        self.derp_ctl.home_region(),
+                    );
                 }
                 MapEvent::KeepAlive { seq } => {
                     keepalives += 1;
@@ -403,6 +427,37 @@ impl Runtime {
                     info!(seq, count = keepalives, "control.map.keepalive");
                 }
                 MapEvent::Idle => {}
+            }
+
+            // Drain CallMeMaybe send queue (Stage 4). For each
+            // (peer_node, encrypted_bytes), look up the peer's home
+            // region and relay via DERP. The peer's magicsock receives
+            // the frame (via its own DualTransport disco peek), decodes
+            // the CMM, and pings each advertised endpoint to open NAT.
+            for (peer_node, bytes) in self.magic_ctl.take_pending_cmm() {
+                let region = match peer_regions.get(&peer_node).copied() {
+                    Some(r) if r != 0 => r,
+                    _ => {
+                        // No region known yet (peer not in netmap, or
+                        // HomeDERP=0). Skip; will retry next pump
+                        // after MapResponse populates the region.
+                        continue;
+                    }
+                };
+                match self.derp_ctl.send(region, peer_node, &bytes) {
+                    Ok(()) => info!(
+                        peer = ?&peer_node[..4],
+                        region,
+                        n = bytes.len(),
+                        "magicsock.callme.send"
+                    ),
+                    Err(e) => warn!(
+                        peer = ?&peer_node[..4],
+                        region,
+                        error = %e,
+                        "magicsock.callme.send.failed"
+                    ),
+                }
             }
 
             // Proxy DERP rx signal until a real per-rx hook lands.
@@ -619,6 +674,35 @@ fn push_delta_to_engine(
             initial_endpoint,
         });
         info!(node_id = r.snapshot.node_id, "control.map.peer.rekeyed");
+    }
+}
+
+/// Maintain a `node_pub → DERP region` map from each MapResponse
+/// snapshot. Used by the Stage-4 CallMeMaybe dispatcher to know which
+/// region to relay through for a given peer. Mirrors the region
+/// resolution in `push_delta_to_engine`: peer's HomeDERP if non-zero,
+/// else our own home region as a fallback.
+fn update_peer_regions(
+    regions: &mut HashMap<[u8; 32], u16>,
+    snap: &ts_control::NetMapSnapshot,
+    our_home: u16,
+) {
+    let delta = &snap.delta;
+    for p in &delta.upserted {
+        let region = if p.home_derp != 0 { p.home_derp } else { our_home };
+        regions.insert(p.node_key, region);
+    }
+    for k in &delta.removed {
+        regions.remove(k);
+    }
+    for r in &delta.rekeyed {
+        regions.remove(&r.old_key);
+        let region = if r.snapshot.home_derp != 0 {
+            r.snapshot.home_derp
+        } else {
+            our_home
+        };
+        regions.insert(r.snapshot.node_key, region);
     }
 }
 

@@ -68,9 +68,32 @@ impl Endpoint {
             IpAddr::V4(sa) => sa.to_ipv6_mapped(),
             IpAddr::V6(sa) => sa,
         };
+        Self::from_v6_segments(ip.segments(), sa.port())
+    }
+
+    /// Build an Endpoint by writing each segment in big-endian wire
+    /// order. The previous impl used `zerocopy::transmute!` to bulk-
+    /// reinterpret `[u16; 8]` as `[U16<NetworkEndian>; 8]`, which is a
+    /// pure bytewise reinterpret — on little-endian hosts (the only
+    /// ones we ship to: Vita ARMv7 + x86_64 Linux) it produces a
+    /// byte-swapped IPv6, e.g. `127.0.0.1` round-trips as `0.127.1.0`.
+    /// Tests in this crate masked the bug by encoding + decoding
+    /// through the same broken path. Stage-4 CallMeMaybe surfaced it
+    /// because the *receiver* compares decoded endpoints to a real
+    /// dotted-quad it just bound to.
+    const fn from_v6_segments(s: [u16; 8], port: u16) -> Self {
         Self {
-            addr: zerocopy::transmute!(ip.segments()),
-            port: zerocopy::U16::new(sa.port()),
+            addr: [
+                zerocopy::U16::new(s[0]),
+                zerocopy::U16::new(s[1]),
+                zerocopy::U16::new(s[2]),
+                zerocopy::U16::new(s[3]),
+                zerocopy::U16::new(s[4]),
+                zerocopy::U16::new(s[5]),
+                zerocopy::U16::new(s[6]),
+                zerocopy::U16::new(s[7]),
+            ],
+            port: zerocopy::U16::new(port),
         }
     }
 }
@@ -101,10 +124,7 @@ impl From<Endpoint> for SocketAddr {
 
 impl From<SocketAddrV6> for Endpoint {
     fn from(value: SocketAddrV6) -> Self {
-        Self {
-            addr: zerocopy::transmute!(value.ip().segments()),
-            port: value.port().into(),
-        }
+        Self::from_v6_segments(value.ip().segments(), value.port())
     }
 }
 

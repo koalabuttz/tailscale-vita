@@ -149,4 +149,23 @@ mod test {
         buf[0] = b'X';
         assert!(!is_disco_message(&buf));
     }
+
+    /// Regression: encoding an IPv4 address as an Endpoint must round-
+    /// trip back to the same dotted-quad. The original `transmute!`-
+    /// based encoder produced byte-swapped output (`127.0.0.1` round-
+    /// tripped as `0.127.1.0`); existing tests masked the bug because
+    /// they only compared encoder output to itself.
+    #[test]
+    fn endpoint_ipv4_wire_order_round_trip() {
+        use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let original: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 41641);
+        let ep = Endpoint::from_socket_addr(original);
+        assert_eq!(ep.socket_addr(), original);
+        assert_eq!(ep.port(), 41641);
+
+        let public: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 33)), 53492);
+        let ep2 = Endpoint::from_socket_addr(public);
+        assert_eq!(ep2.socket_addr(), public);
+    }
 }

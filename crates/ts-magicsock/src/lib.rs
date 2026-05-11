@@ -15,7 +15,7 @@
 //! `MagicSocketCtl::alive_endpoint(node_pub)` to learn whether there's
 //! a direct path right now — that decision lives in wg-engine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -28,7 +28,7 @@ use rand_core::{OsRng, RngCore};
 use tracing::{debug, info, trace, warn};
 
 use ts_disco::keys::{DiscoPrivateKey, DiscoPublicKey, NodePublicKey};
-use ts_disco::{Header, MessageType, Packet, Ping, Pong};
+use ts_disco::{CallMeMaybe, Endpoint, Header, MessageType, Packet, Ping, Pong};
 
 mod error;
 pub mod netcheck;
@@ -64,6 +64,19 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(500);
 /// Max receive buffer (Disco packets are small; WG handshake max ~256
 /// bytes; Tailscale's MTU is 1280; round up).
 const RECV_BUF: usize = 64 * 1024;
+/// How long to ping a peer without success before falling back to
+/// CallMeMaybe. Matches upstream Go's `endpointState.pingTimeout` —
+/// long enough for 2 ping retries on each candidate before assuming
+/// the NAT won't open spontaneously.
+const CMM_TRIGGER_AFTER: Duration = Duration::from_secs(10);
+/// Minimum interval between CallMeMaybe sends for the same peer.
+/// Matches Go's 5 s rate-limit — DERP relay traffic isn't free.
+const CMM_RATE_LIMIT: Duration = Duration::from_secs(5);
+/// Cap on how many CallMeMaybe endpoints we advertise. Real Tailscale
+/// caps at 16; we don't need more (Vita has 1 LAN IP + 1 STUN-reflected
+/// public IP — well under the limit, but defending against config
+/// drift is cheap).
+const CMM_MAX_ENDPOINTS: usize = 16;
 /// 32-byte WireGuard node public key — same NodeKeyBytes type used
 /// elsewhere in the workspace.
 pub type NodeKey = [u8; 32];
@@ -129,6 +142,16 @@ struct MagicState {
     /// `handle_recv` matches incoming STUN responses by tx_id and
     /// fulfills the channel.
     stun_outstanding: HashMap<[u8; 12], StunInflight>,
+    /// Our own endpoints to advertise in outgoing CallMeMaybe. Set by
+    /// runtime after netcheck completes; consumed by the CMM trigger
+    /// path in `ping_pump`. Empty until set.
+    local_endpoints: Vec<SocketAddr>,
+    /// Per-peer rate limit: latest CallMeMaybe-send timestamp. Prevents
+    /// our pump from flooding DERP with CMMs when a peer is unreachable.
+    last_cmm_sent_at: HashMap<NodeKey, Instant>,
+    /// CallMeMaybe send queue. Magicsock encrypts + enqueues; the
+    /// runtime polls via `take_pending_cmm` and dispatches over DERP.
+    cmm_pending: VecDeque<(NodeKey, Vec<u8>)>,
 }
 
 /// Public handle. Cloneable; runtime + wg-engine both hold copies.
@@ -138,6 +161,13 @@ pub struct MagicSocketCtl {
     state: Arc<Mutex<MagicState>>,
     shutdown: Arc<AtomicBool>,
     local_addr: SocketAddr,
+    /// Our Disco identity. Shared with the worker thread (which also
+    /// holds an Arc). Needed on the ctl side so `handle_disco_from_derp`
+    /// can decrypt CallMeMaybe frames the runtime relays from DERP.
+    our_disco_priv: Arc<DiscoPrivateKey>,
+    /// Our node public key — encoded into outbound Pings (and inbound
+    /// CMM-triggered Pings) so receivers can correlate disco→node.
+    our_node_pub: NodePublicKey,
 }
 
 /// Spawned worker side. Drop joins the receive thread.
@@ -166,19 +196,24 @@ impl MagicSocket {
         let socket = Arc::new(socket);
         let state = Arc::new(Mutex::new(MagicState::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        // Share the disco-priv via Arc so the ctl side can decrypt
+        // CallMeMaybe frames that arrive via DERP (Stage 4). The worker
+        // also holds an Arc; both sides read-only — no mutation.
+        let our_disco_priv = Arc::new(our_disco_priv);
 
         let ctl = MagicSocketCtl {
             socket: Arc::clone(&socket),
             state: Arc::clone(&state),
             shutdown: Arc::clone(&shutdown),
             local_addr,
+            our_disco_priv: Arc::clone(&our_disco_priv),
+            our_node_pub,
         };
 
         let worker_state = Arc::clone(&state);
         let worker_socket = Arc::clone(&socket);
         let worker_shutdown = Arc::clone(&shutdown);
-        // SECURITY: our_disco_priv is moved into the worker — the
-        // ctl side cannot decrypt incoming Disco frames.
+        let worker_priv = Arc::clone(&our_disco_priv);
         let worker = thread::Builder::new()
             .name("ts-magicsock".into())
             .stack_size(256 * 1024)
@@ -188,7 +223,7 @@ impl MagicSocket {
                     worker_socket,
                     worker_state,
                     worker_shutdown,
-                    our_disco_priv,
+                    worker_priv,
                     our_node_pub,
                     non_disco_tx,
                 );
@@ -331,6 +366,83 @@ impl MagicSocketCtl {
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
     }
+
+    /// Set our own advertise-able endpoints. Used as the body of any
+    /// CallMeMaybe we send (we're telling the peer: "ping me at these
+    /// addresses to open the NAT"). Typically: magicsock's local UDP
+    /// binding + STUN-reflected public-mapped endpoint.
+    ///
+    /// Callable at any time; the latest value wins. Pass an empty vec
+    /// to disable outbound CMM until endpoints are re-discovered.
+    pub fn set_local_endpoints(&self, endpoints: Vec<SocketAddr>) {
+        let count = endpoints.len();
+        let mut s = self.state.lock();
+        s.local_endpoints = endpoints;
+        info!(count, "magicsock.local_endpoints.set");
+    }
+
+    /// Drain queued CallMeMaybe sends. Each `(peer_node_key,
+    /// encrypted_bytes)` tuple is ready to dispatch over DERP to the
+    /// named peer (the caller looks up the peer's home region + uses
+    /// `DerpTransport`/`DerpTransportCtl::send`).
+    ///
+    /// Magicsock can't send DERP frames itself — it owns the magic UDP
+    /// socket, not the DERP conn pool. So it stages CMM bytes here and
+    /// the runtime drains the queue.
+    pub fn take_pending_cmm(&self) -> Vec<(NodeKey, Vec<u8>)> {
+        let mut s = self.state.lock();
+        s.cmm_pending.drain(..).collect()
+    }
+
+    /// Handle a Disco-formatted frame that arrived via DERP (not UDP).
+    ///
+    /// DualTransport sniffs `TS💬` magic on DERP-delivered bytes and
+    /// dispatches them here; the only Disco type expected on DERP is
+    /// CallMeMaybe. Ping/Pong over DERP would defeat the purpose
+    /// (DERP is the slow path we're trying to escape) — log + drop.
+    pub fn handle_disco_from_derp(&self, bytes: &[u8]) {
+        let mut owned = bytes.to_vec();
+        let encrypted = match Packet::<ts_disco::Encrypted>::from_encrypted_bytes_mut(&mut owned) {
+            Ok(p) => p,
+            Err(e) => {
+                trace!(?e, "magicsock.derp_disco.parse_failed");
+                return;
+            }
+        };
+        let sender_pub = encrypted.header().sender_pub();
+        let plaintext = match encrypted.decrypt_in_place(&self.our_disco_priv) {
+            Ok(p) => p,
+            Err(e) => {
+                trace!(?e, "magicsock.derp_disco.decrypt_failed");
+                return;
+            }
+        };
+        match plaintext.ty() {
+            Some(MessageType::CallMeMaybe) => {
+                let cmm = match plaintext.as_msg::<CallMeMaybe>() {
+                    Some(m) => m,
+                    None => {
+                        trace!("magicsock.derp_disco.callme.body_invalid");
+                        return;
+                    }
+                };
+                handle_call_me_maybe(
+                    &self.socket,
+                    &self.state,
+                    &self.our_disco_priv,
+                    &self.our_node_pub,
+                    sender_pub,
+                    cmm,
+                );
+            }
+            Some(other) => {
+                trace!(?other, "magicsock.derp_disco.unexpected_type");
+            }
+            None => {
+                trace!("magicsock.derp_disco.unknown_type_byte");
+            }
+        }
+    }
 }
 
 /// 8-hex-char short form of a 12-byte STUN tx_id, for log compactness.
@@ -358,7 +470,7 @@ fn worker_loop(
     socket: Arc<UdpSocket>,
     state: Arc<Mutex<MagicState>>,
     shutdown: Arc<AtomicBool>,
-    our_disco_priv: DiscoPrivateKey,
+    our_disco_priv: Arc<DiscoPrivateKey>,
     our_node_pub: NodePublicKey,
     non_disco_tx: Sender<NonDiscoPacket>,
 ) {
@@ -386,6 +498,7 @@ fn worker_loop(
                     &socket,
                     &state,
                     &our_disco_priv,
+                    &our_node_pub,
                     &non_disco_tx,
                 );
             }
@@ -410,6 +523,7 @@ fn handle_recv(
     socket: &UdpSocket,
     state: &Mutex<MagicState>,
     our_disco_priv: &DiscoPrivateKey,
+    our_node_pub: &NodePublicKey,
     non_disco_tx: &Sender<NonDiscoPacket>,
 ) {
     // Three-way demux: STUN response → netcheck; Disco → handler;
@@ -424,7 +538,7 @@ fn handle_recv(
         let _ = non_disco_tx.try_send((src, bytes.to_vec()));
         return;
     }
-    handle_disco(bytes, src, socket, state, our_disco_priv);
+    handle_disco(bytes, src, socket, state, our_disco_priv, our_node_pub);
 }
 
 /// Match a STUN binding-success response against the
@@ -479,6 +593,7 @@ fn handle_disco(
     socket: &UdpSocket,
     state: &Mutex<MagicState>,
     our_disco_priv: &DiscoPrivateKey,
+    our_node_pub: &NodePublicKey,
 ) {
     // Decryption is in-place; copy into a mutable owned buffer.
     let mut owned = bytes.to_vec();
@@ -570,11 +685,104 @@ fn handle_disco(
                 }
             }
         }
+        Some(MessageType::CallMeMaybe) => {
+            // CallMeMaybe should arrive via DERP, not UDP. If we got
+            // one over UDP, the path's already direct — pinging again
+            // is harmless but redundant. Accept it anyway for protocol
+            // robustness (upstream Go's design is "decode anywhere,
+            // act idempotently").
+            let cmm = match plaintext.as_msg::<CallMeMaybe>() {
+                Some(m) => m,
+                None => {
+                    trace!(%src, "magicsock.disco.callme.body_invalid");
+                    return;
+                }
+            };
+            handle_call_me_maybe(socket, state, our_disco_priv, our_node_pub, sender_pub, cmm);
+        }
         Some(other) => {
             trace!(?other, %src, "magicsock.disco.unhandled_type");
         }
         None => {
             trace!(%src, "magicsock.disco.unknown_type_byte");
+        }
+    }
+}
+
+/// Handle an incoming CallMeMaybe: the sender is telling us "I think
+/// you can reach me at these endpoints; please ping them to open the
+/// reverse NAT mapping." Action:
+///
+/// 1. For each advertised endpoint, ensure the peer's `PathState` has
+///    an entry for it (the ping pump will pick it up on the next cycle).
+/// 2. Send an immediate Ping to each endpoint so the outbound NAT
+///    mapping opens NOW — don't wait up to 5 s for the next pump.
+///
+/// `socket`/`our_disco_priv` are needed for the immediate-ping path.
+/// Looked up via `sender_pub` → `disco_to_node` reverse map; if the
+/// peer is unknown (CMM from a peer not yet in our netmap), drop —
+/// the next MapResponse will catch up.
+///
+/// Worker thread takes `&DiscoPrivateKey`; ctl side takes
+/// `&Arc<DiscoPrivateKey>` and `&*arc` to coerce.
+fn handle_call_me_maybe(
+    socket: &UdpSocket,
+    state: &Mutex<MagicState>,
+    our_disco_priv: &DiscoPrivateKey,
+    our_node_pub: &NodePublicKey,
+    sender_pub: DiscoPublicKey,
+    cmm: &CallMeMaybe,
+) {
+    // Snapshot the endpoint list out of the packed zerocopy view
+    // before we re-enter the lock — packed-field access via deref
+    // gets unwieldy with the lock guard alive.
+    let advertised: Vec<SocketAddr> = cmm.endpoints.iter().map(|e| e.socket_addr()).collect();
+    let now = Instant::now();
+    let (node_pub, peer_disco) = {
+        let mut s = state.lock();
+        let node_pub = match s.disco_to_node.get(&sender_pub).copied() {
+            Some(n) => n,
+            None => {
+                debug!(
+                    sender = %hex32_disco(&sender_pub),
+                    "magicsock.callme.recv.unknown_sender"
+                );
+                return;
+            }
+        };
+        let peer = match s.peers.get_mut(&node_pub) {
+            Some(p) => p,
+            None => return,
+        };
+        // Merge advertised endpoints into peer's candidate list. Fresh
+        // ones get a new PathState so the ping pump picks them up;
+        // already-known ones stay (don't disrupt their RTT history).
+        for ep in &advertised {
+            if !peer.endpoints.contains(ep) {
+                peer.endpoints.push(*ep);
+            }
+            peer.paths.entry(*ep).or_insert_with(PathState::new);
+        }
+        (node_pub, peer.disco_pub)
+    };
+    info!(
+        peer_pub = %hex32(&node_pub),
+        endpoint_count = advertised.len(),
+        "magicsock.callme.recv"
+    );
+    // Fire an immediate Ping to each advertised endpoint. Each Ping
+    // also opens our outbound NAT mapping for the sender's reply.
+    for ep in advertised {
+        match send_ping(socket, our_disco_priv, our_node_pub, &peer_disco, ep) {
+            Ok(tx_id) => {
+                let mut s = state.lock();
+                if let Some(peer) = s.peers.get_mut(&node_pub) {
+                    let path = peer.paths.entry(ep).or_insert_with(PathState::new);
+                    path.last_ping_at = Some(now);
+                    path.outstanding_tx_id = Some(tx_id);
+                }
+            }
+            Err(e) => trace!(?e, %ep, "magicsock.callme.recv.immediate_ping_failed"),
         }
     }
 }
@@ -635,6 +843,124 @@ fn ping_pump(
             path.outstanding_tx_id = Some(tx_id);
         }
     }
+
+    // CallMeMaybe trigger: for each peer where (we know endpoints) AND
+    // (we've been pinging at least CMM_TRIGGER_AFTER seconds with no
+    // alive Pong) AND (we haven't sent a CMM for this peer in
+    // CMM_RATE_LIMIT seconds), queue a Disco-encrypted CallMeMaybe.
+    // Runtime drains the queue and dispatches via DERP.
+    cmm_pump(state, our_disco_priv, now);
+}
+
+/// Build + queue CallMeMaybe sends for any peer that needs NAT-
+/// traversal help. Idempotent + rate-limited; safe to call every pump.
+fn cmm_pump(
+    state: &Mutex<MagicState>,
+    our_disco_priv: &DiscoPrivateKey,
+    now: Instant,
+) {
+    // Snapshot what to send + our local endpoints, all under one lock.
+    let (local_endpoints, to_cmm): (Vec<SocketAddr>, Vec<(NodeKey, DiscoPublicKey)>) = {
+        let s = state.lock();
+        if s.local_endpoints.is_empty() {
+            // Nothing to advertise — runtime hasn't called
+            // set_local_endpoints yet (no netcheck completed).
+            return;
+        }
+        let local = s.local_endpoints.clone();
+        let mut out = Vec::new();
+        for (node_pub, peer) in &s.peers {
+            if peer.endpoints.is_empty() {
+                continue;
+            }
+            // Any alive path? Then no CMM needed.
+            if peer.paths.values().any(|p| p.alive(now)) {
+                continue;
+            }
+            // Have we been pinging long enough? Earliest last_ping_at
+            // across this peer's paths.
+            let earliest = peer
+                .paths
+                .values()
+                .filter_map(|p| p.last_ping_at)
+                .min();
+            let stale_long_enough = earliest
+                .map(|t| now.duration_since(t) >= CMM_TRIGGER_AFTER)
+                .unwrap_or(false);
+            if !stale_long_enough {
+                continue;
+            }
+            // Per-peer rate limit.
+            let too_soon = s
+                .last_cmm_sent_at
+                .get(node_pub)
+                .map(|t| now.duration_since(*t) < CMM_RATE_LIMIT)
+                .unwrap_or(false);
+            if too_soon {
+                continue;
+            }
+            out.push((*node_pub, peer.disco_pub));
+        }
+        (local, out)
+    };
+
+    if to_cmm.is_empty() {
+        return;
+    }
+    // Truncate endpoints to the wire cap.
+    let ep_slice: &[SocketAddr] = if local_endpoints.len() > CMM_MAX_ENDPOINTS {
+        &local_endpoints[..CMM_MAX_ENDPOINTS]
+    } else {
+        &local_endpoints
+    };
+
+    for (node_pub, peer_disco) in to_cmm {
+        let bytes = match build_call_me_maybe(our_disco_priv, &peer_disco, ep_slice) {
+            Ok(b) => b,
+            Err(e) => {
+                trace!(?e, "magicsock.callme.build_failed");
+                continue;
+            }
+        };
+        let mut s = state.lock();
+        s.last_cmm_sent_at.insert(node_pub, now);
+        s.cmm_pending.push_back((node_pub, bytes));
+        info!(
+            peer_pub = %hex32(&node_pub),
+            endpoint_count = ep_slice.len(),
+            "magicsock.callme.queued"
+        );
+    }
+}
+
+/// Build + Disco-encrypt a CallMeMaybe destined for `peer_disco_pub`,
+/// advertising `endpoints` as places the peer can reach us. Returns
+/// ready-to-send bytes; the caller is responsible for delivery (always
+/// via DERP, since by definition UDP-direct doesn't work yet).
+fn build_call_me_maybe(
+    our_disco_priv: &DiscoPrivateKey,
+    peer_disco_pub: &DiscoPublicKey,
+    endpoints: &[SocketAddr],
+) -> Result<Vec<u8>, MagicError> {
+    let mut nonce = [0u8; Header::NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce);
+
+    let body_size = CallMeMaybe::size_for_endpoint_count(endpoints.len());
+    let pkt_size = Packet::<ts_disco::Plaintext>::size_for_message(body_size);
+    let mut buf = vec![0u8; pkt_size];
+
+    {
+        let pkt = Packet::<ts_disco::Plaintext>::init_from_bytes::<CallMeMaybe>(
+            &mut buf,
+            |cmm| {
+                for (i, ep) in endpoints.iter().enumerate() {
+                    cmm.endpoints[i] = Endpoint::from_socket_addr(*ep);
+                }
+            },
+        )?;
+        pkt.encrypt_in_place(our_disco_priv, peer_disco_pub, nonce)?;
+    }
+    Ok(buf)
 }
 
 /// Build + encrypt + send a Disco Ping. Returns the tx_id used.
@@ -770,5 +1096,61 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Build CMM bytes via the internal helper and decode them back via
+    /// the receiver's path. Validates that:
+    /// 1. The encrypted bytes start with Disco magic (so DualTransport's
+    ///    `is_disco_message` peek correctly identifies them on DERP).
+    /// 2. The receiver's `handle_disco_from_derp` decrypts the frame and
+    ///    queues an immediate Ping to the advertised endpoint — which we
+    ///    observe by bouncing the Ping into a bound UDP listener that
+    ///    pretends to be the peer at the advertised address.
+    #[test]
+    fn cmm_roundtrip_triggers_immediate_ping() {
+        let a_priv = DiscoPrivateKey::random();
+        let b_priv = DiscoPrivateKey::random();
+        let a_pub = a_priv.public_key();
+        let b_pub = b_priv.public_key();
+        let a_node_bytes = [0xCC; 32];
+        let b_node_bytes = [0xDD; 32];
+        let b_node = NodePublicKey::from(b_node_bytes);
+
+        // Bind a "spoofed" endpoint socket — when B reacts to the CMM
+        // it'll ping this address; we'll observe the Disco Ping arrival.
+        let fake_a_endpoint = UdpSocket::bind(loopback(0)).unwrap();
+        let fake_a_addr = fake_a_endpoint.local_addr().unwrap();
+        fake_a_endpoint
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let (b_non_tx, _b_non_rx) = unbounded::<NonDiscoPacket>();
+        let (_b_sock, b_ctl) = MagicSocket::bind(
+            loopback(0),
+            DiscoPrivateKey::from_bytes(*b_priv.as_bytes()),
+            b_node,
+            b_non_tx,
+        )
+        .unwrap();
+
+        // B needs to know "node A's disco identity" before it can decode
+        // the CMM (sender_pub → node_pub lookup) and ping back. Register
+        // with empty endpoints — the CMM itself will deliver fake_a_addr.
+        b_ctl.upsert_peer(a_node_bytes, a_pub, vec![]);
+
+        // A builds CMM for B advertising fake_a_addr.
+        let cmm_bytes = build_call_me_maybe(&a_priv, &b_pub, &[fake_a_addr]).unwrap();
+        assert!(ts_disco::is_disco_message(&cmm_bytes));
+
+        // Deliver to B as if relayed over DERP.
+        b_ctl.handle_disco_from_derp(&cmm_bytes);
+
+        // B should now immediately Ping fake_a_addr. Read one packet.
+        let mut buf = [0u8; 1500];
+        let (n, src) = fake_a_endpoint
+            .recv_from(&mut buf)
+            .expect("expected immediate Ping from B at fake_a_addr");
+        assert!(ts_disco::is_disco_message(&buf[..n]));
+        assert_eq!(src, b_ctl.local_addr());
     }
 }

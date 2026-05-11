@@ -235,6 +235,6 @@ mod tests {
         assert_eq!(cfg.hostname, "vita");
         assert_eq!(cfg.demo_port, 8080);
         assert_eq!(cfg.max_derp_conns, 8);
-        assert_eq!(cfg.capver, 138);
+        assert_eq!(cfg.capver, ts_control::CAPVER as u32);
     }
 }
