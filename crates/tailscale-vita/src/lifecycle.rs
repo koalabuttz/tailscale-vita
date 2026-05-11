@@ -34,6 +34,14 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 const OFFLINE_RECONNECT_THRESHOLD: u32 = 5;
 const OFFLINE_DIAG_AFTER: Duration = Duration::from_secs(600);
 
+/// Distinguishes the two terminal failure kinds. Maps onto the
+/// corresponding `OnlineState` variant via `mark_fatal`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FatalKind {
+    Auth,
+    Security,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnlineState {
     /// Initial state — no map event and no DERP rx seen yet.
@@ -46,6 +54,16 @@ pub enum OnlineState {
     /// 5+ consecutive control or DERP reconnects. We've lost the
     /// path repeatedly.
     Offline,
+    /// Auth-fatal terminal state (M13.5): the control plane rejected
+    /// our identity (bad / expired / revoked auth-key) and there's no
+    /// point retrying. UI should prompt the user to fix `auth_key` in
+    /// `config.toml`. Sticky — once entered, no event clears it.
+    AuthFailed,
+    /// Security-fatal terminal state (M13.5): the server's Noise pub
+    /// key changed unexpectedly, or `/key` returned malformed data.
+    /// UI should prompt the user to investigate (could be a MITM, or
+    /// could be a legitimate rotation requiring `server.pub` reset).
+    SecurityFailed,
 }
 
 pub struct LifecycleTracker {
@@ -59,6 +77,11 @@ pub struct LifecycleTracker {
     last_heartbeat: Option<Instant>,
     offline_since: Option<Instant>,
     offline_diag_fired: bool,
+    /// Human-readable explanation for a terminal `AuthFailed` /
+    /// `SecurityFailed` state. Empty when state is non-fatal.
+    /// Surfaced via `fatal_reason()` so UI / logs / `tailscale status`
+    /// can show what happened.
+    fatal_reason: Option<String>,
 }
 
 impl LifecycleTracker {
@@ -74,11 +97,33 @@ impl LifecycleTracker {
             last_heartbeat: None,
             offline_since: None,
             offline_diag_fired: false,
+            fatal_reason: None,
         }
     }
 
     pub fn state(&self) -> OnlineState {
         self.state
+    }
+
+    /// Reason for a terminal `AuthFailed` / `SecurityFailed` state.
+    /// Returns `None` if the current state isn't fatal.
+    pub fn fatal_reason(&self) -> Option<&str> {
+        self.fatal_reason.as_deref()
+    }
+
+    /// Transition to a sticky terminal state (`AuthFailed` or
+    /// `SecurityFailed`). After this, `compute_next_state` short-
+    /// circuits and returns the same state regardless of events; only
+    /// `LifecycleTracker::new()` (i.e., a process restart) clears it.
+    pub fn mark_fatal(&mut self, kind: FatalKind, reason: impl Into<String>) {
+        let new = match kind {
+            FatalKind::Auth => OnlineState::AuthFailed,
+            FatalKind::Security => OnlineState::SecurityFailed,
+        };
+        let reason = reason.into();
+        info!(?new, %reason, "lifecycle.fatal");
+        self.state = new;
+        self.fatal_reason = Some(reason);
     }
 
     /// Record a control-plane event (any MapResponse, including KeepAlive).
@@ -177,6 +222,16 @@ impl LifecycleTracker {
     }
 
     fn compute_next_state(&self, now: Instant) -> OnlineState {
+        // Sticky fatal states bypass all other computation. Once we've
+        // marked AuthFailed / SecurityFailed, no map event or DERP rx
+        // can recover us — only a process restart with corrected
+        // config/state can.
+        if matches!(
+            self.state,
+            OnlineState::AuthFailed | OnlineState::SecurityFailed
+        ) {
+            return self.state;
+        }
         if self.consecutive_control_reconnects >= OFFLINE_RECONNECT_THRESHOLD
             || self.consecutive_derp_reconnects >= OFFLINE_RECONNECT_THRESHOLD
         {
@@ -311,5 +366,31 @@ mod tests {
         assert!(!lt.offline_diag_fired);
         lt.tick(t(600), 0, 0);
         assert!(lt.offline_diag_fired);
+    }
+
+    #[test]
+    fn auth_failed_is_sticky_across_recovery_events() {
+        let mut lt = LifecycleTracker::new();
+        lt.mark_fatal(FatalKind::Auth, "register: MachineAuthorized=false");
+        assert_eq!(lt.state(), OnlineState::AuthFailed);
+        assert_eq!(
+            lt.fatal_reason(),
+            Some("register: MachineAuthorized=false")
+        );
+        // Even a recovery-shaped event sequence shouldn't unstick.
+        lt.record_map_event(t(0));
+        lt.record_derp_rx(t(0));
+        lt.tick(t(0), 0, 1);
+        assert_eq!(lt.state(), OnlineState::AuthFailed);
+    }
+
+    #[test]
+    fn security_failed_is_sticky() {
+        let mut lt = LifecycleTracker::new();
+        lt.mark_fatal(FatalKind::Security, "server Noise key changed");
+        assert_eq!(lt.state(), OnlineState::SecurityFailed);
+        lt.record_map_event(t(0));
+        lt.tick(t(0), 0, 0);
+        assert_eq!(lt.state(), OnlineState::SecurityFailed);
     }
 }

@@ -45,7 +45,12 @@ const IPN_VERSION: &str = "tailscale-vita/0.1.0";
 const HOSTINFO_OS: &str = "linux";
 const HOSTINFO_OS_VERSION: &str = "vita-3.74";
 const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
-const WATCHDOG: Duration = Duration::from_secs(120);
+/// Maximum time between frames before we declare the long-poll dead
+/// and reconnect. Tailscale's coord sends keepalive frames every ~25 s
+/// when `MapRequest.KeepAlive=true`; 60 s gives us 2-keepalive
+/// tolerance, half the previous 120 s value. Tighter detection of
+/// half-dead connections (TCP socket alive but server stopped writing).
+const WATCHDOG: Duration = Duration::from_secs(60);
 const LAST_SEQ_FILE: &str = "last_seq";
 const SESSION_HANDLE_FILE: &str = "session_handle";
 

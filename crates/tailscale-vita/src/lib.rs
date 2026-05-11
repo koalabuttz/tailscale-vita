@@ -28,5 +28,5 @@ pub mod runtime;
 pub use config::Config;
 pub use dual_transport::DualTransport;
 pub use error::{ConfigError, RuntimeError};
-pub use lifecycle::{LifecycleTracker, OnlineState};
-pub use runtime::{RunStats, Runtime};
+pub use lifecycle::{FatalKind, LifecycleTracker, OnlineState};
+pub use runtime::{ControlHandle, ControlSignal, RunStats, Runtime};

@@ -19,10 +19,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 use parking_lot::Mutex;
 use smoltcp::wire::Ipv4Cidr as SmolIpv4Cidr;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use netstack::{Stack, StackConfig};
 use ts_control::async_io::AsyncNoiseStream;
@@ -37,7 +37,7 @@ use wg_engine::{Engine, EngineConfig, Ipv4Cidr, PeerConfig, TransportAddr};
 use crate::config::Config;
 use crate::dual_transport::DualTransport;
 use crate::error::RuntimeError;
-use crate::lifecycle::{LifecycleTracker, OnlineState};
+use crate::lifecycle::{FatalKind, LifecycleTracker, OnlineState};
 use crate::proto::{consume_early_payload, hex_short, read_server_response};
 
 pub struct Runtime {
@@ -64,6 +64,54 @@ pub struct Runtime {
     stack: Option<Stack>,
     map: Option<MapClient>,
     lifecycle: Mutex<LifecycleTracker>,
+    /// Sender side of the M13.5 Stage 4 control-signal channel.
+    /// Cloned out via `controller()` for management UIs.
+    signal_tx: Sender<ControlSignal>,
+    /// Receiver side, drained at the top of every event-loop iteration.
+    /// Wrapped in `Option` so `run_event_loop` can `take()` it (mirrors
+    /// the `map` / `stack` pattern).
+    signal_rx: Option<Receiver<ControlSignal>>,
+}
+
+/// Out-of-band signals the management UI can send to the running
+/// event loop. M13.5 Stage 4. Future LiveArea bubble app uses these
+/// to drive control-plane state changes without restarting the daemon.
+///
+/// Important: signals do NOT bypass fatal states. If we're in
+/// `OnlineState::AuthFailed`, `ForceReconnect` is ignored; the user
+/// must fix `config.toml` and restart. The UI's job is to surface
+/// fatal states, not paper over them.
+#[derive(Debug, Clone)]
+pub enum ControlSignal {
+    /// Re-establish the control-plane session immediately, skipping
+    /// any pending backoff. Used after a config tweak the user just
+    /// made, or as a manual "kick the daemon" gesture.
+    ForceReconnect,
+}
+
+/// Sender-side handle for `ControlSignal`. Returned from
+/// `Runtime::controller()`; cloneable and `Send`/`Sync` so the UI
+/// thread can hold it independently of the event-loop thread.
+#[derive(Clone)]
+pub struct ControlHandle {
+    tx: Sender<ControlSignal>,
+}
+
+impl ControlHandle {
+    /// Request an immediate reconnect. Returns `Ok(())` if the signal
+    /// was queued, `Err(...)` if the event loop has shut down (the
+    /// receiver was dropped).
+    pub fn force_reconnect(&self) -> Result<(), crossbeam_channel::SendError<ControlSignal>> {
+        self.tx.send(ControlSignal::ForceReconnect)
+    }
+
+    /// Low-level send for future signal variants.
+    pub fn send(
+        &self,
+        sig: ControlSignal,
+    ) -> Result<(), crossbeam_channel::SendError<ControlSignal>> {
+        self.tx.send(sig)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -165,6 +213,8 @@ impl Runtime {
         )?;
         info!("control.map.started");
 
+        let (signal_tx, signal_rx) = unbounded();
+
         Ok(Self {
             config,
             state_dir,
@@ -177,7 +227,20 @@ impl Runtime {
             stack: Some(stack),
             map: Some(map),
             lifecycle: Mutex::new(LifecycleTracker::new()),
+            signal_tx,
+            signal_rx: Some(signal_rx),
         })
+    }
+
+    /// Cloneable handle for sending `ControlSignal` to this runtime.
+    /// Use it from management UIs (LiveArea bubble app, future SOCKS
+    /// proxy admin endpoint, etc.) to trigger control-plane state
+    /// changes. Signals are processed at the top of each event-loop
+    /// iteration; expect ~2 s of latency.
+    pub fn controller(&self) -> ControlHandle {
+        ControlHandle {
+            tx: self.signal_tx.clone(),
+        }
     }
 
     pub fn config(&self) -> &Config {
@@ -224,6 +287,9 @@ impl Runtime {
                 .take()
                 .ok_or_else(|| RuntimeError::Internal("runtime map_client already taken".into()))?,
         );
+        let signal_rx = self.signal_rx.take().ok_or_else(|| {
+            RuntimeError::Internal("runtime signal_rx already taken".into())
+        })?;
 
         let mut snapshots = 0u32;
         let mut keepalives = 0u32;
@@ -254,6 +320,41 @@ impl Runtime {
         let mut reconnect_attempt: u32 = 0;
 
         while !should_stop() {
+            // M13.5 Stage 4: drain any pending control signals. Fatal
+            // states block signals — UI must surface the failure to
+            // the user, not paper over it.
+            let lifecycle_state = self.lifecycle.lock().state();
+            let is_fatal = matches!(
+                lifecycle_state,
+                OnlineState::AuthFailed | OnlineState::SecurityFailed
+            );
+            loop {
+                match signal_rx.try_recv() {
+                    Ok(ControlSignal::ForceReconnect) => {
+                        if is_fatal {
+                            warn!(
+                                state = ?lifecycle_state,
+                                "control.signal.force_reconnect.ignored.fatal"
+                            );
+                            continue;
+                        }
+                        info!("control.signal.force_reconnect");
+                        // Tear down current session; the reconnect
+                        // block below will rebuild with attempt=0
+                        // (immediate, no backoff sleep).
+                        map_opt = None;
+                        reconnect_attempt = 0;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        // All ControlHandle clones dropped. Not an
+                        // error — just no more signals will arrive.
+                        debug!("control.signal.channel.disconnected");
+                        break;
+                    }
+                }
+            }
+
             // M13 reconnect: if we're sessionless, sleep with backoff +
             // attempt bootstrap. Done at loop top so both first-fail
             // and bootstrap-fail paths share the same retry mechanism.
@@ -290,13 +391,36 @@ impl Runtime {
                         sent_netinfo_once = false;
                     }
                     Err(e) => {
-                        reconnect_attempt = reconnect_attempt.saturating_add(1);
-                        warn!(
-                            error = %e,
-                            attempt = reconnect_attempt,
-                            "control.reconnect.failed"
-                        );
-                        continue; // backoff harder next iter
+                        // Same fatal-vs-transient triage as the
+                        // in-session error arm. A bad auth_key
+                        // discovered during reconnect should fail
+                        // fast, not spin forever.
+                        let class = classify_control_error(&e);
+                        match class {
+                            ErrorClass::AuthFatal => {
+                                warn!(error = %e, "control.reconnect.auth_fatal");
+                                self.lifecycle
+                                    .lock()
+                                    .mark_fatal(FatalKind::Auth, e.to_string());
+                                return Err(RuntimeError::Control(e));
+                            }
+                            ErrorClass::SecurityFatal => {
+                                warn!(error = %e, "control.reconnect.security_fatal");
+                                self.lifecycle
+                                    .lock()
+                                    .mark_fatal(FatalKind::Security, e.to_string());
+                                return Err(RuntimeError::Control(e));
+                            }
+                            ErrorClass::Transient => {
+                                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                                warn!(
+                                    error = %e,
+                                    attempt = reconnect_attempt,
+                                    "control.reconnect.failed"
+                                );
+                                continue; // backoff harder next iter
+                            }
+                        }
                     }
                 }
             }
@@ -305,14 +429,33 @@ impl Runtime {
                 Ok(e) => e,
                 Err(e) => {
                     control_errors += 1;
-                    warn!(error = %e, "control.map.error");
-                    self.lifecycle.lock().record_control_reconnect();
-                    // Drop the dead session; next loop iter handles
-                    // backoff + bootstrap. Setting attempt=0 so the
-                    // first reconnect is fast (1 s).
-                    map_opt = None;
-                    reconnect_attempt = 0;
-                    continue;
+                    let class = classify_control_error(&e);
+                    match class {
+                        ErrorClass::AuthFatal => {
+                            warn!(error = %e, "control.map.error.auth_fatal");
+                            self.lifecycle
+                                .lock()
+                                .mark_fatal(FatalKind::Auth, e.to_string());
+                            return Err(RuntimeError::Control(e));
+                        }
+                        ErrorClass::SecurityFatal => {
+                            warn!(error = %e, "control.map.error.security_fatal");
+                            self.lifecycle
+                                .lock()
+                                .mark_fatal(FatalKind::Security, e.to_string());
+                            return Err(RuntimeError::Control(e));
+                        }
+                        ErrorClass::Transient => {
+                            warn!(error = %e, "control.map.error");
+                            self.lifecycle.lock().record_control_reconnect();
+                            // Drop the dead session; next loop iter
+                            // handles backoff + bootstrap. attempt=0
+                            // so the first reconnect is immediate.
+                            map_opt = None;
+                            reconnect_attempt = 0;
+                            continue;
+                        }
+                    }
                 }
             };
             let now = Instant::now();
@@ -700,13 +843,69 @@ fn push_delta_to_engine(
 /// window in practice, and we'd rather waste a minute than hammer).
 const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(60);
 
+/// Bucketing for `ControlError` triage. Drives whether the event loop
+/// retries (with backoff), or short-circuits to a terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorClass {
+    /// Network blip, server hiccup, idle long-poll cutover — retry
+    /// after backoff. The vast majority of errors fall here.
+    Transient,
+    /// Server rejected our identity. No retry will help; user must
+    /// fix `auth_key` and restart.
+    AuthFatal,
+    /// Server's Noise key changed or `/key` returned malformed data.
+    /// Could be MITM or legitimate rotation; either way the user must
+    /// investigate.
+    SecurityFatal,
+}
+
+/// Decide whether a `ControlError` is worth retrying. Conservatively
+/// bias toward `Transient` for ambiguous errors — false-positive
+/// transient retries cost a backoff cycle, but false-positive fatal
+/// classification strands the user.
+fn classify_control_error(err: &ts_control::ControlError) -> ErrorClass {
+    use ts_control::ControlError;
+    match err {
+        // Explicit auth failure from /machine/register.
+        ControlError::AuthRejected { .. } => ErrorClass::AuthFatal,
+        // HTTP 401/403 = unauthorized; 410 Gone = identity revoked.
+        // 4xx other than these is usually a wire-protocol mismatch
+        // (5xx is the server's problem and we retry).
+        ControlError::Http { status, .. } if matches!(*status, 401 | 403 | 410) => {
+            ErrorClass::AuthFatal
+        }
+        // The register-path also emits a plain `Transport(_)` when the
+        // server returns `MachineAuthorized=false` without an AuthURL.
+        // Sniff for the marker so we don't infinite-loop on a revoked
+        // node — see register.rs:108-112.
+        ControlError::Transport(s) if s.contains("MachineAuthorized=false") => {
+            ErrorClass::AuthFatal
+        }
+        // Noise-side trust failures — refuse to retry.
+        ControlError::BadServerKey { .. } | ControlError::ServerKeyChanged => {
+            ErrorClass::SecurityFatal
+        }
+        // Everything else: network, idle long-poll, frame decode hiccup,
+        // 5xx server errors, etc. Retry.
+        _ => ErrorClass::Transient,
+    }
+}
+
+/// ±jitter on the exponential backoff, expressed as a fraction of the
+/// base delay. 0.25 = the actual delay is in `[base*0.75, base*1.25]`.
+/// Decorrelates retries from multiple tailnet devices recovering
+/// together (avoids the synchronized-retry "thundering herd" pattern).
+const BACKOFF_JITTER_FRAC: f64 = 0.25;
+
 /// Compute the sleep delay before reconnect attempt `attempt` (0-indexed).
 ///
 /// Returns `Duration::ZERO` when `attempt == 0` so the first reconnect
 /// after a healthy session is immediate — most control-plane errors
 /// are transient h2 frames that re-handshake successfully on the very
-/// next dial. Subsequent attempts double: 1 s, 2 s, 4 s, 8 s, 16 s,
-/// 32 s, 60 s (clamped).
+/// next dial. Subsequent attempts double: ~1 s, ~2 s, ~4 s, ~8 s, ~16 s,
+/// ~32 s, then ~60 s (clamped). Each non-zero delay is jittered by
+/// ±25% to avoid the thundering-herd effect when multiple tailnet
+/// devices recover from a network outage simultaneously.
 fn reconnect_backoff(attempt: u32) -> Duration {
     if attempt == 0 {
         return Duration::ZERO;
@@ -714,12 +913,24 @@ fn reconnect_backoff(attempt: u32) -> Duration {
     // 2^(attempt-1) seconds. Saturate `1 << shift` against overflow at
     // attempt ≥ 64; capped to RECONNECT_BACKOFF_CAP either way.
     let secs = 1u64.checked_shl(attempt - 1).unwrap_or(u64::MAX);
-    let d = Duration::from_secs(secs);
-    if d > RECONNECT_BACKOFF_CAP {
-        RECONNECT_BACKOFF_CAP
-    } else {
-        d
-    }
+    let base = Duration::from_secs(secs).min(RECONNECT_BACKOFF_CAP);
+    apply_jitter(base, BACKOFF_JITTER_FRAC)
+}
+
+/// Multiplicative jitter: returns a Duration in `[d*(1-frac), d*(1+frac)]`.
+/// Uses `OsRng` from `rand_core` (already in the workspace via
+/// `crypto_box`/`x25519_dalek` — no new dep). Resolution is
+/// milliseconds, which is fine for reconnect-cadence purposes.
+fn apply_jitter(d: Duration, frac: f64) -> Duration {
+    use rand_core::RngCore;
+    let mut rng = rand_core::OsRng;
+    // Sample u32 → fold into [-1, 1].
+    let raw = rng.next_u32() as f64 / u32::MAX as f64; // [0, 1]
+    let signed = (raw * 2.0) - 1.0; // [-1, 1]
+    let multiplier = 1.0 + signed * frac;
+    let base_ms = d.as_millis() as f64;
+    let jittered_ms = (base_ms * multiplier).max(0.0) as u64;
+    Duration::from_millis(jittered_ms)
 }
 
 /// Sleep `delay`, polling `should_stop` every 250 ms so the demo can
@@ -767,18 +978,32 @@ fn bootstrap_control_session(
     local_endpoint_types: Vec<u8>,
     state_dir: &Path,
     phase: BootstrapPhase,
-) -> Result<MapClient, RuntimeError> {
+) -> Result<MapClient, ts_control::ControlError> {
     info!(?phase, "control.bootstrap.start");
 
-    // 1. Fetch server's Noise pubkey. Cheap (~50 ms typical); we
-    // intentionally re-fetch on every reconnect so a server-key
-    // rotation doesn't strand us on a stale key.
-    let server_pub = ts_control::fetch_server_key(&config.control_url, config.capver)?;
+    // 1. Fetch server's Noise pubkey via cache (M13.5 Stage 2). Cache
+    // TTL is 1 h; on a Noise failure below we invalidate + retry to
+    // cover the legitimate-rotation case.
+    let server_pub = ts_control::fetch_server_key_cached(
+        &config.control_url,
+        config.capver,
+        state_dir,
+    )?;
     info!(server_pub = %server_pub, "control.key.received");
 
     // 2. Noise IK handshake.
     info!("starting Noise IK handshake");
-    let mut hs = ts_control::NoiseHandshaker::new(&ks.machine_priv, &server_pub)?;
+    let mut hs = match ts_control::NoiseHandshaker::new(&ks.machine_priv, &server_pub) {
+        Ok(h) => h,
+        Err(e) => {
+            // Handshake construction failure could mean the cached
+            // server pub is stale. Drop the cache so the next
+            // bootstrap attempt refetches.
+            warn!(error = %e, "control.noise.handshaker.failed; invalidating server-key cache");
+            ts_control::invalidate_server_key_cache(state_dir);
+            return Err(e);
+        }
+    };
     let header_b64 = hs.build_init_header()?;
     info!(b64_len = header_b64.len(), "control.noise.init.built");
 
@@ -786,7 +1011,18 @@ fn bootstrap_control_session(
     info!(leftover = upgraded.leftover.len(), "control.upgrade.101");
 
     let server_response = read_server_response(&mut upgraded)?;
-    let nt = hs.finalize(&server_response)?;
+    let nt = match hs.finalize(&server_response) {
+        Ok(nt) => nt,
+        Err(e) => {
+            // Most likely a server-key rotation we didn't notice
+            // (cached key doesn't match what the server is actually
+            // signing with anymore). Invalidate so the next attempt
+            // refetches.
+            warn!(error = %e, "control.noise.finalize.failed; invalidating server-key cache");
+            ts_control::invalidate_server_key_cache(state_dir);
+            return Err(e);
+        }
+    };
     info!(
         handshake_hash = %hex_short(&nt.handshake_hash),
         "control.noise.handshake.complete"
@@ -1009,30 +1245,150 @@ fn build_local_endpoints(control_url: &str, magic_local: SocketAddr) -> Vec<Stri
 mod tests {
     use super::*;
 
+    /// Asserts `actual` lies in `[base * (1-frac), base * (1+frac)]`.
+    /// Used to validate jittered backoff without flaking on the RNG.
+    fn assert_within_jitter(actual: Duration, base: Duration, frac: f64) {
+        let base_ms = base.as_millis() as f64;
+        let low = ((base_ms * (1.0 - frac)).floor()) as u128;
+        let high = ((base_ms * (1.0 + frac)).ceil()) as u128;
+        let actual_ms = actual.as_millis();
+        assert!(
+            (low..=high).contains(&actual_ms),
+            "jittered {actual_ms} ms not in [{low}, {high}] for base {base_ms} ms"
+        );
+    }
+
     #[test]
     fn reconnect_backoff_first_attempt_is_immediate() {
-        // Attempt 0 = "we just got a fresh error, retry now." Most h2
-        // hiccups recover on the very next dial; an immediate retry
-        // halves the user-visible outage for transient failures.
+        // Attempt 0 = "we just got a fresh error, retry now." Jitter
+        // does NOT apply — we want predictable immediacy here.
         assert_eq!(reconnect_backoff(0), Duration::ZERO);
     }
 
     #[test]
-    fn reconnect_backoff_doubles_until_cap() {
-        assert_eq!(reconnect_backoff(1), Duration::from_secs(1));
-        assert_eq!(reconnect_backoff(2), Duration::from_secs(2));
-        assert_eq!(reconnect_backoff(3), Duration::from_secs(4));
-        assert_eq!(reconnect_backoff(4), Duration::from_secs(8));
-        assert_eq!(reconnect_backoff(5), Duration::from_secs(16));
-        assert_eq!(reconnect_backoff(6), Duration::from_secs(32));
+    fn reconnect_backoff_doubles_within_jitter() {
+        // Each step's base is 2^(attempt-1) seconds, jittered ±25%.
+        for (attempt, base_secs) in [(1u32, 1u64), (2, 2), (3, 4), (4, 8), (5, 16), (6, 32)] {
+            let got = reconnect_backoff(attempt);
+            assert_within_jitter(got, Duration::from_secs(base_secs), BACKOFF_JITTER_FRAC);
+        }
     }
 
     #[test]
-    fn reconnect_backoff_clamps_at_cap() {
-        // 2^6 = 64s > 60s cap.
-        assert_eq!(reconnect_backoff(7), RECONNECT_BACKOFF_CAP);
-        assert_eq!(reconnect_backoff(20), RECONNECT_BACKOFF_CAP);
-        // Extreme attempt values shouldn't panic via integer overflow.
-        assert_eq!(reconnect_backoff(u32::MAX), RECONNECT_BACKOFF_CAP);
+    fn reconnect_backoff_clamps_at_cap_with_jitter() {
+        // 2^6 = 64s > 60s cap. The clamp happens before jitter so the
+        // jittered value sits in cap-band.
+        for attempt in [7u32, 8, 20, u32::MAX] {
+            let got = reconnect_backoff(attempt);
+            assert_within_jitter(got, RECONNECT_BACKOFF_CAP, BACKOFF_JITTER_FRAC);
+        }
+    }
+
+    #[test]
+    fn jitter_stays_within_bounds_under_many_samples() {
+        // Validate the apply_jitter helper directly. Sample 1000 times
+        // and assert every sample is in range. Catches RNG misuse.
+        let base = Duration::from_secs(10);
+        for _ in 0..1000 {
+            let got = apply_jitter(base, 0.25);
+            assert_within_jitter(got, base, 0.25);
+        }
+    }
+
+    #[test]
+    fn control_handle_force_reconnect_delivers_signal() {
+        // Validate the handle wiring without standing up a full
+        // Runtime. The event loop's drain logic is exercised by
+        // hardware verification (Stage 5).
+        let (tx, rx) = unbounded::<ControlSignal>();
+        let handle = ControlHandle { tx };
+        handle.force_reconnect().expect("send should succeed");
+        match rx.try_recv() {
+            Ok(ControlSignal::ForceReconnect) => {}
+            other => panic!("expected ForceReconnect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_handle_send_fails_after_receiver_dropped() {
+        let (tx, rx) = unbounded::<ControlSignal>();
+        let handle = ControlHandle { tx };
+        drop(rx);
+        assert!(handle.force_reconnect().is_err());
+    }
+
+    #[test]
+    fn classify_auth_rejected_is_fatal() {
+        let err = ts_control::ControlError::AuthRejected {
+            auth_url: "https://login.tailscale.com/a/abc".into(),
+        };
+        assert_eq!(classify_control_error(&err), ErrorClass::AuthFatal);
+    }
+
+    #[test]
+    fn classify_http_401_403_410_are_auth_fatal() {
+        for status in [401u16, 403, 410] {
+            let err = ts_control::ControlError::Http {
+                status,
+                body: "".into(),
+            };
+            assert_eq!(
+                classify_control_error(&err),
+                ErrorClass::AuthFatal,
+                "HTTP {status} should be AuthFatal"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_http_5xx_is_transient() {
+        for status in [500u16, 502, 503, 504] {
+            let err = ts_control::ControlError::Http {
+                status,
+                body: "".into(),
+            };
+            assert_eq!(
+                classify_control_error(&err),
+                ErrorClass::Transient,
+                "HTTP {status} should be Transient"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_machine_unauthorized_transport_message_is_auth_fatal() {
+        // register.rs:108-112 emits this shape when MachineAuthorized
+        // is false but no AuthURL is present (e.g., revoked node).
+        let err = ts_control::ControlError::Transport(
+            "register: MachineAuthorized=false (no AuthURL)".into(),
+        );
+        assert_eq!(classify_control_error(&err), ErrorClass::AuthFatal);
+    }
+
+    #[test]
+    fn classify_generic_transport_is_transient() {
+        let err = ts_control::ControlError::Transport("ureq: timed out".into());
+        assert_eq!(classify_control_error(&err), ErrorClass::Transient);
+    }
+
+    #[test]
+    fn classify_bad_server_key_is_security_fatal() {
+        let err = ts_control::ControlError::BadServerKey {
+            reason: "expected 64 hex chars in mkey",
+        };
+        assert_eq!(classify_control_error(&err), ErrorClass::SecurityFatal);
+        assert_eq!(
+            classify_control_error(&ts_control::ControlError::ServerKeyChanged),
+            ErrorClass::SecurityFatal
+        );
+    }
+
+    #[test]
+    fn classify_watchdog_and_eof_are_transient() {
+        let watchdog = ts_control::ControlError::MapWatchdog { idle_secs: 120 };
+        assert_eq!(classify_control_error(&watchdog), ErrorClass::Transient);
+        let eof =
+            ts_control::ControlError::MapConnectionLost("server closed map stream".into());
+        assert_eq!(classify_control_error(&eof), ErrorClass::Transient);
     }
 }

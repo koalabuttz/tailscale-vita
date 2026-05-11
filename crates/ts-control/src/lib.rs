@@ -54,7 +54,10 @@ pub use noise::{NoiseHandshaker, NoiseTransport};
 pub use persist::{atomic_write, pin_or_load_server_key};
 pub use record::NoiseStream;
 pub use register::{register, RegistrationOutcome};
-pub use server_key::fetch_server_key;
+pub use server_key::{
+    fetch_server_key, fetch_server_key_cached, invalidate_server_key_cache,
+    SERVER_KEY_CACHE_TTL,
+};
 pub use types::{
     generate_machine_keypair, DiscoPrivate, DiscoPublic, MachinePrivate, MachinePublic,
     NodePrivate, NodePublic, DISCOKEY_PREFIX, MKEY_PREFIX, NODEKEY_PREFIX,
