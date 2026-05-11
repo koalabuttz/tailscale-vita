@@ -361,6 +361,14 @@ pub(crate) struct NodeWire {
     /// its `MapRequest.Endpoints`.
     #[serde(rename = "Endpoints", default, deserialize_with = "null_or_default")]
     pub endpoints: Vec<String>,
+    /// M15-B (ACL UX): tags the server has assigned to this node, e.g.
+    /// `["tag:vita"]`. Server-computed from the auth-key + tailnet ACL
+    /// policy. When this Vita's own NodeWire has an empty `tags` field,
+    /// the runtime emits a one-shot warning that we have full tailnet
+    /// access — encourages users to re-issue with `--tags=tag:vita` and
+    /// write an ACL.
+    #[serde(rename = "Tags", default, deserialize_with = "null_or_default")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]
@@ -539,6 +547,33 @@ mod tests {
         assert_eq!(node.id, 1);
         assert_eq!(node.addresses.len(), 2);
         assert_eq!(node.addresses[0], "100.64.0.1/32");
+    }
+
+    #[test]
+    fn node_wire_tags_present() {
+        let body = br#"{"ID":1,"Name":"v","Tags":["tag:vita","tag:portable"]}"#;
+        let n: NodeWire = serde_json::from_slice(body).unwrap();
+        assert_eq!(n.tags, vec!["tag:vita".to_string(), "tag:portable".into()]);
+    }
+
+    #[test]
+    fn node_wire_tags_absent_defaults_to_empty() {
+        // Untagged auth-key produces a node record with no Tags field.
+        // M15-B uses this absence to trigger the registration-time
+        // ACL warning.
+        let body = br#"{"ID":1,"Name":"v"}"#;
+        let n: NodeWire = serde_json::from_slice(body).unwrap();
+        assert!(n.tags.is_empty());
+    }
+
+    #[test]
+    fn node_wire_tags_null_defaults_to_empty() {
+        // Some control-plane implementations emit `"Tags": null`
+        // instead of omitting the field. `null_or_default` handles
+        // this (same pattern as Addresses/AllowedIPs/Endpoints).
+        let body = br#"{"ID":1,"Name":"v","Tags":null}"#;
+        let n: NodeWire = serde_json::from_slice(body).unwrap();
+        assert!(n.tags.is_empty());
     }
 
     #[test]

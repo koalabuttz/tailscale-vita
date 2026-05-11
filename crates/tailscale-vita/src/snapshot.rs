@@ -52,8 +52,30 @@ pub struct RuntimeSnapshot {
     /// Our public-mapped UDP endpoint discovered via STUN (Stage-3
     /// netcheck). `None` until netcheck completes.
     pub public_endpoint: Option<SocketAddr>,
+    /// M15-B: ACL posture as the server computed it for our node.
+    /// LocalAPI consumers (and the future LiveArea UI) display this
+    /// prominently so users notice when their Vita has full tailnet
+    /// access (the load-bearing security boundary in
+    /// `memory/vita_threat_model.md`).
+    pub acl: AclSummary,
     /// Per-peer view, keyed by node-key hex.
     pub peers: HashMap<String, PeerView>,
+}
+
+/// What scope the server has granted this Vita on the tailnet. When
+/// `has_tags=false`, the auth-key wasn't tagged and the device can
+/// reach every peer + service the ACL allows for untagged nodes —
+/// which on most personal tailnets is "everything." UIs should
+/// surface this in a high-visibility way (red badge in LiveArea, etc.).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AclSummary {
+    /// Tags assigned to our node, e.g. `["tag:vita"]`. Empty when
+    /// untagged.
+    pub tags: Vec<String>,
+    /// Convenience: `!tags.is_empty()`. Lets JSON consumers branch
+    /// without scanning the array. Mirrors upstream Tailscale's
+    /// `tailscale status --json` "TagsSet" boolean.
+    pub has_tags: bool,
 }
 
 /// Per-peer info LocalAPI consumers see. Constructed by merging
@@ -117,6 +139,7 @@ impl RuntimeSnapshot {
             alive_derp_regions: Vec::new(),
             magic_local,
             public_endpoint: None,
+            acl: AclSummary::default(),
             peers: HashMap::new(),
         }
     }

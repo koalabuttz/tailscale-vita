@@ -33,4 +33,4 @@ pub use error::{ConfigError, RuntimeError};
 pub use lifecycle::{FatalKind, LifecycleTracker, OnlineState};
 pub use localapi::LocalApiServer;
 pub use runtime::{ControlHandle, ControlSignal, RunStats, Runtime};
-pub use snapshot::{AllowedIpView, PeerView, RuntimeSnapshot};
+pub use snapshot::{AclSummary, AllowedIpView, PeerView, RuntimeSnapshot};

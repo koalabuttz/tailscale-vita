@@ -39,7 +39,7 @@ use crate::dual_transport::DualTransport;
 use crate::error::RuntimeError;
 use crate::lifecycle::{FatalKind, LifecycleTracker, OnlineState};
 use crate::snapshot::{
-    node_key_hex, now_unix, AllowedIpView, PeerView, RuntimeSnapshot,
+    node_key_hex, now_unix, AclSummary, AllowedIpView, PeerView, RuntimeSnapshot,
 };
 use crate::proto::{consume_early_payload, hex_short, read_server_response};
 
@@ -349,6 +349,12 @@ impl Runtime {
         // the 3-second-cadence refresh loop below so /status doesn't
         // serve frozen direct-path state between netmap deltas.
         let mut last_snapshot_publish_at = Instant::now();
+        // M15-B: one-shot ACL-posture warning. Fires once on the
+        // first MapResponse if `netmap.our_tags` is empty (auth-key
+        // wasn't tagged → device has full tailnet access). Reset on
+        // reconnect so a fresh session re-evaluates (tag changes
+        // server-side are unlikely but possible).
+        let mut acl_warned = false;
 
         let mut snapshots = 0u32;
         let mut keepalives = 0u32;
@@ -451,6 +457,11 @@ impl Runtime {
                         // Fresh session needs a fresh NetInfo write so
                         // the server re-commits DiscoKey state.
                         sent_netinfo_once = false;
+                        // M15-B: re-evaluate ACL posture on fresh
+                        // session — tags can change server-side
+                        // between sessions if the user re-issued the
+                        // auth-key while we were disconnected.
+                        acl_warned = false;
                     }
                     Err(e) => {
                         // Same fatal-vs-transient triage as the
@@ -682,6 +693,28 @@ impl Runtime {
                         fatal_reason,
                     );
                     last_snapshot_publish_at = Instant::now();
+
+                    // M15-B: one-shot ACL-posture warning on the
+                    // first MapResponse. If the server returned no
+                    // tags for our node, the auth-key was untagged
+                    // and the device has full tailnet access. Loud
+                    // INFO/WARN so the user actually notices.
+                    if !acl_warned {
+                        acl_warned = true;
+                        let tags = &map.netmap().our_tags;
+                        if tags.is_empty() {
+                            warn!(
+                                "control.acl.untagged: this Vita has FULL tailnet access. \
+                                 Re-issue the auth-key with --tags=tag:vita and write an ACL \
+                                 in the Tailscale admin panel to restrict reach."
+                            );
+                        } else {
+                            info!(
+                                tags = ?tags,
+                                "control.acl.tagged"
+                            );
+                        }
+                    }
                 }
                 MapEvent::KeepAlive { seq } => {
                     keepalives += 1;
@@ -1305,6 +1338,11 @@ fn publish_snapshot(
         })
         .collect();
 
+    let acl = AclSummary {
+        tags: netmap.our_tags.clone(),
+        has_tags: !netmap.our_tags.is_empty(),
+    };
+
     let new_snap = RuntimeSnapshot {
         updated_at_unix: now_unix(),
         started_at_unix,
@@ -1317,6 +1355,7 @@ fn publish_snapshot(
         alive_derp_regions,
         magic_local: magic_ctl.local_addr(),
         public_endpoint,
+        acl,
         peers,
     };
     *out.write() = new_snap;

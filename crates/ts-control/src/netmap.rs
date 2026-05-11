@@ -69,6 +69,13 @@ pub struct DerpNodeSnapshot {
 #[derive(Default)]
 pub struct NetMap {
     pub our_addrs: Vec<AllowedIp>,
+    /// M15-B: tags the server has assigned to our node, computed from
+    /// the auth-key + tailnet ACL policy. Empty when the auth-key
+    /// wasn't tagged — runtime emits a warning on first MapResponse
+    /// in that case ("full tailnet access; recommend re-issuing with
+    /// `--tags=tag:vita` and writing an ACL"). Surfaced in
+    /// `RuntimeSnapshot.acl.tags` for LocalAPI consumers.
+    pub our_tags: Vec<String>,
     pub peers: HashMap<NodeKeyBytes, PeerSnapshot>,
     /// Secondary index: server-assigned NodeID → NodeKey. Lets us
     /// resolve `PeersRemoved` and `PeersChangedPatch` entries (which
@@ -132,6 +139,15 @@ impl NetMap {
                 info!(addrs = ?new_addrs, "control.map.our_addrs.set");
                 self.our_addrs = new_addrs;
                 delta.our_addrs_changed = true;
+            }
+            // M15-B: capture our assigned tags. Server recomputes on
+            // every full Node frame (which is what we get on first
+            // map and on PeersChanged frames carrying ours). Quietly
+            // replace; the runtime's first-MapResponse hook handles
+            // the user-visible warn-if-untagged case.
+            if node.tags != self.our_tags {
+                info!(tags = ?node.tags, "control.map.our_tags.set");
+                self.our_tags = node.tags.clone();
             }
         }
 

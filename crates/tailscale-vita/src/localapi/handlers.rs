@@ -261,6 +261,10 @@ mod tests {
             alive_derp_regions: vec![12],
             magic_local: "0.0.0.0:41641".parse().unwrap(),
             public_endpoint: Some("66.31.113.175:41641".parse().unwrap()),
+            acl: crate::snapshot::AclSummary {
+                tags: vec!["tag:vita".into()],
+                has_tags: true,
+            },
             peers: {
                 let mut m = HashMap::new();
                 m.insert(
