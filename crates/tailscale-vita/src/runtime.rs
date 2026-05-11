@@ -43,6 +43,16 @@ use crate::proto::{consume_early_payload, hex_short, read_server_response};
 pub struct Runtime {
     config: Config,
     state_dir: PathBuf,
+    /// Cached `host:port` form of `config.control_url`. Used for HTTP/2
+    /// `:authority` headers. Reused across reconnects (control-plane
+    /// hostname doesn't drift mid-session).
+    host_authority: String,
+    /// Persistent keypairs (machine/node/disco/nl). M13 needs these on
+    /// reconnect: every fresh Noise+H2 tunnel re-keys with
+    /// `ks.machine_priv` against the same server pub. Disk is the
+    /// source of truth; we cache a clone here to avoid re-reading the
+    /// four files on every reconnect.
+    ks: KeyStore,
     derp_ctl: DerpTransportCtl,
     engine: Arc<Engine>,
     magic_ctl: MagicSocketCtl,
@@ -86,65 +96,9 @@ impl Runtime {
             "runtime.up.start"
         );
 
-        // 1. Fetch server's Noise pubkey.
-        let server_pub = ts_control::fetch_server_key(&config.control_url, config.capver)?;
-        info!(server_pub = %server_pub, "control.key.received");
-
-        // 2. KeyStore — persistent machine/node/disco keys.
+        // KeyStore first — persistent machine/node/disco keys. Both the
+        // initial bootstrap below and any M13 reconnect reuse this.
         let ks = KeyStore::load_or_generate(&state_dir)?;
-
-        // 3-5. Noise IK handshake + h2 over the Noise tunnel. Lifted
-        // verbatim from the M9 demo's run().
-        info!("starting Noise IK handshake");
-        let mut hs = ts_control::NoiseHandshaker::new(&ks.machine_priv, &server_pub)?;
-        let header_b64 = hs.build_init_header()?;
-        info!(b64_len = header_b64.len(), "control.noise.init.built");
-
-        let mut upgraded = ts_control::upgrade::dial_and_upgrade(&config.control_url, &header_b64)?;
-        info!(leftover = upgraded.leftover.len(), "control.upgrade.101");
-
-        let server_response = read_server_response(&mut upgraded)?;
-        let nt = hs.finalize(&server_response)?;
-        info!(
-            handshake_hash = %hex_short(&nt.handshake_hash),
-            "control.noise.handshake.complete"
-        );
-
-        let leftover = upgraded.leftover;
-        let mut noise_stream = NoiseStream::new(upgraded.tcp, nt, leftover);
-        consume_early_payload(&mut noise_stream)?;
-
-        let async_stream = AsyncNoiseStream::spawn(noise_stream);
-        info!("opening HTTP/2 over Noise");
-        let mut conn = Http2Conn::open(async_stream)?;
-        info!("control.http2.handshake.complete");
-
-        // 6. Register using config.auth_key directly (M10 — no separate
-        //    auth-key.txt file). User pastes the Headscale preauth key
-        //    into config.toml.
-        let auth_key = config.auth_key.trim();
-        info!(len = auth_key.len(), "control.auth_key.loaded");
-
-        // Generate a per-process BackendLogID — upstream Go client
-        // hard-errors without one and the modern Tailscale coordinator
-        // appears to use it as a session disambiguator. 32 hex chars.
-        let backend_log_id = generate_backend_log_id();
-        info!(backend_log_id = %backend_log_id, "control.backend_log_id.generated");
-
-        let outcome = ts_control::register(
-            &mut conn,
-            auth_key,
-            &ks.node_pub,
-            &ks.nl_pub,
-            &backend_log_id,
-            &config.hostname,
-            &host_authority,
-        )?;
-        info!(
-            machine_authorized = outcome.machine_authorized,
-            node_key_expired = outcome.node_key_expired,
-            "control.register.ok"
-        );
 
         // 8. DerpTransport + MagicSocket (M12) + Engine + Stack.
         // Same 32 priv bytes serve WG identity AND DERP NaCl-box ECDH
@@ -197,23 +151,25 @@ impl Runtime {
         let stack = Stack::start(StackConfig::new(), engine_running)?;
         info!("netstack: poll thread running (no local IP yet)");
 
-        // 9. MapClient. local_endpoints sourced from MagicSocket bind.
-        let map = MapClient::start(
-            conn,
-            ks.node_pub,
-            ks.disco_pub,
-            config.hostname.clone(),
-            backend_log_id.clone(),
-            host_authority.clone(),
-            state_dir.clone(),
+        // 9. First control-plane session: Noise IK + H2 + register +
+        // MapClient. M13: factored into a helper so reconnect can call
+        // it again on long-poll failures.
+        let map = bootstrap_control_session(
+            &config,
+            &ks,
+            &host_authority,
             local_endpoints,
             local_endpoint_types,
+            &state_dir,
+            BootstrapPhase::Initial,
         )?;
         info!("control.map.started");
 
         Ok(Self {
             config,
             state_dir,
+            host_authority,
+            ks,
             derp_ctl,
             engine,
             magic_ctl,
@@ -263,10 +219,11 @@ impl Runtime {
             .stack
             .as_ref()
             .ok_or_else(|| RuntimeError::Internal("runtime stack already shut down".into()))?;
-        let mut map = self
-            .map
-            .take()
-            .ok_or_else(|| RuntimeError::Internal("runtime map_client already taken".into()))?;
+        let mut map_opt: Option<MapClient> = Some(
+            self.map
+                .take()
+                .ok_or_else(|| RuntimeError::Internal("runtime map_client already taken".into()))?,
+        );
 
         let mut snapshots = 0u32;
         let mut keepalives = 0u32;
@@ -286,20 +243,81 @@ impl Runtime {
         // streaming long-poll runs. Mirrors upstream Go's
         // `controlclient.Direct.SetDerpHomeRegion` which sends a
         // `stream=false` MapRequest with NetInfo + OmitPeers=true.
+        //
+        // Reset to false on reconnect so a fresh control-plane session
+        // re-arms the NetInfo write path (the server treats each
+        // session independently).
         let mut sent_netinfo_once = false;
+        // M13 reconnect bookkeeping. attempt counts contiguous failures;
+        // resets to 0 on a successful event. Backoff is 2^attempt
+        // seconds capped at RECONNECT_BACKOFF_CAP.
+        let mut reconnect_attempt: u32 = 0;
 
         while !should_stop() {
+            // M13 reconnect: if we're sessionless, sleep with backoff +
+            // attempt bootstrap. Done at loop top so both first-fail
+            // and bootstrap-fail paths share the same retry mechanism.
+            if map_opt.is_none() {
+                let delay = reconnect_backoff(reconnect_attempt);
+                info!(
+                    delay_secs = delay.as_secs(),
+                    attempt = reconnect_attempt,
+                    "control.reconnect.backoff"
+                );
+                if cooperative_sleep(delay, &mut should_stop) {
+                    break;
+                }
+                // Re-derive local endpoints — LAN IP could have changed
+                // during the outage (Vita roamed WiFi).
+                let magic_local = self.magic_ctl.local_addr();
+                let local_eps = build_local_endpoints(&self.config.control_url, magic_local);
+                let local_ep_types: Vec<u8> = vec![1u8; local_eps.len()];
+                match bootstrap_control_session(
+                    &self.config,
+                    &self.ks,
+                    &self.host_authority,
+                    local_eps,
+                    local_ep_types,
+                    &self.state_dir,
+                    BootstrapPhase::Reconnect(reconnect_attempt + 1),
+                ) {
+                    Ok(m) => {
+                        info!(attempt = reconnect_attempt + 1, "control.reconnect.ok");
+                        map_opt = Some(m);
+                        reconnect_attempt = 0;
+                        // Fresh session needs a fresh NetInfo write so
+                        // the server re-commits DiscoKey state.
+                        sent_netinfo_once = false;
+                    }
+                    Err(e) => {
+                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                        warn!(
+                            error = %e,
+                            attempt = reconnect_attempt,
+                            "control.reconnect.failed"
+                        );
+                        continue; // backoff harder next iter
+                    }
+                }
+            }
+            let map = map_opt.as_mut().expect("map_opt populated above");
             let event = match map.next_event(Duration::from_secs(2)) {
                 Ok(e) => e,
                 Err(e) => {
                     control_errors += 1;
                     warn!(error = %e, "control.map.error");
                     self.lifecycle.lock().record_control_reconnect();
-                    // v1: continue the loop. M11+ adds real reconnect.
+                    // Drop the dead session; next loop iter handles
+                    // backoff + bootstrap. Setting attempt=0 so the
+                    // first reconnect is fast (1 s).
+                    map_opt = None;
+                    reconnect_attempt = 0;
                     continue;
                 }
             };
             let now = Instant::now();
+            // Any successful event clears the reconnect-attempt counter.
+            reconnect_attempt = 0;
 
             match event {
                 MapEvent::Snapshot(snap) => {
@@ -472,7 +490,7 @@ impl Runtime {
         }
 
         // Map drops here — terminating the long-poll cleanly.
-        drop(map);
+        drop(map_opt);
 
         Ok(RunStats {
             snapshots,
@@ -677,6 +695,151 @@ fn push_delta_to_engine(
     }
 }
 
+/// Cap on the reconnect backoff. Linux/macOS tailscaled uses ~1 min;
+/// matches our cadence (a stuck control plane recovers within this
+/// window in practice, and we'd rather waste a minute than hammer).
+const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(60);
+
+/// Compute the sleep delay before reconnect attempt `attempt` (0-indexed).
+///
+/// Returns `Duration::ZERO` when `attempt == 0` so the first reconnect
+/// after a healthy session is immediate — most control-plane errors
+/// are transient h2 frames that re-handshake successfully on the very
+/// next dial. Subsequent attempts double: 1 s, 2 s, 4 s, 8 s, 16 s,
+/// 32 s, 60 s (clamped).
+fn reconnect_backoff(attempt: u32) -> Duration {
+    if attempt == 0 {
+        return Duration::ZERO;
+    }
+    // 2^(attempt-1) seconds. Saturate `1 << shift` against overflow at
+    // attempt ≥ 64; capped to RECONNECT_BACKOFF_CAP either way.
+    let secs = 1u64.checked_shl(attempt - 1).unwrap_or(u64::MAX);
+    let d = Duration::from_secs(secs);
+    if d > RECONNECT_BACKOFF_CAP {
+        RECONNECT_BACKOFF_CAP
+    } else {
+        d
+    }
+}
+
+/// Sleep `delay`, polling `should_stop` every 250 ms so the demo can
+/// exit promptly during a long backoff. Returns `true` if we got
+/// stopped (caller should break out of the event loop).
+fn cooperative_sleep<F: FnMut() -> bool>(delay: Duration, should_stop: &mut F) -> bool {
+    let wake = Instant::now() + delay;
+    while Instant::now() < wake {
+        if should_stop() {
+            return true;
+        }
+        let remaining = wake.saturating_duration_since(Instant::now());
+        std::thread::sleep(remaining.min(Duration::from_millis(250)));
+    }
+    false
+}
+
+/// Which call-site is invoking `bootstrap_control_session`. Used only
+/// for log distinctness — the work performed is identical.
+#[derive(Clone, Copy, Debug)]
+enum BootstrapPhase {
+    /// First-time bootstrap from `Runtime::up`. Logs at INFO.
+    Initial,
+    /// Reconnect attempt N after a control-plane error. Logs include
+    /// the attempt number for grep-ability.
+    Reconnect(u32),
+}
+
+/// Fetch server key → Noise IK → HTTP/2 → register → open MapClient.
+///
+/// Idempotent w.r.t. our persistent state: KeyStore is reloaded from
+/// disk by the caller, register is re-sent (Tailscale's register is
+/// idempotent — same node_pub + auth_key reaches the same node row,
+/// and Ephemeral=true means re-registering a stale identity creates
+/// a new one without us caring). `last_seq` for delta-resume lives in
+/// `state_dir` and `MapClient::start` picks it up via the same path.
+///
+/// On reconnect, the magicsock + DERP + engine + netstack are all
+/// untouched — only the long-poll tunnel is rebuilt.
+fn bootstrap_control_session(
+    config: &Config,
+    ks: &KeyStore,
+    host_authority: &str,
+    local_endpoints: Vec<String>,
+    local_endpoint_types: Vec<u8>,
+    state_dir: &Path,
+    phase: BootstrapPhase,
+) -> Result<MapClient, RuntimeError> {
+    info!(?phase, "control.bootstrap.start");
+
+    // 1. Fetch server's Noise pubkey. Cheap (~50 ms typical); we
+    // intentionally re-fetch on every reconnect so a server-key
+    // rotation doesn't strand us on a stale key.
+    let server_pub = ts_control::fetch_server_key(&config.control_url, config.capver)?;
+    info!(server_pub = %server_pub, "control.key.received");
+
+    // 2. Noise IK handshake.
+    info!("starting Noise IK handshake");
+    let mut hs = ts_control::NoiseHandshaker::new(&ks.machine_priv, &server_pub)?;
+    let header_b64 = hs.build_init_header()?;
+    info!(b64_len = header_b64.len(), "control.noise.init.built");
+
+    let mut upgraded = ts_control::upgrade::dial_and_upgrade(&config.control_url, &header_b64)?;
+    info!(leftover = upgraded.leftover.len(), "control.upgrade.101");
+
+    let server_response = read_server_response(&mut upgraded)?;
+    let nt = hs.finalize(&server_response)?;
+    info!(
+        handshake_hash = %hex_short(&nt.handshake_hash),
+        "control.noise.handshake.complete"
+    );
+
+    let leftover = upgraded.leftover;
+    let mut noise_stream = NoiseStream::new(upgraded.tcp, nt, leftover);
+    consume_early_payload(&mut noise_stream)?;
+
+    // 3. HTTP/2 over the Noise tunnel.
+    let async_stream = AsyncNoiseStream::spawn(noise_stream);
+    info!("opening HTTP/2 over Noise");
+    let mut conn = Http2Conn::open(async_stream)?;
+    info!("control.http2.handshake.complete");
+
+    // 4. Register. Ephemeral=true is baked into ts_control::register so
+    // repeating this is safe — server either confirms the existing
+    // ephemeral node or attaches our identity to a fresh row.
+    let auth_key = config.auth_key.trim();
+    let backend_log_id = generate_backend_log_id();
+    info!(backend_log_id = %backend_log_id, "control.backend_log_id.generated");
+    let outcome = ts_control::register(
+        &mut conn,
+        auth_key,
+        &ks.node_pub,
+        &ks.nl_pub,
+        &backend_log_id,
+        &config.hostname,
+        host_authority,
+    )?;
+    info!(
+        machine_authorized = outcome.machine_authorized,
+        node_key_expired = outcome.node_key_expired,
+        "control.register.ok"
+    );
+
+    // 5. MapClient. Picks up `last_seq` from state_dir so a reconnect
+    // resumes the netmap delta instead of redownloading the world.
+    let map = MapClient::start(
+        conn,
+        ks.node_pub,
+        ks.disco_pub,
+        config.hostname.clone(),
+        backend_log_id,
+        host_authority.to_string(),
+        state_dir.to_path_buf(),
+        local_endpoints,
+        local_endpoint_types,
+    )?;
+    info!(?phase, "control.bootstrap.done");
+    Ok(map)
+}
+
 /// Maintain a `node_pub → DERP region` map from each MapResponse
 /// snapshot. Used by the Stage-4 CallMeMaybe dispatcher to know which
 /// region to relay through for a given peer. Mirrors the region
@@ -840,4 +1003,36 @@ fn build_local_endpoints(control_url: &str, magic_local: SocketAddr) -> Vec<Stri
         IpAddr::V6(v6) => format!("[{v6}]:{port}"),
     };
     vec![endpoint]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backoff_first_attempt_is_immediate() {
+        // Attempt 0 = "we just got a fresh error, retry now." Most h2
+        // hiccups recover on the very next dial; an immediate retry
+        // halves the user-visible outage for transient failures.
+        assert_eq!(reconnect_backoff(0), Duration::ZERO);
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_until_cap() {
+        assert_eq!(reconnect_backoff(1), Duration::from_secs(1));
+        assert_eq!(reconnect_backoff(2), Duration::from_secs(2));
+        assert_eq!(reconnect_backoff(3), Duration::from_secs(4));
+        assert_eq!(reconnect_backoff(4), Duration::from_secs(8));
+        assert_eq!(reconnect_backoff(5), Duration::from_secs(16));
+        assert_eq!(reconnect_backoff(6), Duration::from_secs(32));
+    }
+
+    #[test]
+    fn reconnect_backoff_clamps_at_cap() {
+        // 2^6 = 64s > 60s cap.
+        assert_eq!(reconnect_backoff(7), RECONNECT_BACKOFF_CAP);
+        assert_eq!(reconnect_backoff(20), RECONNECT_BACKOFF_CAP);
+        // Extreme attempt values shouldn't panic via integer overflow.
+        assert_eq!(reconnect_backoff(u32::MAX), RECONNECT_BACKOFF_CAP);
+    }
 }
