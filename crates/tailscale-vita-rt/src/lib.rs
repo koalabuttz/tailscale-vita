@@ -91,11 +91,16 @@ extern "C" {
     /// pthread + reent process-wide init. We call these from the
     /// bootstrap thread (NOT module_start) because module_start runs
     /// on a SCE module-loader thread that crashes inside pthread_init's
-    /// pte_osInit chain. From a regular SCE-spawned thread, the same
-    /// init succeeds (the thread can auto-allocate its TLS reent slot
-    /// via __getreent_for_thread's lazy allocation path).
+    /// pte_osInit chain.
+    ///
+    /// 2026-05-12 finding (M15-A): the SCE-spawned bootstrap thread
+    /// ALSO crashes inside pthread_init unless _init_vita_reent runs
+    /// in THIS thread first. TLS slot 0x89 (the reent slot read by
+    /// vitasdk_get_pthread_data) is per-thread; module_start's
+    /// _init_vita_reent only set up the loader thread's slot.
     fn pthread_init() -> c_int;
     fn __sinit(reent: *mut c_void);
+    fn _init_vita_reent();
     static mut _impure_ptr: *mut c_void;
 }
 
@@ -181,6 +186,15 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// thread-spawn case; here we extend the pattern to vita-log).
 unsafe extern "C" fn bootstrap_main(_args: u32, _argp: *mut c_void) -> i32 {
     trace("rb1: bootstrap thread entry");
+
+    // M15-A fix: _init_vita_reent populates this thread's TLS slot
+    // 0x89 with a reent pointer. Without it, pthread_init crashes
+    // inside vitasdk_get_pthread_data when it reads the slot from
+    // the freshly-spawned bootstrap thread. (module_start's call
+    // to _init_vita_reent only set up the loader thread's slot.)
+    trace("rb1.1: pre-_init_vita_reent (bootstrap thread)");
+    unsafe { _init_vita_reent() };
+    trace("rb1.2: _init_vita_reent returned");
 
     // Init pthread + stdio reentrancy from THIS thread (not from
     // module_start, where pthread_init crashes inside pte_osInit's

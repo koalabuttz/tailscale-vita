@@ -1,0 +1,16 @@
+# tailscale-vita-plugin — taiHEN config fragment
+#
+# Copy this stanza into ux0:/tai/config.txt (append after any existing
+# *KERNEL / *main sections). The plugin loads ONLY when the demo app
+# (TVIT00010) launches — staging here intentionally instead of *main
+# so a plugin crash during bringup tears down the demo, not SceShell.
+# (Memory note m11_suprx_loader_findings: SceShell brick risk is the
+# reason the earlier plugin attempt was pulled. *<TITLEID> staging
+# avoids it.)
+#
+# After editing config.txt, reboot the Vita (taiHEN re-reads config
+# at boot). For subsequent .suprx updates, FTP-replace the file in
+# ux0:/tai/ and reboot — taiHEN doesn't hot-reload.
+
+*TVIT00010
+ux0:tai/tailscale-vita-plugin.suprx
