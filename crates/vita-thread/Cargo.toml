@@ -1,0 +1,12 @@
+[package]
+name = "vita-thread"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# vita-thread is intentionally zero-dep: it's a thin shim between the
+# eboot's std::thread backend and the SUPRX's SCE-primitives backend.
+# Pulling in deps would risk transitive std::thread::spawn usage that
+# would defeat the purpose (see docs/SUPRX-PTHREAD-INVESTIGATION.md).
+[dependencies]

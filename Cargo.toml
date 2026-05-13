@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/vita-thread",
     "crates/vita-log",
     "crates/wg-engine",
     "crates/netstack",
