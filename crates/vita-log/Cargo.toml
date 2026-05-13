@@ -12,3 +12,4 @@ crossbeam-channel  = { workspace = true }
 parking_lot        = { workspace = true }
 time               = { workspace = true }
 thiserror          = { workspace = true }
+vita-thread        = { path = "../vita-thread" }

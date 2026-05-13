@@ -13,6 +13,7 @@ ts-disco     = { path = "../ts-disco" }
 ts-magicsock = { path = "../ts-magicsock" }
 wg-engine    = { path = "../wg-engine" }
 netstack     = { path = "../netstack" }
+vita-thread  = { path = "../vita-thread" }
 
 # DualTransport's RX side waits on the non-Disco channel from MagicSocket.
 crossbeam-channel = { workspace = true }

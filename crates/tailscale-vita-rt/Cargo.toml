@@ -17,6 +17,7 @@ crate-type  = ["staticlib"]
 tailscale-vita = { path = "../tailscale-vita" }
 vita-log       = { path = "../vita-log" }
 netstack       = { path = "../netstack" }
+vita-thread    = { path = "../vita-thread" }
 
 # Workspace deps for the runtime body + worker thread.
 crossbeam-channel = { workspace = true }

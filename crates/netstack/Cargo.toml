@@ -11,3 +11,4 @@ parking_lot       = { workspace = true }
 tracing           = { workspace = true }
 thiserror         = { workspace = true }
 wg-engine         = { path = "../wg-engine" }
+vita-thread       = { path = "../vita-thread" }

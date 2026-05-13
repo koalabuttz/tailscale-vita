@@ -1049,6 +1049,7 @@ dependencies = [
  "smoltcp",
  "thiserror 1.0.69",
  "tracing",
+ "vita-thread",
  "wg-engine",
 ]
 
@@ -1643,6 +1644,7 @@ dependencies = [
  "ts-derp",
  "ts-disco",
  "ts-magicsock",
+ "vita-thread",
  "wg-engine",
  "x25519-dalek",
 ]
@@ -1667,6 +1669,7 @@ dependencies = [
  "tailscale-vita",
  "tracing",
  "vita-log",
+ "vita-thread",
 ]
 
 [[package]]
@@ -1925,6 +1928,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "vita-thread",
  "webpki-roots",
  "x25519-dalek",
 ]
@@ -1945,6 +1949,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tracing",
+ "vita-thread",
  "webpki-roots",
  "wg-engine",
  "x25519-dalek",
@@ -1975,6 +1980,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "ts-disco",
+ "vita-thread",
  "wg-engine",
  "zerocopy",
 ]
@@ -2084,7 +2090,12 @@ dependencies = [
  "time",
  "tracing",
  "tracing-subscriber",
+ "vita-thread",
 ]
+
+[[package]]
+name = "vita-thread"
+version = "0.1.0"
 
 [[package]]
 name = "walkdir"
@@ -2189,6 +2200,7 @@ dependencies = [
  "thiserror 1.0.69",
  "toml",
  "tracing",
+ "vita-thread",
  "x25519-dalek",
 ]
 

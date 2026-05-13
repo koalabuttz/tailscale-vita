@@ -72,8 +72,8 @@ pub fn init_with_config(cfg: LogConfig) -> Result<(), LogError> {
 
     let writer_path = std::path::PathBuf::from(&cfg.path);
     let writer_cfg = cfg.clone();
-    std::thread::Builder::new()
-        .name("vita-log".into())
+    vita_thread::Builder::new()
+        .name("vita-log")
         .stack_size(256 * 1024)
         .spawn(move || writer::run(rx, writer_path, writer_cfg))
         .map_err(LogError::Open)?;

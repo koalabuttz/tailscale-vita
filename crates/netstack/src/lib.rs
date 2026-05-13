@@ -20,7 +20,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::JoinHandle;
+use vita_thread::JoinHandle;
 use std::time::Instant as StdInstant;
 
 use parking_lot::{Condvar, Mutex};
@@ -88,7 +88,7 @@ pub struct StackInner {
 /// the shared state.
 pub struct Stack {
     inner: Arc<StackInner>,
-    poll_join: Option<JoinHandle<()>>,
+    poll_join: Option<JoinHandle>,
     /// Holds the wg-engine alive for the lifetime of the Stack.
     _engine: Option<wg_engine::EngineRunning>,
 }
@@ -121,8 +121,8 @@ impl Stack {
         });
 
         let inner_for_thread = Arc::clone(&inner);
-        let join = std::thread::Builder::new()
-            .name("netstack-poll".into())
+        let join = vita_thread::Builder::new()
+            .name("netstack-poll")
             .stack_size(256 * 1024)
             .spawn(move || poll::run(inner_for_thread, device))
             .map_err(NetstackError::Io)?;

@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use std::thread::JoinHandle;
+use vita_thread::JoinHandle;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -86,7 +86,7 @@ pub struct AsyncNoiseStream {
     pub(crate) core: Arc<IoCore>,
     /// Pump-thread join handle. Held by the parent of `AsyncNoiseStream`
     /// (typically the `Http2Conn`) so it can be joined on shutdown.
-    pub(crate) pump_join: Option<JoinHandle<()>>,
+    pub(crate) pump_join: Option<JoinHandle>,
 }
 
 impl AsyncNoiseStream {
@@ -101,8 +101,8 @@ impl AsyncNoiseStream {
             err: Mutex::new(None),
         });
         let core_for_thread = Arc::clone(&core);
-        let pump_join = std::thread::Builder::new()
-            .name("noise-pump".into())
+        let pump_join = vita_thread::Builder::new()
+            .name("noise-pump")
             .stack_size(256 * 1024)
             .spawn(move || pump(core_for_thread))
             .expect("spawn noise-pump thread");

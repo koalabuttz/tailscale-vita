@@ -21,7 +21,7 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread::{self, JoinHandle};
+use vita_thread::{self as thread, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -724,7 +724,7 @@ fn decompress_zstd_frame(input: &[u8]) -> Result<Vec<u8>, ControlError> {
 struct GzipWorker {
     compressed_tx: Option<Sender<Vec<u8>>>,
     decompressed_rx: Receiver<Result<Vec<u8>, String>>,
-    join: Option<JoinHandle<()>>,
+    join: Option<JoinHandle>,
 }
 
 impl GzipWorker {
@@ -732,7 +732,7 @@ impl GzipWorker {
         let (compressed_tx, compressed_rx) = mpsc::channel::<Vec<u8>>();
         let (decompressed_tx, decompressed_rx) = mpsc::channel::<Result<Vec<u8>, String>>();
         let join = thread::Builder::new()
-            .name("ts-gz".into())
+            .name("ts-gz")
             .stack_size(256 * 1024)
             .spawn(move || run_gzip_worker(compressed_rx, decompressed_tx))
             .expect("spawn ts-gz worker");

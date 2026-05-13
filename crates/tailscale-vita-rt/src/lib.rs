@@ -87,22 +87,13 @@ unsafe extern "C" fn pthread_smoke_target(_arg: *mut c_void) -> *mut c_void {
     ptr::null_mut()
 }
 
-extern "C" {
-    /// pthread + reent process-wide init. We call these from the
-    /// bootstrap thread (NOT module_start) because module_start runs
-    /// on a SCE module-loader thread that crashes inside pthread_init's
-    /// pte_osInit chain.
-    ///
-    /// 2026-05-12 finding (M15-A): the SCE-spawned bootstrap thread
-    /// ALSO crashes inside pthread_init unless _init_vita_reent runs
-    /// in THIS thread first. TLS slot 0x89 (the reent slot read by
-    /// vitasdk_get_pthread_data) is per-thread; module_start's
-    /// _init_vita_reent only set up the loader thread's slot.
-    fn pthread_init() -> c_int;
-    fn __sinit(reent: *mut c_void);
-    fn _init_vita_reent();
-    static mut _impure_ptr: *mut c_void;
-}
+// M15-A2: pthread_init/_init_vita_reent extern decls deleted —
+// the SUPRX no longer calls into libc-pthread at all. See
+// docs/SUPRX-PTHREAD-INVESTIGATION.md for why. Thread spawning is
+// now routed through the `vita-thread` crate (sceKernelCreateThread
+// directly). libpthread is still linked to satisfy compile-time
+// symbol resolution for std::thread types appearing in compiled
+// Rust code, but no runtime path enters it.
 
 const SCE_O_WRONLY: i32 = 0x0002;
 const SCE_O_CREAT: i32 = 0x0200;
@@ -187,28 +178,16 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 unsafe extern "C" fn bootstrap_main(_args: u32, _argp: *mut c_void) -> i32 {
     trace("rb1: bootstrap thread entry");
 
-    // M15-A fix: _init_vita_reent populates this thread's TLS slot
-    // 0x89 with a reent pointer. Without it, pthread_init crashes
-    // inside vitasdk_get_pthread_data when it reads the slot from
-    // the freshly-spawned bootstrap thread. (module_start's call
-    // to _init_vita_reent only set up the loader thread's slot.)
-    trace("rb1.1: pre-_init_vita_reent (bootstrap thread)");
-    unsafe { _init_vita_reent() };
-    trace("rb1.2: _init_vita_reent returned");
+    // M15-A2: pthread_init() is NOT called from the SUPRX anymore.
+    // The investigation (docs/SUPRX-PTHREAD-INVESTIGATION.md) found
+    // that the SUPRX's libpthread state conflicts with the eboot's
+    // copy. We avoid the entire conflict by routing every thread
+    // spawn through `vita_thread`, which uses sceKernelCreateThread
+    // directly. vita_log + all 11 spawn sites in the workspace use
+    // it; pthread is linked but never called.
 
-    // Init pthread + stdio reentrancy from THIS thread (not from
-    // module_start, where pthread_init crashes inside pte_osInit's
-    // SCE-syscall chain). __getreent_for_thread will auto-allocate
-    // our TLS reent slot on first use.
-    let pt_rc = unsafe { pthread_init() };
-    trace(&format!("rb1.5: pthread_init -> {}", pt_rc));
-    // SAFETY: _impure_ptr is a libc global, valid after _init_vita_reent.
-    unsafe { __sinit(_impure_ptr) };
-    trace("rb1.6: __sinit(_impure_ptr) returned");
-
-    // Initialise vita-log first (spawns its own writer thread via
-    // std::thread::spawn — relies on pthread being functional, which
-    // requires the calls above to have set things up).
+    // Initialise vita-log (spawns its writer thread via vita_thread,
+    // which is SCE-primitive-backed on Vita target).
     match vita_log::init() {
         Ok(_) => trace("rb2: vita_log::init Ok"),
         Err(LogError::AlreadyInitialized) => trace("rb2: vita_log::init AlreadyInitialized"),
@@ -363,8 +342,8 @@ fn run_runtime() {
     // demo. The worker owns `runtime` (so it can call `shutdown()` on
     // exit); the bootstrap thread runs the accept loop.
     let (stop_tx, stop_rx) = bounded::<()>(1);
-    let worker = std::thread::Builder::new()
-        .name("ts-vita-rt-event".into())
+    let worker = vita_thread::Builder::new()
+        .name("ts-vita-rt-event")
         .stack_size(256 * 1024)
         .spawn(move || {
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(move || {

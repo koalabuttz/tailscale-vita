@@ -20,7 +20,7 @@
 use std::io::{ErrorKind, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use vita_thread::{self as thread, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -69,7 +69,7 @@ pub struct DerpConn {
     /// sent at least once).
     is_home: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    join: Option<JoinHandle>,
 }
 
 impl DerpConn {

@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use vita_thread::{self as thread, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -227,8 +227,8 @@ pub struct MagicSocketCtl {
 /// Spawned worker side. Drop joins the receive thread(s) — both v4
 /// and v6 if both are bound.
 pub struct MagicSocket {
-    worker_v4: Option<JoinHandle<()>>,
-    worker_v6: Option<JoinHandle<()>>,
+    worker_v4: Option<JoinHandle>,
+    worker_v6: Option<JoinHandle>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -306,7 +306,7 @@ impl MagicSocket {
         let v4_send_v4 = Arc::clone(&socket_v4);
         let v4_send_v6 = socket_v6.as_ref().map(Arc::clone);
         let worker_v4 = thread::Builder::new()
-            .name("ts-magicsock-v4".into())
+            .name("ts-magicsock-v4")
             .stack_size(256 * 1024)
             .spawn(move || {
                 let our_node_pub = our_node_pub;
@@ -333,7 +333,7 @@ impl MagicSocket {
             let v6_send_v4 = Arc::clone(&socket_v4);
             let v6_send_v6 = Some(Arc::clone(&sock));
             let h = thread::Builder::new()
-                .name("ts-magicsock-v6".into())
+                .name("ts-magicsock-v6")
                 .stack_size(256 * 1024)
                 .spawn(move || {
                     let our_node_pub = our_node_pub;

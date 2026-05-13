@@ -15,7 +15,7 @@
 use std::net::TcpStream;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
-use std::thread;
+use vita_thread as thread;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;

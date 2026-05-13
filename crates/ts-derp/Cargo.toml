@@ -32,3 +32,6 @@ crossbeam-channel = { workspace = true }
 # Logging + errors
 tracing = { workspace = true }
 thiserror = { workspace = true }
+
+# M15-A2: SUPRX-safe thread spawn (sceKernelCreateThread on Vita).
+vita-thread = { path = "../vita-thread" }

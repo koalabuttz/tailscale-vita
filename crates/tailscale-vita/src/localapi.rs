@@ -17,7 +17,7 @@ mod router;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use vita_thread::{self as thread, JoinHandle};
 use std::time::Duration;
 
 use parking_lot::RwLock;
@@ -39,7 +39,7 @@ const ACCEPT_TICK: Duration = Duration::from_millis(500);
 
 /// Drop-on-shutdown handle for the LocalAPI thread.
 pub struct LocalApiServer {
-    worker: Option<JoinHandle<()>>,
+    worker: Option<JoinHandle>,
     shutdown: Arc<AtomicBool>,
     bound_addr: SocketAddr,
 }
@@ -90,7 +90,7 @@ impl LocalApiServer {
             .unwrap_or_else(|e| warn!(error = %e, "localapi.listener.set_nonblocking_failed"));
 
         let worker = match thread::Builder::new()
-            .name("ts-localapi".into())
+            .name("ts-localapi")
             .stack_size(128 * 1024)
             .spawn(move || accept_loop(listener, worker_shutdown, ctx))
         {

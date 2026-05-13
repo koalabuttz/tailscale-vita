@@ -10,7 +10,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::thread::JoinHandle;
+use vita_thread::JoinHandle;
 
 use arc_swap::ArcSwap;
 use boringtun::noise::Tunn;
@@ -170,8 +170,8 @@ impl Engine {
             let rx_notify = Arc::clone(&rx_notify);
             let shutdown = Arc::clone(&shutdown);
             let hint = direct_path_hint.clone();
-            std::thread::Builder::new()
-                .name("wg_engine".into())
+            vita_thread::Builder::new()
+                .name("wg_engine")
                 .stack_size(256 * 1024)
                 .spawn(move || {
                     pump::run(
@@ -212,7 +212,7 @@ pub struct EngineRunning {
     /// Wakes whenever `tun_rx` gets a new packet. M3 smoltcp wakeup hook.
     pub rx_notify: Arc<(Mutex<bool>, Condvar)>,
     shutdown: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    join: Option<JoinHandle>,
 }
 
 impl EngineRunning {
