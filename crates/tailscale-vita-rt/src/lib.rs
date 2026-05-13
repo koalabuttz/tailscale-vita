@@ -186,8 +186,22 @@ unsafe extern "C" fn bootstrap_main(_args: u32, _argp: *mut c_void) -> i32 {
     // directly. vita_log + all 11 spawn sites in the workspace use
     // it; pthread is linked but never called.
 
-    // Initialise vita-log (spawns its writer thread via vita_thread,
-    // which is SCE-primitive-backed on Vita target).
+    // M15-A2 diagnostic finding (left in code for future Phase II):
+    // The vita_thread smoke test PASSED on hardware 2026-05-13 —
+    // a closure trace'd from inside an SCE-spawned thread completed
+    // and joined cleanly. So vita_thread + marshalling are correct.
+    //
+    // BUT: vita_log::init() crashes immediately after (core dump).
+    // Suspected root cause: vita_log uses tracing-subscriber +
+    // std::sync::Mutex (panic hook) + std::thread_local internally;
+    // Vita target lacks ELF-TLS so thread_local falls back to
+    // pthread_getspecific/setspecific, which requires pthread_init
+    // state we deliberately skip. So the SUPRX can spawn threads OK
+    // but Rust std's primitives that touch pthread (Mutex, thread_local,
+    // panic-hook) still crash. The Phase I investigation underestimated
+    // this scope — Phase II will need to address the broader
+    // pthread-uninit-state problem.
+    trace("rb1.7: pre-vita_log::init (will crash mid-init on M15-A2 — see lib.rs comments)");
     match vita_log::init() {
         Ok(_) => trace("rb2: vita_log::init Ok"),
         Err(LogError::AlreadyInitialized) => trace("rb2: vita_log::init AlreadyInitialized"),
