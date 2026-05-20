@@ -15,7 +15,7 @@ use crate::error::ConfigError;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
-    /// Headscale URL — e.g. "http://192.168.8.147:8080" for the dev
+    /// Headscale URL — e.g. "http://192.168.x.x:8080" for a LAN dev
     /// Headscale, or "https://controlplane.tailscale.com" for prod.
     pub control_url: String,
 
@@ -123,7 +123,7 @@ const TEMPLATE: &str = r#"# tailscale-vita demo config
 # Edit this file in place after the demo writes the template. Required
 # fields: `control_url` and `auth_key`. Everything else has defaults.
 
-control_url = "http://192.168.8.147:8080"
+control_url = "http://HEADSCALE_HOST_IP:8080"
 
 # Bare hex on Headscale 0.26. Generate via:
 #   docker exec tailscale-vita-headscale headscale preauthkeys create \
@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn template_round_trip() {
         let cfg: Config = toml::from_str(TEMPLATE).unwrap();
-        assert_eq!(cfg.control_url, "http://192.168.8.147:8080");
+        assert_eq!(cfg.control_url, "http://HEADSCALE_HOST_IP:8080");
         assert_eq!(cfg.auth_key, "");
         assert_eq!(cfg.hostname, "vita");
         assert_eq!(cfg.demo_port, 8080);
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn host_authority_strips_scheme() {
         let cfg = Config {
-            control_url: "http://192.168.8.147:8080/".into(),
+            control_url: "http://192.0.2.1:8080/".into(),
             auth_key: String::new(),
             hostname: "v".into(),
             log_level: "info".into(),
@@ -217,7 +217,7 @@ mod tests {
             suprx_host_only: false,
             localapi_port: Some(crate::localapi::DEFAULT_PORT),
         };
-        assert_eq!(cfg.host_authority(), "192.168.8.147:8080");
+        assert_eq!(cfg.host_authority(), "192.0.2.1:8080");
     }
 
     #[test]

@@ -1528,7 +1528,7 @@ fn build_local_endpoints(control_url: &str, magic_local: SocketAddr) -> Vec<Stri
     };
     let host = host.split('/').next().unwrap_or(host);
     let host_port = if host.contains(':') {
-        // Already has explicit port (e.g. Headscale on `192.168.8.147:8080`).
+        // Already has explicit port (e.g. Headscale on `<host>:8080`).
         host.to_string()
     } else {
         format!("{host}:{default_port}")

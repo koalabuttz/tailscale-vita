@@ -10,6 +10,12 @@ develop against this and we get full visibility into every wire byte
 
 ```bash
 cd infra/headscale
+
+# First time only: create your local config from the template and
+# edit `server_url:` to point at the dev host's LAN IP (or hostname).
+cp config/config.yaml.example config/config.yaml
+$EDITOR config/config.yaml
+
 docker compose up -d
 docker compose logs -f headscale     # tail logs
 
@@ -42,9 +48,11 @@ Vita-client development.
 ## Files
 
 - `docker-compose.yml` — the Headscale container.
-- `config/config.yaml` — Headscale config (taken from the upstream
-  example with `server_url` adjusted for local dev). Edit `server_url`
-  to match your LAN IP/hostname so the Vita can reach it.
+- `config/config.yaml.example` — Headscale config template (upstream
+  example with placeholders for local dev). Copy to `config/config.yaml`
+  and edit `server_url` to match your LAN IP/hostname so the Vita can
+  reach it. The live `config/config.yaml` is `.gitignore`d so your
+  network details stay out of the repo.
 - `lib/` — Headscale's persistent state (SQLite DB + node keys).
   Created automatically on first run; `.gitignore`d.
 

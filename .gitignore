@@ -8,8 +8,25 @@ target/
 *.elf
 *.sfo
 
+# Vita crash dumps (collected during M11/M15 SUPRX work)
+*.psp2dmp
+psp2core-*
+
+# On-device runtime state — should only live on the Vita at
+# ux0:/data/tailscale-vita/, never in the repo. Belt-and-suspenders
+# in case a sync script ever pulls from there.
+auth-key*.txt
+*.priv
+server-key.bin
+session_handle
+last_seq
+
 # Local dev state
 .idea/
 .vscode/
 .claude/
 *.log
+
+# OS detritus
+.DS_Store
+Thumbs.db

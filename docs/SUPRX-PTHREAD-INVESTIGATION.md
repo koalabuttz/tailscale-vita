@@ -17,7 +17,7 @@ This document is the writeup of investigation phases I1 + I2 from the approved p
 - `ftpeverywhere` (Vita FTP server, SUPRX): builds with `-nostdlib`, uses `sceKernelCreateThread` directly. No pthread.
 - `vitacompanion` (FTP + cmd shell daemon, SUPRX loaded under `*main`): zero pthread references. Uses SCE primitives.
 - 5 .suprx files pulled from the live Vita at `ur0:/tai/` (vitacompanion, pngshot, shellbat, psp2shell_m, henkaku): zero pthread references in `strings` output of any.
-- `tailscale-rs/` (in `/home/david/projects/refs/`) — Rust reference impl — uses pthread in `examples/` only; never deployed to Vita.
+- `tailscale-rs/` (cloned locally as a reference impl) — uses pthread in `examples/` only; never deployed to Vita.
 - Web search "vita taihen suprx Rust std::thread nostartfiles" returns zero results. We are pioneering this combination.
 
 **Implication:** the established pattern for SUPRX threading is "use SCE primitives, link `-nostdlib`." Every working precedent sidesteps libc-pthread entirely.

@@ -1,2 +1,6 @@
 # Headscale persistent state — node keys, SQLite DB, etc.
 lib/
+
+# Live config (copy from config.yaml.example and edit server_url).
+# Tracked file is the .example template; the live one stays local.
+config/config.yaml

@@ -10,7 +10,10 @@
 #
 # https://myheadscale.example.com:443
 #
-server_url: http://192.168.8.147:8080
+# For local development, set this to http://<dev-host LAN IP>:8080
+# so the Vita on Wi-Fi can reach Headscale on your host. The Vita's
+# `config.toml` must use the SAME URL (TS2021 pins it).
+server_url: http://HEADSCALE_HOST_IP:8080
 
 # Address to listen to / bind to on the server
 #

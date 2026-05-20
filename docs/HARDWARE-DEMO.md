@@ -24,17 +24,18 @@ package this into a redistributable demo eboot.
 ## Variables
 
 ```bash
-export VITASDK=/home/david/vitasdk
-export PATH=$VITASDK/bin:$PATH
+export VITASDK="$HOME/vitasdk"   # or wherever the VitaSDK is installed
+export PATH="$VITASDK/bin:$PATH"
 
-VITA_IP=192.168.8.107            # your Vita's WiFi IP
-HEADSCALE_HOST_IP=192.168.8.147  # the dev host's LAN IP
+VITA_IP=192.168.x.x              # your Vita's WiFi IP
+HEADSCALE_HOST_IP=192.168.x.x    # the dev host's LAN IP
 ```
 
-Update both `crates/tailscale-vita-demo/src/main.rs`'s `HEADSCALE_URL`
-constant **and** `infra/headscale/config/config.yaml`'s `server_url`
+Update both the Vita's `config.toml` (`ux0:/data/tailscale-vita/config.toml`)
+`control_url` **and** `infra/headscale/config/config.yaml`'s `server_url`
 when these change. They must agree (Tailscale's TS2021 protocol pins
-the server's URL).
+the server's URL). The first run on the Vita writes a template
+`config.toml` you can then edit over FTP.
 
 ## 1. Bring up Headscale
 

@@ -474,7 +474,7 @@ mod tests {
         let mut nm = NetMap::default();
         let mut n = node(1, 0x11, "100.64.0.2");
         n.endpoints = vec![
-            "192.168.8.147:41641".into(),
+            "192.0.2.1:41641".into(),
             "[2001:db8::1]:41641".into(),
             "garbage".into(), // dropped silently
         ];
@@ -486,7 +486,7 @@ mod tests {
         assert_eq!(p.endpoints.len(), 2);
         assert_eq!(
             p.endpoints[0],
-            "192.168.8.147:41641".parse::<SocketAddr>().unwrap()
+            "192.0.2.1:41641".parse::<SocketAddr>().unwrap()
         );
     }
 
