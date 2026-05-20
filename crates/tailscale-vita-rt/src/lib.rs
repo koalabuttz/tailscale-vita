@@ -178,30 +178,21 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 unsafe extern "C" fn bootstrap_main(_args: u32, _argp: *mut c_void) -> i32 {
     trace("rb1: bootstrap thread entry");
 
-    // M15-A2: pthread_init() is NOT called from the SUPRX anymore.
-    // The investigation (docs/SUPRX-PTHREAD-INVESTIGATION.md) found
-    // that the SUPRX's libpthread state conflicts with the eboot's
-    // copy. We avoid the entire conflict by routing every thread
-    // spawn through `vita_thread`, which uses sceKernelCreateThread
-    // directly. vita_log + all 11 spawn sites in the workspace use
-    // it; pthread is linked but never called.
-
-    // M15-A2 diagnostic finding (left in code for future Phase II):
-    // The vita_thread smoke test PASSED on hardware 2026-05-13 —
-    // a closure trace'd from inside an SCE-spawned thread completed
-    // and joined cleanly. So vita_thread + marshalling are correct.
+    // M15-A3 S1 vertical slice: this is the minimum-viable smoke test
+    // for the SUPRX-safe Rust runtime architecture. The plan:
+    // 1. Call new vita_log::init() (uses vita_sync::Mutex + vita_thread —
+    //    no pthread, no tracing-subscriber).
+    // 2. Emit a single vita_log::info!() line.
+    // 3. Call vita_log::flush() to let the writer thread drain.
+    // 4. Exit. NOT calling run_runtime yet — that path still has
+    //    295 tracing macro call sites that crash in SUPRX (S5 will
+    //    migrate them).
     //
-    // BUT: vita_log::init() crashes immediately after (core dump).
-    // Suspected root cause: vita_log uses tracing-subscriber +
-    // std::sync::Mutex (panic hook) + std::thread_local internally;
-    // Vita target lacks ELF-TLS so thread_local falls back to
-    // pthread_getspecific/setspecific, which requires pthread_init
-    // state we deliberately skip. So the SUPRX can spawn threads OK
-    // but Rust std's primitives that touch pthread (Mutex, thread_local,
-    // panic-hook) still crash. The Phase I investigation underestimated
-    // this scope — Phase II will need to address the broader
-    // pthread-uninit-state problem.
-    trace("rb1.7: pre-vita_log::init (will crash mid-init on M15-A2 — see lib.rs comments)");
+    // If "hello from SUPRX" appears in log.txt: vita_sync::Mutex
+    // works, vita_log writer thread works, the macro pattern is
+    // sound. Then we proceed to S2-S7.
+
+    trace("rb1.7: pre-vita_log::init (M15-A3 S1)");
     match vita_log::init() {
         Ok(_) => trace("rb2: vita_log::init Ok"),
         Err(LogError::AlreadyInitialized) => trace("rb2: vita_log::init AlreadyInitialized"),
@@ -212,7 +203,6 @@ unsafe extern "C" fn bootstrap_main(_args: u32, _argp: *mut c_void) -> i32 {
                 io.kind(),
                 code
             ));
-            // SAFETY: extern C call to exit cleanly.
             unsafe { sceKernelExitDeleteThread(0) };
         }
         Err(e) => {
@@ -221,15 +211,17 @@ unsafe extern "C" fn bootstrap_main(_args: u32, _argp: *mut c_void) -> i32 {
         }
     }
 
-    info!("ts-vita-rt: bootstrap thread alive");
+    trace("rb3: pre-info! macro emit");
+    vita_log::info!("hello from SUPRX — M15-A3 S1 vertical slice succeeded");
+    vita_log::info!(thread_id = "bootstrap", "second info! with field syntax");
+    trace("rb4: info! macro emits returned");
 
-    let outcome = std::panic::catch_unwind(AssertUnwindSafe(run_runtime));
-    if outcome.is_err() {
-        trace("rb-panic: run_runtime panicked");
-        error!("ts-vita-rt: bootstrap thread panicked; runtime exited");
-    } else {
-        trace("rb-end: run_runtime returned");
-    }
+    // Give the writer thread time to drain + write.
+    vita_log::flush();
+    trace("rb5: flush returned");
+
+    // S1 stops here. S7 will replace this with run_runtime().
+    trace("rb-end: S1 smoke test complete; exiting bootstrap");
 
     // SAFETY: extern C call to exit cleanly.
     unsafe { sceKernelExitDeleteThread(0) }

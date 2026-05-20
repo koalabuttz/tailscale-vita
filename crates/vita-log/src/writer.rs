@@ -1,75 +1,55 @@
+//! Writer thread: drains the global queue, writes lines to the log
+//! file, handles rotation. Spawned via `vita_thread::Builder` so
+//! it uses an SCE thread on Vita target (no pthread).
+
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, TrySendError};
-use tracing_subscriber::fmt::MakeWriter;
+use crate::{LogConfig, LOGS_DROPPED, QUEUE};
 
-use crate::{LogConfig, LOGS_DROPPED};
+/// Writer poll cadence. The queue is mutex-protected (no condvar in
+/// S1), so we poll. 20 ms is fine for log throughput.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-pub(crate) struct ChannelWriter {
-    tx: Sender<Vec<u8>>,
-}
+pub(crate) fn run(cfg: LogConfig) {
+    let path = PathBuf::from(&cfg.path);
+    let mut state = match WriterState::open(path, cfg) {
+        Some(s) => s,
+        None => return,
+    };
 
-impl Write for ChannelWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.tx.try_send(buf.to_vec()) {
-            Ok(()) => Ok(buf.len()),
-            Err(TrySendError::Full(_)) => {
-                LOGS_DROPPED.fetch_add(1, Ordering::Relaxed);
-                Ok(buf.len())
+    loop {
+        // Drain queue under one lock.
+        let drained: Vec<String> = {
+            let queue = match QUEUE.get() {
+                Some(q) => q,
+                None => return,
+            };
+            let mut q = queue.lock();
+            if q.is_empty() {
+                Vec::new()
+            } else {
+                q.drain(..).collect()
             }
-            Err(TrySendError::Disconnected(_)) => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "vita-log writer thread is gone",
-            )),
+        };
+
+        if drained.is_empty() {
+            vita_thread::sleep(POLL_INTERVAL);
+            continue;
         }
-    }
 
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct ChannelMakeWriter {
-    tx: Sender<Vec<u8>>,
-}
-
-impl ChannelMakeWriter {
-    pub fn new(tx: Sender<Vec<u8>>) -> Self {
-        Self { tx }
-    }
-}
-
-impl<'a> MakeWriter<'a> for ChannelMakeWriter {
-    type Writer = ChannelWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        ChannelWriter {
-            tx: self.tx.clone(),
-        }
-    }
-}
-
-pub(crate) fn run(rx: Receiver<Vec<u8>>, path: PathBuf, cfg: LogConfig) {
-    let mut state = WriterState::open(path, cfg);
-    while let Ok(chunk) = rx.recv() {
-        state.write_chunk(&chunk);
-        while let Ok(more) = rx.try_recv() {
-            state.write_chunk(&more);
+        for line in drained {
+            state.write_line(&line);
         }
         let _ = state.file.flush();
 
         let dropped = LOGS_DROPPED.swap(0, Ordering::Relaxed);
         if dropped > 0 {
-            let line = format!(
-                "{} WARN  vita_log dropped log events count={}\n",
-                now_iso8601(),
-                dropped,
-            );
-            state.write_chunk(line.as_bytes());
+            let line = format!("vita_log: dropped {} events\n", dropped);
+            state.write_line(&line);
             let _ = state.file.flush();
         }
     }
@@ -83,36 +63,33 @@ struct WriterState {
 }
 
 impl WriterState {
-    fn open(path: PathBuf, cfg: LogConfig) -> Self {
-        // Truncate on init: each run gets a fresh log. M1's accumulating-
-        // append behavior was unhelpful in practice — by M5 a single
-        // diagnostic session interleaves 5+ runs and you lose track of
-        // which line is from which. Rotate-on-size still applies within
-        // a run.
+    fn open(path: PathBuf, cfg: LogConfig) -> Option<Self> {
+        // Truncate on init: each run gets a fresh log. Rotate-on-size
+        // applies within a run (when bytes_written exceeds rotate_bytes).
         let file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&path)
-            .unwrap_or_else(|e| {
-                eprintln!("vita-log: cannot open {}: {}", path.display(), e);
-                File::create(std::env::temp_dir().join("vita-log-fallback.txt"))
-                    .expect("vita-log fallback file create failed")
-            });
-        let bytes_written = 0u64;
-        Self {
+            .ok()?;
+        Some(Self {
             path,
             cfg,
             file,
-            bytes_written,
-        }
+            bytes_written: 0,
+        })
     }
 
-    fn write_chunk(&mut self, chunk: &[u8]) {
-        if self.file.write_all(chunk).is_err() {
+    fn write_line(&mut self, line: &str) {
+        if self.file.write_all(line.as_bytes()).is_err() {
             return;
         }
-        self.bytes_written += chunk.len() as u64;
+        // Newline if the caller didn't include one.
+        if !line.ends_with('\n') {
+            let _ = self.file.write_all(b"\n");
+            self.bytes_written += 1;
+        }
+        self.bytes_written += line.len() as u64;
         if self.bytes_written >= self.cfg.rotate_bytes {
             self.rotate();
         }
@@ -146,12 +123,4 @@ fn numbered(path: &Path, idx: usize) -> PathBuf {
         .unwrap_or("log.txt");
     p.set_file_name(format!("{}.{}", name, idx));
     p
-}
-
-fn now_iso8601() -> String {
-    use time::format_description::well_known::Iso8601;
-    use time::OffsetDateTime;
-    OffsetDateTime::now_utc()
-        .format(&Iso8601::DEFAULT)
-        .unwrap_or_else(|_| "?".into())
 }

@@ -2084,14 +2084,15 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vita-log"
 version = "0.1.0"
 dependencies = [
- "crossbeam-channel",
- "parking_lot",
  "thiserror 1.0.69",
  "time",
- "tracing",
- "tracing-subscriber",
+ "vita-sync",
  "vita-thread",
 ]
+
+[[package]]
+name = "vita-sync"
+version = "0.1.0"
 
 [[package]]
 name = "vita-thread"

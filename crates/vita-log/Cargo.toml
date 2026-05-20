@@ -5,11 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# M15-A3: dropped tracing + tracing-subscriber + crossbeam-channel +
+# parking_lot. Those use pthread state that the SUPRX can't init.
+# Replaced with our own macros + vita-thread + vita-sync.
 [dependencies]
-tracing            = { workspace = true }
-tracing-subscriber = { workspace = true }
-crossbeam-channel  = { workspace = true }
-parking_lot        = { workspace = true }
-time               = { workspace = true }
-thiserror          = { workspace = true }
-vita-thread        = { path = "../vita-thread" }
+vita-thread = { path = "../vita-thread" }
+vita-sync   = { path = "../vita-sync" }
+time        = { workspace = true }
+thiserror   = { workspace = true }
