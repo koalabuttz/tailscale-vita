@@ -1,11 +1,18 @@
 //! POST `/machine/register` through the open Noise+HTTP/2 tunnel.
 //!
-//! Wire shape: minimal RegisterRequest carrying just NodeKey, NLKey,
-//! Auth, and a stripped-down Hostinfo (Hostname + App + IPNVersion).
-//! The "full Go-canonical" RegisterRequest body — with Timestamp,
-//! NetInfo, OS, OSVersion, and BackendLogID populated — empirically
-//! breaks the DiscoKey-commit path on real Tailscale's coord server
-//! (verified by bisection in the M14M Phase 11 debugging session).
+//! Wire shape we send: Version, NodeKey, NLKey, Auth, Timestamp,
+//! Ephemeral, and a Hostinfo of Hostname + App + IPNVersion +
+//! BackendLogID. Deliberately omitted: Hostinfo.OS / OSVersion (sent
+//! empty, so `skip_serializing_if` drops them) and NetInfo (not a
+//! field of this request at all).
+//!
+//! History: setting `OS` to a concrete value (e.g. "linux") or
+//! attaching NetInfo to the *RegisterRequest* empirically broke the
+//! DiscoKey-commit path on real Tailscale's coord server (M14M Phase 11
+//! bisection). Timestamp and BackendLogID were initially suspected too,
+//! but the real DiscoKey-zero fix turned out to be the separate NetInfo
+//! "lite" MapRequest (M12) — so Timestamp + BackendLogID are safe and
+//! are kept.
 
 use http::Method;
 use serde::{Deserialize, Serialize};
@@ -194,8 +201,11 @@ mod tests {
                 hostname: "vita".into(),
                 app: "tailscale-vita/0.1.0".into(),
                 ipn_version: "tailscale-vita/0.1.0".into(),
-                os: "linux".into(),
-                os_version: "vita-3.74".into(),
+                // OS / OSVersion left empty exactly as `register()` builds
+                // them — the skip_serializing_if must then drop them
+                // (the DiscoKey-commit workaround; see module docs).
+                os: String::new(),
+                os_version: String::new(),
                 backend_log_id: "test-blog-id".into(),
             },
             timestamp: "2026-05-04T00:00:00Z".into(),
@@ -204,15 +214,21 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert_eq!(v["Version"], 90);
         assert!(v["NodeKey"].as_str().unwrap().starts_with("nodekey:"));
+        assert!(v["NLKey"].as_str().unwrap().starts_with("nlpub:"));
         assert_eq!(v["Auth"]["AuthKey"], "abcd1234");
         assert_eq!(v["Hostinfo"]["Hostname"], "vita");
         assert_eq!(v["Hostinfo"]["IPNVersion"], "tailscale-vita/0.1.0");
         assert_eq!(v["Hostinfo"]["App"], "tailscale-vita/0.1.0");
-        assert!(v["NLKey"].as_str().unwrap().starts_with("nlpub:"));
-        assert!(v.get("Timestamp").is_none());
-        assert!(v["Hostinfo"].get("BackendLogID").is_none());
+        // Timestamp + BackendLogID ARE sent (kept after M12 showed the
+        // real DiscoKey-zero fix was the NetInfo MapRequest, not stripping
+        // these). Present in the wire body.
+        assert_eq!(v["Timestamp"], "2026-05-04T00:00:00Z");
+        assert_eq!(v["Hostinfo"]["BackendLogID"], "test-blog-id");
+        // OS / OSVersion empty -> skipped; NetInfo is not part of the request.
         assert!(v["Hostinfo"].get("OS").is_none());
+        assert!(v["Hostinfo"].get("OSVersion").is_none());
         assert!(v["Hostinfo"].get("NetInfo").is_none());
+        assert_eq!(v["Ephemeral"], true);
     }
 
     #[test]
