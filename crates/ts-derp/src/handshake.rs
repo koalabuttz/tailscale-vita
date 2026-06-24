@@ -237,9 +237,15 @@ fn dial_tcp(host_port: &str) -> Result<TcpStream, DerpError> {
 fn wrap_tls(tcp: TcpStream, server_name: &str) -> Result<DerpTls, DerpError> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    // builder_with_provider(ring) bypasses rustls' process-default
+    // CryptoProvider OnceLock (forbidden on the SUPRX thread; S6 audit).
+    let config = ClientConfig::builder_with_provider(
+        std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .with_safe_default_protocol_versions()
+    .expect("ring provider supports the safe default protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     let server_name: ServerName<'static> = ServerName::try_from(server_name.to_owned())
         .map_err(|e| DerpError::Tls(format!("bad ServerName: {e}")))?;
     let conn = ClientConnection::new(Arc::new(config), server_name)?;

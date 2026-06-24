@@ -110,16 +110,16 @@ pub fn fetch_server_key_cached(
 pub fn invalidate_server_key_cache(state_dir: &Path) {
     let key_path = state_dir.join(KEY_CACHE_FILE);
     let meta_path = state_dir.join(KEY_CACHE_META_FILE);
-    let _ = std::fs::remove_file(&key_path);
-    let _ = std::fs::remove_file(&meta_path);
+    let _ = vita_fs::remove_file(&key_path);
+    let _ = vita_fs::remove_file(&meta_path);
     debug!(?key_path, "control.key.cache.invalidated");
 }
 
 fn read_cached_key(state_dir: &Path) -> Option<MachinePublic> {
     let key_path = state_dir.join(KEY_CACHE_FILE);
     let meta_path = state_dir.join(KEY_CACHE_META_FILE);
-    let key_str = std::fs::read_to_string(&key_path).ok()?;
-    let meta_str = std::fs::read_to_string(&meta_path).ok()?;
+    let key_str = vita_fs::read_to_string(&key_path).ok()?;
+    let meta_str = vita_fs::read_to_string(&meta_path).ok()?;
     let fetched_unix: u64 = meta_str
         .lines()
         .find_map(|line| line.strip_prefix("fetched_at_unix=").map(str::trim))
@@ -137,30 +137,22 @@ fn read_cached_key(state_dir: &Path) -> Option<MachinePublic> {
 }
 
 fn write_cached_key(state_dir: &Path, key: &MachinePublic) -> std::io::Result<()> {
-    use std::io::Write as _;
-    std::fs::create_dir_all(state_dir)?;
+    // vita_fs = raw sceIo on Vita (std::fs File/sync_all crash on the
+    // SUPRX bootstrap thread; S6 audit). Atomic-ish: write tmp, rename
+    // over (vita_fs::write syncs + vita_fs::rename clears the target).
+    vita_fs::create_dir_all(state_dir)?;
     let now_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Atomic-ish write: write to tmp, rename over. Single-process so
-    // we don't worry about cross-process serialization.
     let key_path = state_dir.join(KEY_CACHE_FILE);
     let meta_path = state_dir.join(KEY_CACHE_META_FILE);
     let key_tmp = state_dir.join(format!("{KEY_CACHE_FILE}.tmp"));
     let meta_tmp = state_dir.join(format!("{KEY_CACHE_META_FILE}.tmp"));
-    {
-        let mut f = std::fs::File::create(&key_tmp)?;
-        writeln!(f, "{}", key.to_mkey_string())?;
-        f.sync_all()?;
-    }
-    {
-        let mut f = std::fs::File::create(&meta_tmp)?;
-        writeln!(f, "fetched_at_unix={now_unix}")?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&key_tmp, &key_path)?;
-    std::fs::rename(&meta_tmp, &meta_path)?;
+    vita_fs::write(&key_tmp, format!("{}\n", key.to_mkey_string()).as_bytes())?;
+    vita_fs::write(&meta_tmp, format!("fetched_at_unix={now_unix}\n").as_bytes())?;
+    vita_fs::rename(&key_tmp, &key_path)?;
+    vita_fs::rename(&meta_tmp, &meta_path)?;
     Ok(())
 }
 

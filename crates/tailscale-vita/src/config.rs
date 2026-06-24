@@ -83,7 +83,9 @@ impl Config {
     /// (demo's main) should log the error and exit cleanly so the
     /// user can edit and re-launch.
     pub fn load_or_template(path: &Path) -> Result<Self, ConfigError> {
-        match std::fs::read_to_string(path) {
+        // vita_fs (raw sceIo on Vita) — std::fs would crash on the SUPRX
+        // bootstrap thread (no newlib _REENT). See S6 audit.
+        match vita_fs::read_to_string(path) {
             Ok(s) => Ok(toml::from_str(&s)?),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Self::write_template(path)?;
@@ -98,9 +100,9 @@ impl Config {
     /// Write the template TOML file at `path`. Creates parent dirs.
     pub fn write_template(path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            vita_fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, TEMPLATE)
+        vita_fs::write(path, TEMPLATE.as_bytes())
     }
 
     /// `host:port` form of `control_url` — the value used as the HTTP/2

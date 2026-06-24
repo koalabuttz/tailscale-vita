@@ -35,6 +35,7 @@ rustls           = { workspace = true }
 rustls-pki-types = { workspace = true }
 webpki-roots     = { workspace = true }
 vita-thread      = { path = "../vita-thread" }
+vita-fs          = { path = "../vita-fs" }
 
 # Phase 9 host-diagnostic example (`examples/host_diagnostic.rs`).
 # Built only by `cargo run --example host_diagnostic` — does NOT bloat

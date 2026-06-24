@@ -835,7 +835,7 @@ impl std::io::Read for ChannelReader {
 // ---------- Persistence ---------------------------------------------------
 
 fn load_session_state(dir: &Path) -> Result<(i64, String), ControlError> {
-    let last_seq = match std::fs::read(dir.join(LAST_SEQ_FILE)) {
+    let last_seq = match vita_fs::read(&dir.join(LAST_SEQ_FILE)) {
         Ok(b) if b.len() == 8 => i64::from_le_bytes(b.try_into().unwrap()),
         _ => 0,
     };
@@ -845,7 +845,7 @@ fn load_session_state(dir: &Path) -> Result<(i64, String), ControlError> {
     // like "client wants to resume session X starting at seq=0" — server
     // has no record of session X, so the request may be silently
     // downgraded. Match upstream Go (`omitzero` on both fields).
-    let session_handle = match std::fs::read(dir.join(SESSION_HANDLE_FILE)) {
+    let session_handle = match vita_fs::read(&dir.join(SESSION_HANDLE_FILE)) {
         Ok(b) => String::from_utf8(b)
             .map(|s| s.trim().to_string())
             .unwrap_or_default(),

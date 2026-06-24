@@ -1,0 +1,12 @@
+[package]
+name = "vita-fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# vita-fs is zero-dep: a thin cfg-gated file-I/O shim. On the Vita
+# target it uses raw sceIo syscalls (no newlib _REENT, so it works on
+# the SUPRX bootstrap thread where std::fs crashes — same reason
+# vita-log went raw-sceIo). On host it delegates to std::fs.
+[dependencies]

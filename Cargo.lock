@@ -1633,6 +1633,7 @@ dependencies = [
  "ts-disco",
  "ts-magicsock",
  "vita-chan",
+ "vita-fs",
  "vita-log",
  "vita-sync",
  "vita-thread",
@@ -1656,6 +1657,7 @@ version = "0.1.0"
 dependencies = [
  "netstack",
  "tailscale-vita",
+ "tokio",
  "vita-chan",
  "vita-log",
  "vita-thread",
@@ -1915,6 +1917,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "vita-fs",
  "vita-log",
  "vita-sync",
  "vita-thread",
@@ -2075,6 +2078,10 @@ version = "0.1.0"
 dependencies = [
  "vita-sync",
 ]
+
+[[package]]
+name = "vita-fs"
+version = "0.1.0"
 
 [[package]]
 name = "vita-log"

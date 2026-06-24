@@ -82,9 +82,16 @@ impl Write for ControlStream {
 pub fn wrap_tls(tcp: TcpStream, server_name: &str) -> Result<ControlStream, ControlError> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    // builder_with_provider(ring) bypasses rustls' process-default
+    // CryptoProvider, which is a std::sync::OnceLock — forbidden on the
+    // SUPRX bootstrap thread (no pthread/_REENT init). See S6 audit.
+    let mut config = rustls::ClientConfig::builder_with_provider(
+        std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .with_safe_default_protocol_versions()
+    .expect("ring provider supports the safe default protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     // ALPN `http/1.1` matches what Cloudflare's edge expects from
     // clients dialing `controlplane.tailscale.com` over HTTPS for the
     // 101 Upgrade flow. Go's `crypto/tls` always advertises ALPN

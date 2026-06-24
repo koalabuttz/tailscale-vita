@@ -9,7 +9,6 @@
 //! envelope. Same atomic-rename pattern as M4's `server-key.bin`.
 //! Pubs are derived from privs on every load via x25519 scalar*basepoint.
 
-use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
 
@@ -90,7 +89,7 @@ impl KeyStore {
 /// generate a fresh Curve25519 secret and persist atomically.
 fn load_or_generate_priv(dir: &Path, file: &str) -> Result<[u8; 32], ControlError> {
     let path = dir.join(file);
-    match fs::read(&path) {
+    match vita_fs::read(&path) {
         Ok(bytes) if bytes.len() == 32 => {
             let mut out = [0u8; 32];
             out.copy_from_slice(&bytes);

@@ -4,6 +4,7 @@ members = [
     "crates/vita-thread",
     "crates/vita-sync",
     "crates/vita-chan",
+    "crates/vita-fs",
     "crates/vita-log",
     "crates/wg-engine",
     "crates/netstack",

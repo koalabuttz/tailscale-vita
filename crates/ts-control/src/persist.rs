@@ -1,5 +1,3 @@
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use vita_sync::Mutex;
@@ -14,22 +12,16 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ControlError> {
     static WRITE_LOCK: Mutex<()> = Mutex::new(());
     let _g = WRITE_LOCK.lock();
 
+    // vita_fs = raw sceIo on Vita (std::fs crashes on the SUPRX
+    // bootstrap thread — no newlib _REENT; S6 audit). Write to a tmp
+    // path then rename over the target; vita_fs::rename removes an
+    // existing target first (newlib/sceIo rename fails otherwise).
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        vita_fs::create_dir_all(parent)?;
     }
     let tmp = make_tmp_path(path);
-    {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        f.flush()?;
-    }
-    // Vita newlib `rename` may fail if the target exists; remove first.
-    let _ = std::fs::remove_file(path);
-    std::fs::rename(&tmp, path)?;
+    vita_fs::write(&tmp, bytes)?;
+    vita_fs::rename(&tmp, path)?;
     Ok(())
 }
 
@@ -50,7 +42,7 @@ pub fn pin_or_load_server_key(
     seen: &MachinePublic,
 ) -> Result<MachinePublic, ControlError> {
     let path = dir.join("server-key.bin");
-    match std::fs::read(&path) {
+    match vita_fs::read(&path) {
         Ok(bytes) if bytes.len() == 32 => {
             let mut pinned = [0u8; 32];
             pinned.copy_from_slice(&bytes);
