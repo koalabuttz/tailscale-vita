@@ -21,7 +21,7 @@ use vita_thread::{self as thread, JoinHandle};
 use std::time::Duration;
 
 use vita_sync::RwLock;
-use tracing::{debug, info, trace, warn};
+use vita_log::{debug, info, trace, warn};
 use ts_magicsock::MagicSocketCtl;
 
 use crate::runtime::ControlHandle;

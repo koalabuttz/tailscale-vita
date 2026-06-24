@@ -9,7 +9,7 @@
 
 use http::Method;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use vita_log::{info, warn};
 
 use crate::http2::Http2Conn;
 use crate::types::{NLPublic, NodePublic};

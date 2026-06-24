@@ -15,7 +15,7 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 use vita_chan::Sender;
 use vita_sync::Mutex;
-use tracing::{debug, info};
+use vita_log::{debug, info};
 
 use crate::conn::{DerpConn, DerpRx, DerpTx};
 use crate::magic::DEFAULT_MAX_CONNS;

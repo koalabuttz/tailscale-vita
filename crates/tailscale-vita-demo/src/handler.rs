@@ -21,7 +21,7 @@ use std::net::{SocketAddr, TcpStream as StdTcpStream};
 use std::time::Duration;
 
 use netstack::tcp::TcpStream;
-use tracing::{info, warn};
+use vita_log::{info, warn};
 
 const DEFAULT_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\n\
                           Content-Type: text/plain\r\n\

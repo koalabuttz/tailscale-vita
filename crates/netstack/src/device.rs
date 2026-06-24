@@ -4,7 +4,7 @@ use std::sync::Arc;
 use vita_sync::Mutex;
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
-use tracing::trace;
+use vita_log::trace;
 
 /// smoltcp `phy::Device` implementation that bridges to wg-engine's
 /// tun_rx / tun_tx queues. Both directions use **try_lock** so the app

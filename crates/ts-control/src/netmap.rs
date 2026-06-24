@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 
-use tracing::{debug, info, warn};
+use vita_log::{debug, info, warn};
 
 use crate::types::{DerpMapWire, MapResponseWire, NodeWire, PeerChangeWire};
 

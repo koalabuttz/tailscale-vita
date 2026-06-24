@@ -8,6 +8,9 @@
 //! - `info!(key = %expr, "msg")` — `%expr` formats via Display
 //! - `info!(key = ?expr, "msg")` — `?expr` formats via Debug
 //! - `info!(key = expr, "msg")` — formats via Display
+//! - `info!(?expr, "msg")` / `info!(%expr, "msg")` — positional
+//!   shorthand; field is named by the stringified expression
+//! - `info!(ident, "msg")` — bare-ident sugar (`ident = ident`)
 //! - Any combination of fields + trailing fmt-string + args.
 //!
 //! Output format: `"key1=val1 key2=val2 msg"`. Loses tracing's
@@ -38,6 +41,24 @@ macro_rules! __vita_log_fmt {
     ($prefix:expr; $key:ident = ? $value:expr, $($rest:tt)*) => {
         $crate::__vita_log_fmt!(
             format!("{}{}={:?} ", $prefix, stringify!($key), $value);
+            $($rest)*
+        )
+    };
+
+    // Positional Debug shorthand: `?expr` with no key. Names the field
+    // by the stringified expression, matching tracing's `?expr` /
+    // `?self.field` form.
+    ($prefix:expr; ? $value:expr, $($rest:tt)*) => {
+        $crate::__vita_log_fmt!(
+            format!("{}{}={:?} ", $prefix, stringify!($value), $value);
+            $($rest)*
+        )
+    };
+
+    // Positional Display shorthand: `%expr` with no key.
+    ($prefix:expr; % $value:expr, $($rest:tt)*) => {
+        $crate::__vita_log_fmt!(
+            format!("{}{}={} ", $prefix, stringify!($value), $value);
             $($rest)*
         )
     };

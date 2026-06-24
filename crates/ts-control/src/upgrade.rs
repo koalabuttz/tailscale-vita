@@ -18,7 +18,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use httparse::Status;
-use tracing::{debug, warn};
+use vita_log::{debug, warn};
 
 use crate::control_stream::{wrap_tls, ControlStream};
 use crate::url as urlmod;

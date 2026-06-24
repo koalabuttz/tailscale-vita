@@ -27,7 +27,7 @@ use vita_sync::{Condvar, Mutex};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Cidr};
-use tracing::info;
+use vita_log::info;
 
 mod buf;
 mod device;

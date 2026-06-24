@@ -14,7 +14,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use vita_chan::Receiver;
-use tracing::{debug, info, warn};
+use vita_log::{debug, info, warn};
 
 use crate::{MagicSocketCtl, StunResult};
 

@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use tracing::{debug, info, warn};
+use vita_log::{debug, info, warn};
 
 use crate::types::MachinePublic;
 use crate::url as urlmod;

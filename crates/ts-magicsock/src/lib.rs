@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use vita_chan::{bounded, Receiver, Sender};
 use vita_sync::Mutex;
 use rand_core::{OsRng, RngCore};
-use tracing::{debug, info, trace, warn};
+use vita_log::{debug, info, trace, warn};
 
 use ts_disco::keys::{DiscoPrivateKey, DiscoPublicKey, NodePublicKey};
 use ts_disco::{CallMeMaybe, Endpoint, Header, MessageType, Packet, Ping, Pong};

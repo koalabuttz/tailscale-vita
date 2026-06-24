@@ -14,7 +14,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use rand_core::OsRng;
-use tracing::info;
+use vita_log::info;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::persist::atomic_write;

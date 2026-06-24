@@ -12,7 +12,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use tracing::trace;
+use vita_log::trace;
 
 /// Max bytes we'll buffer for a single request (head + small body).
 /// Generous enough for any LocalAPI body we plan to accept; small

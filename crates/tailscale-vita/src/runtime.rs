@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use vita_chan::{unbounded, Receiver, Sender, TryRecvError};
 use vita_sync::{Mutex, RwLock};
 use smoltcp::wire::Ipv4Cidr as SmolIpv4Cidr;
-use tracing::{debug, info, warn};
+use vita_log::{debug, info, warn};
 
 use netstack::{Stack, StackConfig};
 use ts_control::async_io::AsyncNoiseStream;

@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use netstack::tcp::TcpStream;
-use tracing::{info, warn};
+use vita_log::{info, warn};
 
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\n\
                           Content-Type: text/plain\r\n\

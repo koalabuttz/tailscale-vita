@@ -6,7 +6,7 @@ use vita_sync::{Condvar, Mutex};
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
-use tracing::{info, trace};
+use vita_log::{info, trace};
 
 use crate::device::WgDevice;
 use crate::StackInner;

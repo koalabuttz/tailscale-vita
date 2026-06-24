@@ -20,7 +20,7 @@ vita-sync         = { path = "../vita-sync" }
 vita-chan         = { path = "../vita-chan" }
 rand_core         = { workspace = true }
 zerocopy          = { workspace = true, features = ["derive"] }
-tracing           = { workspace = true }
+vita-log = { path = "../vita-log" }
 thiserror         = { workspace = true }
 vita-thread       = { path = "../vita-thread" }
 

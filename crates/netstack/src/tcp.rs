@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
 use smoltcp::wire::IpEndpoint;
-use tracing::{debug, trace};
+use vita_log::{debug, trace};
 
 use crate::buf::{make_tcp_buffers, DEFAULT_TCP_RX_BUF, DEFAULT_TCP_TX_BUF};
 use crate::handle::HandleSlot;

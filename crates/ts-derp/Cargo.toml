@@ -30,7 +30,7 @@ arc-swap = { workspace = true }
 vita-chan = { path = "../vita-chan" }
 
 # Logging + errors
-tracing = { workspace = true }
+vita-log = { path = "../vita-log" }
 thiserror = { workspace = true }
 
 # M15-A2: SUPRX-safe thread spawn (sceKernelCreateThread on Vita).

@@ -11,7 +11,7 @@
 use std::net::Ipv4Addr;
 
 use serde::Serialize;
-use tracing::debug;
+use vita_log::debug;
 
 use crate::localapi::http::query_get;
 use crate::localapi::router::HandlerCtx;

@@ -14,7 +14,6 @@ tailscale-vita = { path = "../tailscale-vita" }
 
 # Public crate types we touch directly.
 vita-chan         = { path = "../vita-chan" }
-tracing           = { workspace = true }
 
 [package.metadata.vita]
 title_id   = "TVIT00010"

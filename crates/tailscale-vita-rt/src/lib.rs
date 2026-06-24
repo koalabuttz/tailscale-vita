@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use vita_chan::{bounded, TryRecvError};
-use tracing::{error, info, warn};
+use vita_log::{error, info, warn};
 
 use netstack::TcpListener;
 use tailscale_vita::{Config, ConfigError, Runtime};

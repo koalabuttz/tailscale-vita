@@ -19,7 +19,7 @@ use vita_thread as thread;
 use std::time::{Duration, Instant};
 
 use vita_sync::Mutex;
-use tracing::{debug, info, warn};
+use vita_log::{debug, info, warn};
 
 use crate::magic::{DIAL_TIMEOUT, HOME_PROBE_CACHE, HOME_SWITCH_FRACTION};
 use crate::{DerpError, DerpMap};

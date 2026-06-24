@@ -20,7 +20,7 @@ use bytes::Bytes;
 use http::{Method, Request};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::runtime::{Builder, Runtime};
-use tracing::{debug, info};
+use vita_log::{debug, info};
 
 use crate::async_io::AsyncNoiseStream;
 use crate::ControlError;
@@ -58,7 +58,7 @@ pub enum ChunkOutcome {
 /// h2 without the orphan-rules problems of impl'ing on a foreign type.
 ///
 /// M14M Phase 10 diagnostic: every `poll_read` / `poll_write` call emits a
-/// `tracing::trace!` event (target = `h2_wire`) carrying the direction and
+/// `vita_log::trace!` event (target = `h2_wire`) carrying the direction and
 /// the hex-encoded chunk bytes. These are the post-Noise-plaintext h2
 /// frames the h2 crate sees — exactly the bytes we want to byte-diff
 /// against tailscale-rs's working `peer_ping` flow. Enable via
@@ -86,8 +86,8 @@ impl AsyncRead for AsyncNoiseStreamPin {
         if matches!(res, Poll::Ready(Ok(()))) {
             let now = buf.filled().len();
             if now > before {
-                tracing::trace!(
-                    target: "h2_wire",
+                vita_log::trace!(
+                    wire = "h2_wire",
                     dir = "rx",
                     n = now - before,
                     hex = %hex_chunk(&buf.filled()[before..now]),
@@ -108,8 +108,8 @@ impl AsyncWrite for AsyncNoiseStreamPin {
         let res = Pin::new(&mut self.0).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &res {
             if *n > 0 {
-                tracing::trace!(
-                    target: "h2_wire",
+                vita_log::trace!(
+                    wire = "h2_wire",
                     dir = "tx",
                     n = *n,
                     hex = %hex_chunk(&buf[..*n]),

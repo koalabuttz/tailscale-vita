@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use boringtun::noise::{Tunn, TunnResult};
 use vita_sync::{Condvar, Mutex};
-use tracing::{debug, error, info, trace, warn};
+use vita_log::{debug, error, info, trace, warn};
 
 use crate::dispatch::{parse_ipv4_dst, peer_for_ip, route_inbound, InboundRoute};
 use crate::indices::Indices;

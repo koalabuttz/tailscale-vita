@@ -104,7 +104,7 @@ impl<S: Read + Write> NoiseStream<S> {
         let total = HEADER_LEN + len;
         self.fill_until(total)?;
 
-        tracing::trace!(record_len = len, "noise.record.decrypt");
+        vita_log::trace!(record_len = len, "noise.record.decrypt");
 
         let mut out = Vec::with_capacity(len);
         self.noise

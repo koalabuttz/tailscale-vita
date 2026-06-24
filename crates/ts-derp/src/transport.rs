@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vita_chan::Receiver;
-use tracing::trace;
+use vita_log::trace;
 
 use wg_engine::{Transport, TransportAddr, WgError};
 

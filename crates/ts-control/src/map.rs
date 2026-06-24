@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::Method;
-use tracing::{debug, info, warn};
+use vita_log::{debug, info, warn};
 
 use crate::http2::{ChunkOutcome, Http2Conn};
 use crate::netmap::{NetMap, NetMapDelta};

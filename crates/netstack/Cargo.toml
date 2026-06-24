@@ -8,7 +8,7 @@ publish.workspace = true
 [dependencies]
 smoltcp           = { workspace = true }
 vita-sync         = { path = "../vita-sync" }
-tracing           = { workspace = true }
+vita-log = { path = "../vita-log" }
 thiserror         = { workspace = true }
 wg-engine         = { path = "../wg-engine" }
 vita-thread       = { path = "../vita-thread" }

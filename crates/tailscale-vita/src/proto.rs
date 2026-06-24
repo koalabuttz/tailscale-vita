@@ -6,7 +6,7 @@
 use std::io::Read;
 use std::time::Duration;
 
-use tracing::info;
+use vita_log::info;
 
 use ts_control::record::NoiseStream;
 use ts_control::upgrade::UpgradedSocket;

@@ -28,7 +28,7 @@
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tracing::{info, warn};
+use vita_log::{info, warn};
 
 const DEGRADED_AFTER: Duration = Duration::from_secs(60);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);

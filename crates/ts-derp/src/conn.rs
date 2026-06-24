@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use vita_chan::{Receiver, Sender};
 use vita_sync::Mutex;
-use tracing::{debug, info, trace, warn};
+use vita_log::{debug, info, trace, warn};
 
 use crate::frame::{
     parse_peer_gone, parse_ping, parse_recv_packet, parse_restarting, read_frame,

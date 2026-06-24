@@ -22,7 +22,7 @@
 use std::time::Duration;
 
 use vita_chan::Receiver;
-use tracing::{debug, trace};
+use vita_log::{debug, trace};
 use ts_derp::DerpTransport;
 use ts_magicsock::{MagicSocketCtl, NonDiscoPacket};
 use wg_engine::{Transport, TransportAddr, WgError};

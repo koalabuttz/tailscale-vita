@@ -22,7 +22,7 @@ vita-chan   = { path = "../vita-chan" }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 toml        = { workspace = true }
-tracing     = { workspace = true }
+vita-log = { path = "../vita-log" }
 vita-sync   = { path = "../vita-sync" }
 x25519-dalek = { workspace = true }
 rand_core    = { workspace = true }

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use vita_sync::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tracing::{debug, trace, warn};
+use vita_log::{debug, trace, warn};
 
 use crate::control_stream::ControlStream;
 use crate::record::NoiseStream;

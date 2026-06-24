@@ -21,4 +21,3 @@ vita-thread    = { path = "../vita-thread" }
 
 # Workspace deps for the runtime body + worker thread.
 vita-chan         = { path = "../vita-chan" }
-tracing           = { workspace = true }

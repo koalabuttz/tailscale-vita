@@ -31,7 +31,7 @@ use rand_core::OsRng;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use rustls_pki_types::ServerName;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use vita_log::{debug, info, warn};
 
 use crate::frame::{read_frame, write_frame, FrameType};
 use crate::magic::{DIAL_TIMEOUT, MAGIC, PROTOCOL_VERSION};

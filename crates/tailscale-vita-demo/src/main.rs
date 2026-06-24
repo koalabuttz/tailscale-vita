@@ -18,7 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use vita_chan::{bounded, RecvTimeoutError};
-use tracing::{error, info, info_span, warn};
+use vita_log::{error, info, warn};
 use vita_log::LogError;
 
 use netstack::TcpListener;
@@ -42,13 +42,14 @@ fn main() {
             return;
         }
     }
-    let _span = info_span!(
-        "startup",
+    // vita_log has no span concept; emit the startup fields as a
+    // one-shot info! (was an info_span!(...).entered() under tracing).
+    info!(
         milestone = "M10",
         build = env!("BUILD_TIMESTAMP"),
         build_unix = env!("BUILD_UNIX"),
-    )
-    .entered();
+        "startup"
+    );
     info!(build = env!("BUILD_TIMESTAMP"), "binary build timestamp");
 
     if let Err(e) = run() {
