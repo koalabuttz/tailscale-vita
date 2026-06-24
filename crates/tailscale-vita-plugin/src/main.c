@@ -32,14 +32,20 @@
 #include <string.h>
 #include <sys/reent.h>
 
-/* TAIPOOL_AS_STDLIB makes taipool.h define malloc/free/calloc/realloc
- * as taipool-backed wrappers. Without this, pthread's internal malloc
- * (used to allocate thread state) calls newlib's malloc which needs
- * `_sbrk`-backed heap init — and that init is in vitasdk's startup
- * files, which `-nostartfiles` skips. Without TAIPOOL_AS_STDLIB,
- * pthread_create returns EAGAIN (rc=11) and std::thread::spawn
- * crashes (Phase 2 hardware finding 2026-05-05). */
-#define TAIPOOL_AS_STDLIB
+/* S6 ROOT-CAUSE FIX (2026-06-24): we deliberately DO NOT define
+ * TAIPOOL_AS_STDLIB anymore. That macro made taipool.h override C
+ * malloc/free/calloc/realloc — but NOT memalign. std's System allocator
+ * (used directly by os.rs thread_local, NOT the #[global_allocator])
+ * allocates over-aligned blocks via libc memalign and frees via libc
+ * free; with the macro, memalign hit NEWLIB while free hit taipool_free
+ * — two different heaps, so taipool_free read a bogus block header
+ * (0xdeadbeef) and crashed. That was the thread_local! first-access
+ * crash. The original 2026-05-05 reason for the macro (pthread's
+ * internal malloc had no heap) is moot now that module_start runs
+ * _init_vita_heap()/_init_vita_malloc() — newlib's C heap is live. So
+ * leave ALL of malloc/free/calloc/realloc/memalign on newlib (a
+ * self-consistent set), which makes std::System matched. Rust's Global
+ * allocator stays taipool via the extern taipool_alloc/free in lib.rs. */
 #include <taipool.h>
 
 /* Phase 2 diagnostic: append a checkpoint marker to a trace file
