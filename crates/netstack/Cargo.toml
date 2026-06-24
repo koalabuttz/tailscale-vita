@@ -7,7 +7,7 @@ publish.workspace = true
 
 [dependencies]
 smoltcp           = { workspace = true }
-parking_lot       = { workspace = true }
+vita-sync         = { path = "../vita-sync" }
 tracing           = { workspace = true }
 thiserror         = { workspace = true }
 wg-engine         = { path = "../wg-engine" }

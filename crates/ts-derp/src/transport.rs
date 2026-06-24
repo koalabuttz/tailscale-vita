@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::Receiver;
+use vita_chan::Receiver;
 use tracing::trace;
 
 use wg_engine::{Transport, TransportAddr, WgError};
@@ -52,7 +52,7 @@ impl DerpTransport {
         our_pub: NodeKeyBytes,
         cap: usize,
     ) -> (Self, DerpTransportCtl) {
-        let (tx_sink, rx) = crossbeam_channel::unbounded::<(u16, DerpRx)>();
+        let (tx_sink, rx) = vita_chan::unbounded::<(u16, DerpRx)>();
         let mux = DerpMux::new(our_priv, our_pub, cap, tx_sink);
         let derp_map_set = Arc::new(AtomicBool::new(false));
         let transport = DerpTransport {
@@ -99,8 +99,8 @@ impl Transport for DerpTransport {
                 },
                 rx.wg_bytes,
             ))),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            Err(vita_chan::RecvTimeoutError::Timeout) => Ok(None),
+            Err(vita_chan::RecvTimeoutError::Disconnected) => {
                 Err(WgError::Transport("derp rx disconnect".into()))
             }
         }

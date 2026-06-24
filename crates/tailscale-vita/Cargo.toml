@@ -16,14 +16,14 @@ netstack     = { path = "../netstack" }
 vita-thread  = { path = "../vita-thread" }
 
 # DualTransport's RX side waits on the non-Disco channel from MagicSocket.
-crossbeam-channel = { workspace = true }
+vita-chan   = { path = "../vita-chan" }
 
 # Workspace deps.
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 toml        = { workspace = true }
 tracing     = { workspace = true }
-parking_lot = { workspace = true }
+vita-sync   = { path = "../vita-sync" }
 x25519-dalek = { workspace = true }
 rand_core    = { workspace = true }
 smoltcp     = { workspace = true }

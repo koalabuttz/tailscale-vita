@@ -22,8 +22,8 @@ use std::sync::Arc;
 use vita_thread::{self as thread, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver, Sender};
-use parking_lot::Mutex;
+use vita_chan::{bounded, Receiver, Sender};
+use vita_sync::Mutex;
 use rand_core::{OsRng, RngCore};
 use tracing::{debug, info, trace, warn};
 
@@ -1381,7 +1381,7 @@ fn send_pong(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossbeam_channel::unbounded;
+    use vita_chan::unbounded;
     use std::net::Ipv4Addr;
 
     fn loopback(port: u16) -> SocketAddr {

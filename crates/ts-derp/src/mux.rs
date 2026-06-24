@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use crossbeam_channel::Sender;
-use parking_lot::Mutex;
+use vita_chan::Sender;
+use vita_sync::Mutex;
 use tracing::{debug, info};
 
 use crate::conn::{DerpConn, DerpRx, DerpTx};
@@ -214,8 +214,8 @@ impl Clone for DerpMux {
 mod tests {
     use super::*;
 
-    fn empty_mux() -> (DerpMux, crossbeam_channel::Receiver<(u16, DerpRx)>) {
-        let (tx, rx) = crossbeam_channel::unbounded::<(u16, DerpRx)>();
+    fn empty_mux() -> (DerpMux, vita_chan::Receiver<(u16, DerpRx)>) {
+        let (tx, rx) = vita_chan::unbounded::<(u16, DerpRx)>();
         let mux = DerpMux::new([0u8; 32], [0u8; 32], 8, tx);
         (mux, rx)
     }

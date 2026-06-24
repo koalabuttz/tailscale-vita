@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use boringtun::noise::{Tunn, TunnResult};
-use parking_lot::{Condvar, Mutex};
+use vita_sync::{Condvar, Mutex};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::dispatch::{parse_ipv4_dst, peer_for_ip, route_inbound, InboundRoute};

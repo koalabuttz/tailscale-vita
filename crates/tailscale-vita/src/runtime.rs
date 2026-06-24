@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
-use parking_lot::{Mutex, RwLock};
+use vita_chan::{unbounded, Receiver, Sender, TryRecvError};
+use vita_sync::{Mutex, RwLock};
 use smoltcp::wire::Ipv4Cidr as SmolIpv4Cidr;
 use tracing::{debug, info, warn};
 
@@ -118,7 +118,7 @@ impl ControlHandle {
     /// Request an immediate reconnect. Returns `Ok(())` if the signal
     /// was queued, `Err(...)` if the event loop has shut down (the
     /// receiver was dropped).
-    pub fn force_reconnect(&self) -> Result<(), crossbeam_channel::SendError<ControlSignal>> {
+    pub fn force_reconnect(&self) -> Result<(), vita_chan::SendError<ControlSignal>> {
         self.tx.send(ControlSignal::ForceReconnect)
     }
 
@@ -126,7 +126,7 @@ impl ControlHandle {
     pub fn send(
         &self,
         sig: ControlSignal,
-    ) -> Result<(), crossbeam_channel::SendError<ControlSignal>> {
+    ) -> Result<(), vita_chan::SendError<ControlSignal>> {
         self.tx.send(sig)
     }
 }
@@ -1463,7 +1463,7 @@ fn push_delta_to_magicsock(magic: &MagicSocketCtl, snap: &ts_control::NetMapSnap
 fn bind_magicsock(
     disco_priv: DiscoPrivateKey,
     our_node_pub: NodePublicKey,
-    non_disco_tx: crossbeam_channel::Sender<ts_magicsock::NonDiscoPacket>,
+    non_disco_tx: vita_chan::Sender<ts_magicsock::NonDiscoPacket>,
 ) -> Result<(MagicSocket, MagicSocketCtl), RuntimeError> {
     let primary: SocketAddr = (IpAddr::from([0, 0, 0, 0]), MAGICSOCK_PORT).into();
     match MagicSocket::bind(primary, disco_priv, our_node_pub, non_disco_tx.clone()) {

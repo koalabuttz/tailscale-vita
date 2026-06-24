@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use parking_lot::{Condvar, Mutex};
+use vita_sync::{Condvar, Mutex};
 
 /// A single-producer-single-consumer-style queue with a Condvar wakeup
 /// for the consumer side. Internally a `Mutex<VecDeque<T>>` so multiple

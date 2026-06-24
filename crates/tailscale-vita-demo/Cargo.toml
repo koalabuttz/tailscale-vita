@@ -13,7 +13,7 @@ netstack       = { path = "../netstack" }
 tailscale-vita = { path = "../tailscale-vita" }
 
 # Public crate types we touch directly.
-crossbeam-channel = { workspace = true }
+vita-chan         = { path = "../vita-chan" }
 tracing           = { workspace = true }
 
 [package.metadata.vita]

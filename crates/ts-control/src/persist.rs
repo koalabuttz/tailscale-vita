@@ -2,7 +2,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use parking_lot::Mutex;
+use vita_sync::Mutex;
 
 use crate::types::MachinePublic;
 use crate::ControlError;

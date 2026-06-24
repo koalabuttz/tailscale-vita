@@ -23,8 +23,8 @@ use std::sync::Arc;
 use vita_thread::{self as thread, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender};
-use parking_lot::Mutex;
+use vita_chan::{Receiver, Sender};
+use vita_sync::Mutex;
 use tracing::{debug, info, trace, warn};
 
 use crate::frame::{
@@ -118,7 +118,7 @@ impl DerpConn {
         rx_sink: Sender<(u16, DerpRx)>,
         is_home: bool,
     ) -> Result<Self, DerpError> {
-        let (tx_send, tx_recv) = crossbeam_channel::unbounded::<DerpTx>();
+        let (tx_send, tx_recv) = vita_chan::unbounded::<DerpTx>();
         let last_used = Arc::new(Mutex::new(Instant::now()));
         let is_home_flag = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -452,16 +452,16 @@ mod tests {
 
     #[test]
     fn handle_frame_keepalive_continues() {
-        let (tx_self, _tx_recv) = crossbeam_channel::unbounded::<DerpTx>();
-        let (rx_sink, _rx) = crossbeam_channel::unbounded::<(u16, DerpRx)>();
+        let (tx_self, _tx_recv) = vita_chan::unbounded::<DerpTx>();
+        let (rx_sink, _rx) = vita_chan::unbounded::<(u16, DerpRx)>();
         let action = handle_frame(1, FrameType::KeepAlive, vec![], &tx_self, &rx_sink);
         assert!(matches!(action, HandleAction::Continue));
     }
 
     #[test]
     fn handle_frame_ping_pushes_pong_to_self() {
-        let (tx_self, tx_recv) = crossbeam_channel::unbounded::<DerpTx>();
-        let (rx_sink, _rx) = crossbeam_channel::unbounded::<(u16, DerpRx)>();
+        let (tx_self, tx_recv) = vita_chan::unbounded::<DerpTx>();
+        let (rx_sink, _rx) = vita_chan::unbounded::<(u16, DerpRx)>();
         let echo: [u8; 8] = [9, 8, 7, 6, 5, 4, 3, 2];
         let mut payload = Vec::new();
         payload.extend_from_slice(&echo);
@@ -472,8 +472,8 @@ mod tests {
 
     #[test]
     fn handle_frame_recv_packet_emits_to_sink() {
-        let (tx_self, _tx_recv) = crossbeam_channel::unbounded::<DerpTx>();
-        let (rx_sink, rx) = crossbeam_channel::unbounded::<(u16, DerpRx)>();
+        let (tx_self, _tx_recv) = vita_chan::unbounded::<DerpTx>();
+        let (rx_sink, rx) = vita_chan::unbounded::<(u16, DerpRx)>();
         let src = [0xaa; 32];
         let mut payload = Vec::new();
         payload.extend_from_slice(&src);
@@ -487,8 +487,8 @@ mod tests {
 
     #[test]
     fn handle_frame_restarting_returns_delay() {
-        let (tx_self, _) = crossbeam_channel::unbounded::<DerpTx>();
-        let (rx_sink, _) = crossbeam_channel::unbounded::<(u16, DerpRx)>();
+        let (tx_self, _) = vita_chan::unbounded::<DerpTx>();
+        let (rx_sink, _) = vita_chan::unbounded::<(u16, DerpRx)>();
         let payload = [0, 0, 0x01, 0x00, 0, 0, 0x10, 0x00];
         let action = handle_frame(1, FrameType::Restarting, payload.to_vec(), &tx_self, &rx_sink);
         match action {

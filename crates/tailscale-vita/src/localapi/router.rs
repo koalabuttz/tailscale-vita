@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use vita_sync::RwLock;
 use ts_magicsock::MagicSocketCtl;
 
 use crate::localapi::handlers;

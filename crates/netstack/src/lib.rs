@@ -23,7 +23,7 @@ use std::sync::Arc;
 use vita_thread::JoinHandle;
 use std::time::Instant as StdInstant;
 
-use parking_lot::{Condvar, Mutex};
+use vita_sync::{Condvar, Mutex};
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Cidr};

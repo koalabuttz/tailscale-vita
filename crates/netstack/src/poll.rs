@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
-use parking_lot::{Condvar, Mutex};
+use vita_sync::{Condvar, Mutex};
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
@@ -41,7 +41,10 @@ pub fn run(inner: Arc<StackInner>, mut device: WgDevice) {
         let (lock, cv) = &*inner.wake;
         let mut woke = lock.lock();
         if !*woke {
-            let _ = cv.wait_for(&mut woke, delay);
+            // vita_sync::Condvar is std-style (by-value guard in/out),
+            // unlike parking_lot's wait_for(&mut guard). Rebind woke.
+            let (g, _) = cv.wait_timeout(woke, delay);
+            woke = g;
         }
         *woke = false;
     }

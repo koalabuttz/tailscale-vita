@@ -18,7 +18,7 @@ use std::sync::Arc;
 use vita_thread as thread;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use vita_sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::magic::{DIAL_TIMEOUT, HOME_PROBE_CACHE, HOME_SWITCH_FRACTION};
@@ -63,7 +63,7 @@ impl HomeProbe {
         }
 
         info!(total, "derp.probe.start");
-        let (tx, rx) = crossbeam_channel::bounded::<(u16, Duration)>(total);
+        let (tx, rx) = vita_chan::bounded::<(u16, Duration)>(total);
         let mut handles = Vec::with_capacity(total);
 
         for (region_id, nodes) in &derp_map.regions {
@@ -93,8 +93,8 @@ impl HomeProbe {
         while Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(r) => results.push(r),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Err(vita_chan::RecvTimeoutError::Timeout) => {}
+                Err(vita_chan::RecvTimeoutError::Disconnected) => break,
             }
         }
         // Best-effort join; threads are short-lived so this rarely blocks.
@@ -154,7 +154,7 @@ impl HomeProbe {
     }
 }
 
-fn probe_one(region: u16, dial_addr: &str, tx: &crossbeam_channel::Sender<(u16, Duration)>) {
+fn probe_one(region: u16, dial_addr: &str, tx: &vita_chan::Sender<(u16, Duration)>) {
     let start = Instant::now();
     let addr = match dial_addr.to_socket_addrs() {
         Ok(mut iter) => match iter.next() {

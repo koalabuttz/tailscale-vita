@@ -20,7 +20,7 @@ use std::sync::Arc;
 use vita_thread::{self as thread, JoinHandle};
 use std::time::Duration;
 
-use parking_lot::RwLock;
+use vita_sync::RwLock;
 use tracing::{debug, info, trace, warn};
 use ts_magicsock::MagicSocketCtl;
 

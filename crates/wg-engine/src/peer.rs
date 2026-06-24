@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use boringtun::noise::Tunn;
-use parking_lot::Mutex;
+use vita_sync::Mutex;
 
 use crate::WgError;
 

@@ -28,7 +28,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, TryRecvError};
+use vita_chan::{bounded, TryRecvError};
 use tracing::{error, info, warn};
 
 use netstack::TcpListener;

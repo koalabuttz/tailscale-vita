@@ -231,8 +231,8 @@ mod tests {
     use crate::localapi::router::HandlerCtx;
     use crate::runtime::ControlHandle;
     use crate::snapshot::{AllowedIpView, RuntimeSnapshot};
-    use crossbeam_channel::unbounded;
-    use parking_lot::RwLock;
+    use vita_chan::unbounded;
+    use vita_sync::RwLock;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -242,7 +242,7 @@ mod tests {
     fn synthetic_ctx() -> (
         HandlerCtx,
         Arc<RwLock<RuntimeSnapshot>>,
-        crossbeam_channel::Receiver<crate::runtime::ControlSignal>,
+        vita_chan::Receiver<crate::runtime::ControlSignal>,
     ) {
         use ts_disco::keys::{DiscoPrivateKey, NodePublicKey};
         use ts_magicsock::MagicSocket;

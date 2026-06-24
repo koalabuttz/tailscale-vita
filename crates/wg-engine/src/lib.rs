@@ -14,7 +14,7 @@ use vita_thread::JoinHandle;
 
 use arc_swap::ArcSwap;
 use boringtun::noise::Tunn;
-use parking_lot::{Condvar, Mutex};
+use vita_sync::{Condvar, Mutex};
 use tracing::info;
 
 mod config;

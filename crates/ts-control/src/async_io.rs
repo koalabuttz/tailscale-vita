@@ -16,7 +16,7 @@ use std::task::{Context, Poll, Waker};
 use vita_thread::JoinHandle;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use vita_sync::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, trace, warn};
 

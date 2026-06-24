@@ -12,7 +12,7 @@ serde_json  = { workspace = true }
 base64      = { workspace = true }
 tracing     = { workspace = true }
 thiserror   = { workspace = true }
-parking_lot = { workspace = true }
+vita-sync   = { path = "../vita-sync" }
 # M5: Noise IK + HTTP/2 over the Noise tunnel
 snow        = { workspace = true }
 chacha20poly1305 = { workspace = true }
@@ -21,7 +21,6 @@ h2          = { workspace = true }
 tokio       = { workspace = true }
 bytes       = { workspace = true }
 http        = "1"
-crossbeam-channel = { workspace = true }
 # M6: persistent keys (machine, node, disco) + RFC3339 timestamps for register
 x25519-dalek = { workspace = true }
 rand_core    = { workspace = true }

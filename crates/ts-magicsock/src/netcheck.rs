@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
-use crossbeam_channel::Receiver;
+use vita_chan::Receiver;
 use tracing::{debug, info, warn};
 
 use crate::{MagicSocketCtl, StunResult};

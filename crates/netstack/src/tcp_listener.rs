@@ -48,7 +48,7 @@ pub struct TcpListener {
     /// Pre-allocated pool. Each entry is one socket sitting in
     /// `Listen` state on `port`. When one transitions to `Established`,
     /// `accept` claims it and re-allocates a fresh slot.
-    pool: parking_lot::Mutex<Vec<(SocketHandle, Arc<HandleSlot>)>>,
+    pool: vita_sync::Mutex<Vec<(SocketHandle, Arc<HandleSlot>)>>,
     port: u16,
 }
 
@@ -83,7 +83,7 @@ impl TcpListener {
         info!(port, pool_size, "netstack.tcp_listener.bound");
         Ok(Self {
             inner,
-            pool: parking_lot::Mutex::new(pool),
+            pool: vita_sync::Mutex::new(pool),
             port,
         })
     }

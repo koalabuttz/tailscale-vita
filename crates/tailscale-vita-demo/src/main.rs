@@ -17,7 +17,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, RecvTimeoutError};
+use vita_chan::{bounded, RecvTimeoutError};
 use tracing::{error, info, info_span, warn};
 use vita_log::LogError;
 

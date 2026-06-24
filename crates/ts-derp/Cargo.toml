@@ -25,9 +25,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 # Concurrency / locking
-parking_lot = { workspace = true }
+vita-sync = { path = "../vita-sync" }
 arc-swap = { workspace = true }
-crossbeam-channel = { workspace = true }
+vita-chan = { path = "../vita-chan" }
 
 # Logging + errors
 tracing = { workspace = true }

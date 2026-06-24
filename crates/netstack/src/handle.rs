@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use parking_lot::{Condvar, Mutex};
+use vita_sync::{Condvar, Mutex};
 use smoltcp::iface::SocketHandle;
 
 /// Edge-triggered event bitset for one socket. The poll loop sets bits
@@ -73,7 +73,8 @@ impl HandleSlot {
         let mut g = self.event.lock();
         while !cond(&g) && std::time::Instant::now() < deadline {
             let timeout = deadline.saturating_duration_since(std::time::Instant::now());
-            let _ = self.cv.wait_for(&mut g, timeout);
+            let (ng, _) = self.cv.wait_timeout(g, timeout);
+            g = ng;
         }
         let drained = *g;
         *g = HandleEvent::default();
@@ -84,7 +85,7 @@ impl HandleSlot {
     pub fn wait_forever<F: Fn(&HandleEvent) -> bool>(&self, cond: F) -> HandleEvent {
         let mut g = self.event.lock();
         while !cond(&g) {
-            self.cv.wait(&mut g);
+            g = self.cv.wait(g);
         }
         let drained = *g;
         *g = HandleEvent::default();

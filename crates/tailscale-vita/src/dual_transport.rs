@@ -21,7 +21,7 @@
 
 use std::time::Duration;
 
-use crossbeam_channel::Receiver;
+use vita_chan::Receiver;
 use tracing::{debug, trace};
 use ts_derp::DerpTransport;
 use ts_magicsock::{MagicSocketCtl, NonDiscoPacket};

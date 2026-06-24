@@ -16,8 +16,8 @@ ts-disco          = { path = "../ts-disco" }
 # at send time to prefer a Disco-validated direct UDP path.
 wg-engine         = { path = "../wg-engine" }
 crypto_box        = { workspace = true }
-parking_lot       = { workspace = true }
-crossbeam-channel = { workspace = true }
+vita-sync         = { path = "../vita-sync" }
+vita-chan         = { path = "../vita-chan" }
 rand_core         = { workspace = true }
 zerocopy          = { workspace = true, features = ["derive"] }
 tracing           = { workspace = true }
