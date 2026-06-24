@@ -4,8 +4,15 @@
 //! actual Vita target (both eboot and SUPRX), `vita.rs` is selected.
 
 use std::sync::{
-    Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock as StdOnceLock, PoisonError,
+    Condvar as StdCondvar, Mutex as StdMutex, MutexGuard as StdMutexGuard,
+    Once as StdOnce, OnceLock as StdOnceLock, PoisonError, RwLock as StdRwLock,
+    RwLockReadGuard as StdRwLockReadGuard, RwLockWriteGuard as StdRwLockWriteGuard,
 };
+use std::time::Duration;
+
+// ============================================================
+// Mutex
+// ============================================================
 
 /// Drop-in replacement for `parking_lot::Mutex<T>`.
 ///
@@ -76,6 +83,99 @@ impl<T> std::ops::DerefMut for MutexGuard<'_, T> {
     }
 }
 
+// ============================================================
+// RwLock
+// ============================================================
+
+/// Drop-in replacement for `parking_lot::RwLock<T>`.
+///
+/// Same poisoning behaviour as `Mutex`: poisoning is silently
+/// converted to a regular lock, matching `parking_lot`.
+pub struct RwLock<T> {
+    inner: StdRwLock<T>,
+}
+
+unsafe impl<T: Send> Send for RwLock<T> {}
+unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
+
+impl<T> RwLock<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            inner: StdRwLock::new(value),
+        }
+    }
+
+    pub fn read(&self) -> RwLockReadGuard<'_, T> {
+        RwLockReadGuard {
+            inner: self.inner.read().unwrap_or_else(PoisonError::into_inner),
+        }
+    }
+
+    pub fn write(&self) -> RwLockWriteGuard<'_, T> {
+        RwLockWriteGuard {
+            inner: self.inner.write().unwrap_or_else(PoisonError::into_inner),
+        }
+    }
+
+    pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
+        match self.inner.try_read() {
+            Ok(g) => Some(RwLockReadGuard { inner: g }),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                Some(RwLockReadGuard { inner: p.into_inner() })
+            }
+        }
+    }
+
+    pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
+        match self.inner.try_write() {
+            Ok(g) => Some(RwLockWriteGuard { inner: g }),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                Some(RwLockWriteGuard { inner: p.into_inner() })
+            }
+        }
+    }
+}
+
+impl<T: Default> Default for RwLock<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+pub struct RwLockReadGuard<'a, T> {
+    inner: StdRwLockReadGuard<'a, T>,
+}
+
+impl<T> std::ops::Deref for RwLockReadGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+
+pub struct RwLockWriteGuard<'a, T> {
+    inner: StdRwLockWriteGuard<'a, T>,
+}
+
+impl<T> std::ops::Deref for RwLockWriteGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+
+impl<T> std::ops::DerefMut for RwLockWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+}
+
+// ============================================================
+// OnceLock<T>
+// ============================================================
+
 /// Drop-in replacement for `std::sync::OnceLock<T>`. Same API.
 pub struct OnceLock<T> {
     inner: StdOnceLock<T>,
@@ -104,5 +204,99 @@ impl<T> OnceLock<T> {
 impl<T> Default for OnceLock<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ============================================================
+// Once (no value)
+// ============================================================
+
+/// Drop-in replacement for `std::sync::Once`.
+pub struct Once {
+    inner: StdOnce,
+}
+
+impl Once {
+    pub const fn new() -> Self {
+        Self {
+            inner: StdOnce::new(),
+        }
+    }
+
+    pub fn call_once<F: FnOnce()>(&self, f: F) {
+        self.inner.call_once(f);
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.inner.is_completed()
+    }
+}
+
+impl Default for Once {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================
+// Condvar
+// ============================================================
+
+pub struct Condvar {
+    inner: StdCondvar,
+}
+
+impl Condvar {
+    pub const fn new() -> Self {
+        Self {
+            inner: StdCondvar::new(),
+        }
+    }
+
+    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+        let inner = self.inner.wait(guard.inner).unwrap_or_else(PoisonError::into_inner);
+        MutexGuard { inner }
+    }
+
+    pub fn wait_timeout<'a, T>(
+        &self,
+        guard: MutexGuard<'a, T>,
+        dur: Duration,
+    ) -> (MutexGuard<'a, T>, WaitTimeoutResult) {
+        let (inner, res) = self
+            .inner
+            .wait_timeout(guard.inner, dur)
+            .unwrap_or_else(PoisonError::into_inner);
+        (
+            MutexGuard { inner },
+            WaitTimeoutResult {
+                timed_out: res.timed_out(),
+            },
+        )
+    }
+
+    pub fn notify_one(&self) {
+        self.inner.notify_one();
+    }
+
+    pub fn notify_all(&self) {
+        self.inner.notify_all();
+    }
+}
+
+impl Default for Condvar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct WaitTimeoutResult {
+    timed_out: bool,
+}
+
+impl WaitTimeoutResult {
+    pub fn timed_out(&self) -> bool {
+        self.timed_out
     }
 }

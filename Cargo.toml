@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/vita-thread",
     "crates/vita-sync",
+    "crates/vita-chan",
     "crates/vita-log",
     "crates/wg-engine",
     "crates/netstack",

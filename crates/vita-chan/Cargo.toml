@@ -1,0 +1,13 @@
+[package]
+name = "vita-chan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# vita-chan is the SUPRX-safe replacement for crossbeam-channel.
+# Built only on vita-sync (Mutex + Condvar + RwLock + Once) and the
+# stdlib's Arc/VecDeque — no third-party deps that could drag in
+# pthread state via thread_local!.
+[dependencies]
+vita-sync = { path = "../vita-sync" }
