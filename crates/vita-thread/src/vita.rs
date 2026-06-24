@@ -13,6 +13,21 @@
 //! Detached threads (JoinHandle dropped without join) leak their SCE
 //! handle until the surrounding process exits — fine in practice
 //! because every workspace spawn site joins in Drop.
+//!
+//! ## ⚠ Known SUPRX limitation (2026-06-24)
+//!
+//! Spawning via this crate from inside a SUPRX **and then performing
+//! any heap allocation from the spawned thread** crashes the SUPRX
+//! on hardware. The thread starts and can call SCE syscalls, but the
+//! first `Box::new` (or anything that touches `taipool_alloc`) faults.
+//! Cause isn't fully understood — possibly the `Box<dyn FnOnce>`
+//! invocation pattern leaves the allocator state in a bad spot for
+//! that thread. The eboot path is unaffected.
+//!
+//! Workaround used by `vita-log`: spawn the writer thread via raw
+//! `sceKernelCreateThread`, with the entry function as a plain
+//! `extern "C" fn` and arguments handed off through a static slot
+//! (no boxed closure). See `vita-log/src/lib.rs::raw_spawn_writer`.
 
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::io;

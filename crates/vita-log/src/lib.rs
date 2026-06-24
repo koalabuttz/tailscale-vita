@@ -1,7 +1,7 @@
 //! File-mirrored logger for tailscale-vita on PSVita.
 //!
 //! Vita has no console; `println!` goes to a sink that nothing reads.
-//! `vita_log::init()` writes events to `ux0:/data/tailscale-vita/log.txt`
+//! `vita_log::init()` writes events to `ux0:data/tailscale-vita/vita.log`
 //! (rotated at 10 MiB, last 3 kept).
 //!
 //! ## Why we don't use `tracing-subscriber`
@@ -17,10 +17,33 @@
 //! M15-A3 replaces tracing-subscriber with our own minimal logger:
 //! - `vita_log::info!` / `warn!` / `error!` / `debug!` / `trace!`
 //!   macros that format and enqueue messages.
-//! - A dedicated writer thread (spawned via `vita_thread`) drains
-//!   the queue and writes to the log file via `std::fs`.
+//! - A dedicated writer thread (spawned via raw `sceKernelCreateThread`
+//!   in `raw_spawn_writer`) drains the queue and writes via SCE I/O.
 //! - Queue is a `vita_sync::Mutex<VecDeque<String>>` — no pthread
 //!   primitives.
+//!
+//! ## Vita gotchas surfaced during S1 bring-up (2026-06-24)
+//!
+//! 1. **Path form**: sceIoOpen with `"ux0:/data/..."` (leading slash
+//!    after the mount prefix) silently accepts writes that never
+//!    persist. Always use `"ux0:data/..."`.
+//! 2. **Filename `log.txt`**: writes to that specific filename in
+//!    `ux0:data/tailscale-vita/` did not persist (likely tied to the
+//!    historic 40 MiB of `log.txt.{0..3}` left there from the
+//!    M1–M10 tracing-subscriber path). We use `vita.log` instead.
+//! 3. **Append-only fds**: opening `O_WRONLY|O_CREAT` without
+//!    `O_APPEND` produced fds that report write success but never
+//!    flushed data to disk. `O_APPEND` works reliably.
+//! 4. **vita-thread closure trampoline crashes the SUPRX**: spawning
+//!    via `vita_thread::Builder::spawn` (which boxes the closure and
+//!    invokes a `Box<dyn FnOnce>` from the SCE-spawned thread) faults
+//!    on the first allocation. The writer thread is spawned via raw
+//!    `sceKernelCreateThread` instead, with cfg passed through a
+//!    static slot (`WRITER_CFG`).
+//! 5. **Cross-thread alloc → dealloc**: `TaipoolAllocator` is not
+//!    safe for the bootstrap thread to allocate a `String` and the
+//!    writer thread to free it. Writer leaks drained `String`s after
+//!    writing (workaround in `writer.rs`).
 //!
 //! ## Macro API
 //!
@@ -33,11 +56,13 @@
 //! - Combinations of the above.
 //!
 //! Field names are formatted inline (`key=value message`) — we
-//! lose tracing's structured-JSON semantics but log.txt stays
+//! lose tracing's structured-JSON semantics but the log file stays
 //! human-readable, which is what we need on Vita.
 
 mod error;
+mod io;
 mod macros;
+mod timestamp;
 mod writer;
 
 pub use error::LogError;
@@ -100,7 +125,7 @@ pub struct LogConfig {
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
-            path: "ux0:/data/tailscale-vita/log.txt".into(),
+            path: "ux0:data/tailscale-vita/vita.log".into(),
             filter: "info".into(),
             rotate_bytes: 10 * 1024 * 1024,
             keep_files: 3,
@@ -119,7 +144,9 @@ pub fn init_with_config(cfg: LogConfig) -> Result<(), LogError> {
         return Err(LogError::AlreadyInitialized);
     }
     if let Some(parent) = std::path::Path::new(&cfg.path).parent() {
-        std::fs::create_dir_all(parent).map_err(LogError::Open)?;
+        if let Some(parent_str) = parent.to_str() {
+            io::mkdir_p(parent_str).map_err(LogError::Open)?;
+        }
     }
 
     // Parse filter string. Just the level prefix for now; tracing's
@@ -140,13 +167,92 @@ pub fn init_with_config(cfg: LogConfig) -> Result<(), LogError> {
     let _ = QUEUE.set(Mutex::new(VecDeque::with_capacity(QUEUE_CAP)));
 
     let writer_cfg = cfg.clone();
-    vita_thread::Builder::new()
-        .name("vita-log")
-        .stack_size(256 * 1024)
-        .spawn(move || writer::run(writer_cfg))
-        .map_err(LogError::Open)?;
+    raw_spawn_writer(writer_cfg).map_err(LogError::Open)?;
 
     let _ = INIT.set(());
+    Ok(())
+}
+
+/// On Vita, spawn the writer thread via raw `sceKernelCreateThread`
+/// rather than through `vita_thread::Builder::spawn`. The latter
+/// uses a `Box<dyn FnOnce>` trampoline, and invoking it from a
+/// SCE-spawned thread crashes the SUPRX on the first allocation
+/// the closure performs (verified 2026-06-24). Cfg is handed off
+/// via a static slot to avoid the closure capture entirely.
+#[cfg(target_os = "vita")]
+static mut WRITER_CFG: Option<LogConfig> = None;
+
+#[cfg(target_os = "vita")]
+unsafe extern "C" fn raw_writer_entry(
+    _args: u32,
+    _argp: *mut std::ffi::c_void,
+) -> i32 {
+    let cfg = unsafe {
+        WRITER_CFG
+            .take()
+            .unwrap_or_else(LogConfig::default)
+    };
+    // Catch any panic before it crosses the extern "C" boundary (UB).
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        writer::run(cfg);
+    }));
+    extern "C" {
+        fn sceKernelExitDeleteThread(status: i32) -> i32;
+    }
+    unsafe { sceKernelExitDeleteThread(0) }
+}
+
+#[cfg(target_os = "vita")]
+fn raw_spawn_writer(cfg: LogConfig) -> std::io::Result<()> {
+    use std::ffi::{c_char, c_int, c_void};
+    extern "C" {
+        fn sceKernelCreateThread(
+            name: *const c_char,
+            entry: unsafe extern "C" fn(u32, *mut c_void) -> i32,
+            init_priority: c_int,
+            stack_size: u32,
+            attr: u32,
+            cpu_affinity_mask: c_int,
+            option: *const c_void,
+        ) -> c_int;
+        fn sceKernelStartThread(thid: c_int, arg_len: u32, argp: *mut c_void) -> c_int;
+    }
+    // SAFETY: writer-thread spawn is one-shot at init; no other
+    // writer racing with us. The take() in raw_writer_entry runs
+    // after sceKernelStartThread (an SCE memory barrier).
+    unsafe {
+        WRITER_CFG = Some(cfg);
+    }
+    let thid = unsafe {
+        sceKernelCreateThread(
+            c"vita-log".as_ptr(),
+            raw_writer_entry,
+            0x40,
+            256 * 1024,
+            0,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if thid < 0 {
+        return Err(std::io::Error::other(format!(
+            "sceKernelCreateThread failed: 0x{:08x}",
+            thid as u32
+        )));
+    }
+    let rc = unsafe { sceKernelStartThread(thid, 0, std::ptr::null_mut()) };
+    if rc < 0 {
+        return Err(std::io::Error::other(format!(
+            "sceKernelStartThread failed: 0x{:08x}",
+            rc as u32
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "vita"))]
+fn raw_spawn_writer(cfg: LogConfig) -> std::io::Result<()> {
+    std::thread::spawn(move || writer::run(cfg));
     Ok(())
 }
 
@@ -163,7 +269,7 @@ pub fn __emit(level: Level, file: &'static str, line: u32, args: std::fmt::Argum
     };
     let line_text = format!(
         "{} {} {}:{} {}",
-        now_iso8601_short(),
+        timestamp::format(),
         level.as_str(),
         short_file(file),
         line,
@@ -185,14 +291,6 @@ pub fn flush() {
 // ============================================================
 // Helpers
 // ============================================================
-
-fn now_iso8601_short() -> String {
-    use time::format_description::well_known::Iso8601;
-    use time::OffsetDateTime;
-    OffsetDateTime::now_utc()
-        .format(&Iso8601::DEFAULT)
-        .unwrap_or_else(|_| "?".into())
-}
 
 /// Strip leading `crates/<crate>/src/` prefix so log lines stay
 /// short. Falls back to the full path.
