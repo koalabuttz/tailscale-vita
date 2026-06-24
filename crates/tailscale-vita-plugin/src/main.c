@@ -25,8 +25,10 @@
 #include <psp2/io/stat.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/modulemgr.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/types.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/reent.h>
 
@@ -87,12 +89,20 @@ extern void ts_vita_rt_stop(void);
  * `_init_vita_reent` for the TLS slot (slot 0x89) + reent mutex that
  * pte_osInit reads via vitasdk_get_pthread_data. After that,
  * `pthread_setup()` does pthread_init + __sinit. */
+extern void _init_vita_heap(void);
 extern void _init_vita_reent(void);
+extern void _init_vita_malloc(void);
 extern void _init_vita_io(void);
 /* Splitting pthread_setup into its components for tracing — it
  * crashes from module_start and we want to know exactly where. */
 extern int  pthread_init(void);
 extern void __sinit(struct _reent *);
+
+/* Bound newlib's C-side heap. _init_vita_heap defaults to 128 MB when
+ * this weak symbol is undefined — far too much for a SUPRX sharing the
+ * demo's address space. pthread-embedded's internal C malloc only needs
+ * kilobytes (thread/mutex structs), so 8 MB is ample. */
+unsigned int _newlib_heap_size_user = 8 * 1024 * 1024;
 
 /* Phase 2: stubs for the two libc-cleanup symbols normally provided
  * by vitasdk's crti.o / crtn.o / vita startup files. We use
@@ -105,6 +115,110 @@ extern void __sinit(struct _reent *);
  */
 void _fini(void) {}
 void _free_vita_newlib(void) {}
+
+/* ============================================================
+ * M15-A3 S6 VALIDATION SHIM — SCE-backed pthread TLS keys.
+ *
+ * pthread-embedded's pthread_key_create crashes in this SUPRX even
+ * after pte_osInit succeeds (its sub-ops — calloc + sceKernelGetRandom
+ * Number — both work in isolation, so the fault is in its own compiled
+ * copy: the static-state duplication vs the eboot's libpthread). These
+ * strong symbols live in main.o (always linked, never pulled-from-
+ * archive), so the linker resolves Rust std's pthread_key_create /
+ * setspecific / getspecific to THESE instead of libpthread.a's. Backed
+ * by a thread-id-keyed table + one SCE mutex. Validation scope: NO key
+ * destructors (fine for Copy thread_local!s). If thread_local! works
+ * with this, the full pthread-ABI shim (mutex/cond/rwlock) is viable.
+ * ============================================================ */
+#define SHIM_MAX_KEYS    128
+#define SHIM_MAX_THREADS 64
+
+typedef struct {
+    SceUID tid; /* 0 = free slot */
+    void  *values[SHIM_MAX_KEYS];
+} shim_row;
+
+static shim_row g_shim_rows[SHIM_MAX_THREADS];
+static char     g_shim_key_used[SHIM_MAX_KEYS];
+static SceUID   g_shim_mutex = -1;
+
+static void shim_lock(void)
+{
+    if (g_shim_mutex >= 0) sceKernelLockMutex(g_shim_mutex, 1, NULL);
+}
+static void shim_unlock(void)
+{
+    if (g_shim_mutex >= 0) sceKernelUnlockMutex(g_shim_mutex, 1);
+}
+
+/* Called once from module_start, before any thread spawns. */
+void pte_shim_init(void)
+{
+    g_shim_mutex = sceKernelCreateMutex("pte-shim", 0, 0, NULL);
+}
+
+int pthread_key_create(pthread_key_t *key, void (*destructor)(void *))
+{
+    (void)destructor; /* validation: destructors not honored */
+    int idx = -1;
+    shim_lock();
+    for (int i = 0; i < SHIM_MAX_KEYS; i++) {
+        if (!g_shim_key_used[i]) {
+            g_shim_key_used[i] = 1;
+            idx = i;
+            break;
+        }
+    }
+    shim_unlock();
+    if (idx < 0) return 11; /* EAGAIN */
+    *key = (pthread_key_t)(uintptr_t)(idx + 1);
+    return 0;
+}
+
+int pthread_key_delete(pthread_key_t key)
+{
+    int idx = (int)(uintptr_t)key - 1;
+    if (idx < 0 || idx >= SHIM_MAX_KEYS) return 22; /* EINVAL */
+    shim_lock();
+    g_shim_key_used[idx] = 0;
+    shim_unlock();
+    return 0;
+}
+
+static shim_row *shim_row_current(int create)
+{
+    SceUID tid = sceKernelGetThreadId();
+    int freei = -1;
+    for (int i = 0; i < SHIM_MAX_THREADS; i++) {
+        if (g_shim_rows[i].tid == tid) return &g_shim_rows[i];
+        if (freei < 0 && g_shim_rows[i].tid == 0) freei = i;
+    }
+    if (!create || freei < 0) return NULL;
+    g_shim_rows[freei].tid = tid;
+    return &g_shim_rows[freei];
+}
+
+int pthread_setspecific(pthread_key_t key, const void *value)
+{
+    int idx = (int)(uintptr_t)key - 1;
+    if (idx < 0 || idx >= SHIM_MAX_KEYS) return 22;
+    shim_lock();
+    shim_row *row = shim_row_current(1);
+    if (row) row->values[idx] = (void *)value;
+    shim_unlock();
+    return row ? 0 : 12; /* ENOMEM */
+}
+
+void *pthread_getspecific(pthread_key_t key)
+{
+    int idx = (int)(uintptr_t)key - 1;
+    if (idx < 0 || idx >= SHIM_MAX_KEYS) return NULL;
+    shim_lock();
+    shim_row *row = shim_row_current(0);
+    void *v = row ? row->values[idx] : NULL;
+    shim_unlock();
+    return v;
+}
 
 int module_start(SceSize argc, const void *args)
 {
@@ -151,11 +265,25 @@ int module_start(SceSize argc, const void *args)
      * context. Instead the SCE-spawned bootstrap thread (kicked off
      * by ts_vita_rt_start) calls them later, where __getreent_for_thread
      * can auto-allocate a per-thread reent slot. */
-    trace("c3a: pre-_init_vita_reent");
+    /* M15-A3 S6 spike — full newlib C-side init so pthread-embedded's
+     * internal calloc/malloc (pthread_mutex_init, pthread_mutexattr_init)
+     * works. The missing _init_vita_malloc() was the std::sync::Mutex
+     * crash: newlib __malloc_lock on an uninitialised LwMutex. Order
+     * matches crt0 (heap, reent, malloc, io). Then create pte_selfThreadKey
+     * so thread_local! can self-heal. None of this calls the crashing
+     * pte_osInit / full pthread_init. */
+    trace("c3a: pre-_init_vita_heap");
+    _init_vita_heap();
+    trace("c3b: pre-_init_vita_reent");
     _init_vita_reent();
-    trace("c3b: _init_vita_reent returned");
+    trace("c3c: pre-_init_vita_malloc");
+    _init_vita_malloc();
+    trace("c3d: pre-_init_vita_io");
     _init_vita_io();
-    trace("c3c: _init_vita_io returned");
+    trace("c3e: newlib C-side init done (heap+reent+malloc+io)");
+    /* Create the pthread-key shim's lock before any thread spawns. */
+    pte_shim_init();
+    trace("c3f: pte_shim_init done");
 
     trace("c4: pre-ts_vita_rt_start");
     int rust_rc = ts_vita_rt_start();
