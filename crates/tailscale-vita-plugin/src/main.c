@@ -72,7 +72,10 @@ static void trace(const char *msg)
  * full runtime allocates several MB at startup (smoltcp socket bufs,
  * h2 frame bufs, DERP queue buffers, RustCrypto state, PEM-decoded
  * cert chain). Start at 16 MB; profile + tune later. */
-#define TAIPOOL_BYTES (16 * 1024 * 1024)
+/* S7: taipool is no longer Rust's global allocator (that's now newlib's
+ * System) — keep a small reservation only in case something still touches
+ * taipool_alloc; the runtime's heap is the newlib heap below. */
+#define TAIPOOL_BYTES (4 * 1024 * 1024)
 
 /* Defined in crates/tailscale-vita-rt/src/lib.rs. */
 extern int  ts_vita_rt_start(void);
@@ -108,7 +111,10 @@ extern void __sinit(struct _reent *);
  * this weak symbol is undefined — far too much for a SUPRX sharing the
  * demo's address space. pthread-embedded's internal C malloc only needs
  * kilobytes (thread/mutex structs), so 8 MB is ample. */
-unsigned int _newlib_heap_size_user = 8 * 1024 * 1024;
+/* S7: the newlib heap now backs ALL Rust allocation (Global = System) plus
+ * C-side libc + pthread internals — bumped to 32 MB to cover the runtime
+ * (smoltcp bufs, h2 frames, rustls cert chains, crypto, the netmap). */
+unsigned int _newlib_heap_size_user = 32 * 1024 * 1024;
 
 /* Phase 2: stubs for the two libc-cleanup symbols normally provided
  * by vitasdk's crti.o / crtn.o / vita startup files. We use
@@ -157,10 +163,27 @@ static void shim_unlock(void)
     if (g_shim_mutex >= 0) sceKernelUnlockMutex(g_shim_mutex, 1);
 }
 
+/* pthread-embedded's per-thread "self" descriptor key. Normally created
+ * by pthread_init() (pthread_init.c:72) — which we SKIP because it crashes
+ * in this SUPRX (S6). Left NULL, pthread_self()'s descriptor cache
+ * (`pthread_setspecific(pte_selfThreadKey, self)`) targets key 0, which our
+ * shim rejects (idx = -1) as a no-op. So every pthread_self() on a foreign
+ * (sceKernelCreateThread) thread re-runs the `sp == NULL` path and mints a
+ * fresh pte_thread_t via pte_new() — a ~256 B leak PER CALL (~890 KB/s on
+ * hardware → 32 MB OOM in ~40 s; S7 root cause). Giving the key a real shim
+ * slot makes the cache work: one descriptor per thread, reused thereafter. */
+extern pthread_key_t pte_selfThreadKey;
+extern pthread_key_t pte_cleanupKey;
+
 /* Called once from module_start, before any thread spawns. */
 void pte_shim_init(void)
 {
     g_shim_mutex = sceKernelCreateMutex("pte-shim", 0, 0, NULL);
+    /* Must come AFTER g_shim_mutex (pthread_key_create takes shim_lock).
+     * These are the two keys pthread_init() would create; without them the
+     * self-descriptor cache and cleanup-handler TLS are no-ops (key 0). */
+    pthread_key_create(&pte_selfThreadKey, NULL);
+    pthread_key_create(&pte_cleanupKey, NULL);
 }
 
 int pthread_key_create(pthread_key_t *key, void (*destructor)(void *))

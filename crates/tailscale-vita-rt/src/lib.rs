@@ -159,8 +159,16 @@ unsafe impl GlobalAlloc for TaipoolAllocator {
     }
 }
 
+// S7: Rust's Global allocator is now newlib's System (malloc/free/memalign),
+// NOT the hand-rolled TaipoolAllocator. TaipoolAllocator's prefix-pointer
+// scheme corrupted under toml's allocation pattern (taipool_free crash on a
+// zeroed prefix word). newlib's heap + malloc are now initialised in
+// module_start (_init_vita_heap/_init_vita_malloc) and proven working
+// (thread_local/tokio ran on System), so unifying ALL allocation (Rust
+// Global + std::alloc::System + C libc) on one tested newlib heap removes
+// the custom-allocator bug class. TaipoolAllocator is kept below but unused.
 #[global_allocator]
-static ALLOCATOR: TaipoolAllocator = TaipoolAllocator;
+static ALLOCATOR: std::alloc::System = std::alloc::System;
 
 // ---------------- Runtime entry points (Phase 2B) ----------------
 
@@ -178,33 +186,74 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 unsafe extern "C" fn bootstrap_main(_args: u32, _argp: *mut c_void) -> i32 {
     trace("rb1: bootstrap thread entry");
 
-    // M15-A3 S1: SUPRX-safe vita-log smoke test. Brings up the
-    // logger (vita_sync + raw-SCE writer-spawn workaround) and emits
-    // two info!() lines. The full `run_runtime()` path still uses
-    // tracing macros that need migrating; S5 covers that.
+    // PERMANENT raw-sceIo panic hook. std's default backtrace machinery
+    // (gimli/addr2line) crashes in taipool_free in this SUPRX (S6), so this
+    // is the ONLY working panic diagnostic — it traces message+location
+    // directly, and fires at panic time regardless of whether unwinding
+    // works. Keep it for the life of the plugin.
+    std::panic::set_hook(Box::new(|info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<no loc>".to_string());
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("<non-str payload>");
+        trace(&format!("PANIC at {}: {}", loc, msg));
+    }));
+    trace("rb-hook: panic hook installed");
 
-    match vita_log::init() {
-        Ok(_) => trace("rb2: vita_log::init Ok"),
-        Err(LogError::AlreadyInitialized) => trace("rb2: already-init"),
-        Err(LogError::Open(ref io)) => {
-            let code = io.raw_os_error().unwrap_or(-9999);
-            trace(&format!(
-                "rb2: vita_log::init Open kind={:?} os_code={} (fatal)",
-                io.kind(),
-                code
-            ));
-            unsafe { sceKernelExitDeleteThread(0) };
+    // Materialize THIS thread's newlib _REENT (TLS slot 0x89) before any
+    // libc call. The bootstrap thread is a raw sceKernelCreateThread spawn
+    // (not via vita_thread, which touches reent in its trampoline), and
+    // run_runtime's first acts — Config::load (std::fs), OsRng/getentropy,
+    // std::sync::Mutex, Instant::now — all deref _REENT. Without this it
+    // regresses to the pre-S6 crash. __getreent self-heals (module_start
+    // ran _init_vita_reent). [S7 must-fix #2 — was in the deleted run_probe.]
+    unsafe {
+        extern "C" {
+            fn __getreent() -> *mut c_void;
         }
-        Err(e) => {
-            trace(&format!("rb2: vita_log::init err {:?} (fatal)", e));
-            unsafe { sceKernelExitDeleteThread(0) };
-        }
+        let _ = __getreent();
     }
+    trace("rb-reent: bootstrap reent touched");
 
-    vita_log::info!("hello from SUPRX — M15-A3 S1 vertical slice");
-    vita_log::info!(thread_id = "bootstrap", "second info! with field syntax");
-    vita_log::flush();
-    trace("rb-end: S1 smoke test complete; exiting bootstrap");
+    // Set up THIS thread's pthread-OSAL control block (pspThreadData with a
+    // cancellation eventflag). pte_osSemaphoreCancellablePend — the
+    // pthread_cond/park path std (and thus tokio's block_on) uses when it
+    // WAITS for I/O — derefs it; on a raw SCE thread it's NULL => data abort
+    // (the register-step crash). pte_osInit() materializes it (proven in the
+    // S6 spike, v5). This is the OSAL init only, NOT the crashing full
+    // pthread_init. Idempotent enough: one call per thread, sets its slot.
+    unsafe {
+        extern "C" {
+            fn pte_osInit() -> i32;
+        }
+        let _ = pte_osInit();
+    }
+    trace("rb-pte: pte_osInit done (thread parkable)");
+
+    // One-shot probe: does ARM EHABI unwinding actually work in this
+    // -nostartfiles SUPRX? If catch_unwind contains this panic we get
+    // "uw-ok" and the panic boundaries (here + vita_thread) are real; if
+    // unwinding is broken the process dies at the panic (the hook's PANIC
+    // line is the last marker) and we'd switch to panic="abort".
+    let uw = std::panic::catch_unwind(|| panic!("unwind-probe"));
+    trace(if uw.is_err() {
+        "uw-ok: unwinding works (panic contained)"
+    } else {
+        "uw-BAD: catch_unwind returned Ok (impossible)"
+    });
+
+    // S7: run the REAL runtime, contained. run_runtime does Config::load ->
+    // Runtime::up (register over Noise+h2 on a tokio current-thread rt) ->
+    // TcpListener::bind -> spawn event-loop worker -> accept loop.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run_runtime));
+
+    trace("rb-end: run_runtime returned; exiting bootstrap");
 
     // SAFETY: extern C call to exit cleanly.
     unsafe { sceKernelExitDeleteThread(0) }
@@ -226,8 +275,14 @@ pub unsafe extern "C" fn ts_vita_rt_start() -> i32 {
         sceKernelCreateThread(
             c"ts-vita-rt-boot".as_ptr(),
             bootstrap_main,
-            0x40,        // priority (matches vitacompanion)
-            256 * 1024,  // stack
+            0x40,            // priority (matches vitacompanion)
+            // S7: 4 MB stack. The bootstrap thread runs the whole
+            // synchronous bring-up on one stack — toml/serde parsing
+            // (very stack-heavy), then rustls + h2 + Noise handshakes
+            // (big cert/frame buffers). The old 256 KB overflowed in
+            // toml::from_str (hard abort, no panic) where the eboot's
+            // ~1 MB main thread does not. Generous here; tune later.
+            4 * 1024 * 1024, // stack
             0,
             0,
             ptr::null(),

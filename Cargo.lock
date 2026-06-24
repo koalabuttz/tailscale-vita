@@ -1657,7 +1657,6 @@ version = "0.1.0"
 dependencies = [
  "netstack",
  "tailscale-vita",
- "tokio",
  "vita-chan",
  "vita-log",
  "vita-thread",

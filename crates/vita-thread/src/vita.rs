@@ -82,13 +82,44 @@ pub struct Handle(c_int);
 /// The kernel copies `arg_len` bytes from `argp` into thread-local
 /// storage; this function reads the pointer back out.
 unsafe extern "C" fn thread_entry(_arg_len: u32, argp: *mut c_void) -> i32 {
+    // Materialize this SCE thread's newlib per-thread _REENT (TLS slot
+    // 0x89) BEFORE running any Rust std code. libc malloc/free/errno (and
+    // anything std does that touches them) deref the calling thread's
+    // _REENT, but a raw sceKernelCreateThread thread has none until it's
+    // touched. __getreent() self-heals (module_start ran _init_vita_reent,
+    // so _newlib_reent_mutex exists). Without this, the FIRST std alloc /
+    // errno on a spawned worker faults — the exact M15-A3 S6 crash class.
+    // Every worker the runtime spawns (magicsock, wg pump, derp, netstack
+    // poll, event loop, listener) goes through here, so this one touch
+    // makes them all std-ready.
+    unsafe {
+        extern "C" {
+            fn __getreent() -> *mut c_void;
+        }
+        let _ = __getreent();
+    }
+    // Set up this worker's pthread-OSAL control block (pspThreadData +
+    // cancel eventflag). Needed before any std::sync::Condvar /
+    // thread::park / tokio block_on that WAITS, since pthread_cond's
+    // pte_osSemaphoreCancellablePend derefs it (NULL on a raw SCE thread
+    // => abort). pte_osInit() materializes it; OSAL-only, not the crashing
+    // full pthread_init. (S6/S7 finding.)
+    unsafe {
+        extern "C" {
+            fn pte_osInit() -> i32;
+        }
+        let _ = pte_osInit();
+    }
     // Read the boxed-closure pointer from the args buffer. argp is
     // a pointer to a copy of a `*mut BoxedClosure` value.
     let boxed_ptr: *mut BoxedClosure = unsafe { *(argp as *const *mut BoxedClosure) };
     // SAFETY: we leaked exactly one Box in `spawn`; reclaim it.
     let boxed: Box<BoxedClosure> = unsafe { Box::from_raw(boxed_ptr) };
-    // Inner Box → FnOnce. Move out + call.
-    (*boxed)();
+    // Inner Box → FnOnce. Move out + call, CONTAINED: panic=unwind is the
+    // staticlib profile, so a panic escaping this `extern "C"` frame is ARM
+    // EHABI UB / scheduler corruption. catch_unwind makes the Builder::spawn
+    // contract ("on panic the thread simply exits") real for every worker.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (*boxed)()));
     // Exit (NOT delete) so a pending join can wake up.
     unsafe { sceKernelExitThread(0) };
     0

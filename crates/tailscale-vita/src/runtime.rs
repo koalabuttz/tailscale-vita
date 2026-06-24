@@ -147,11 +147,36 @@ impl Default for OnlineState {
     }
 }
 
+/// S7 raw-sceIo trace into the SUPRX phase2-trace file, to localize a
+/// hard data-abort inside Runtime::up (which crosses crate boundaries
+/// away from tailscale-vita-rt's `trace`). No newlib/alloc dependency.
+#[cfg(target_os = "vita")]
+fn suprx_trace(msg: &str) {
+    use std::ffi::{c_char, c_int, c_void};
+    extern "C" {
+        fn sceIoOpen(path: *const c_char, flag: c_int, mode: c_int) -> c_int;
+        fn sceIoWrite(fd: c_int, buf: *const c_void, len: u32) -> c_int;
+        fn sceIoClose(fd: c_int) -> c_int;
+    }
+    let path = c"ux0:data/tailscale-vita/phase2-trace.txt".as_ptr();
+    unsafe {
+        let fd = sceIoOpen(path, 0x0002 | 0x0200 | 0x0100, 0o666);
+        if fd >= 0 {
+            let _ = sceIoWrite(fd, msg.as_ptr() as *const c_void, msg.len() as u32);
+            let _ = sceIoWrite(fd, b"\n".as_ptr() as *const c_void, 1);
+            let _ = sceIoClose(fd);
+        }
+    }
+}
+#[cfg(not(target_os = "vita"))]
+fn suprx_trace(_msg: &str) {}
+
 impl Runtime {
     /// Block until the v1 control plane is up: fetch server key, load
     /// keystore, complete Noise+HTTP/2 handshake, register, spin up
     /// engine + DerpTransport + Stack + MapClient.
     pub fn up(config: Config) -> Result<Self, RuntimeError> {
+        suprx_trace("up1: Runtime::up entry");
         let state_dir = PathBuf::from(&config.state_dir);
         let host_authority = config.host_authority();
 
@@ -164,6 +189,7 @@ impl Runtime {
         // KeyStore first — persistent machine/node/disco keys. Both the
         // initial bootstrap below and any M13 reconnect reuse this.
         let ks = KeyStore::load_or_generate(&state_dir)?;
+        suprx_trace("up2: keystore loaded");
 
         // 8. DerpTransport + MagicSocket (M12) + Engine + Stack.
         // Same 32 priv bytes serve WG identity AND DERP NaCl-box ECDH
@@ -185,12 +211,15 @@ impl Runtime {
             non_disco_tx,
         )?;
         let magic_local = magic_ctl.local_addr();
+        suprx_trace("up4: magicsock bound");
         info!(%magic_local, "magicsock.bound");
 
         // Local endpoint candidates for MapRequest.Endpoints. Discover
         // our LAN IP via the connect-trick (kernel routing decision —
         // no packet actually sent).
+        suprx_trace("up5: pre build_local_endpoints (connect-trick)");
         let local_endpoints = build_local_endpoints(&config.control_url, magic_local);
+        suprx_trace("up5b: local endpoints built");
         // M14E: parallel `tailcfg.EndpointType` codes. Every endpoint
         // we build via the connect-trick is a LAN IP (Vita's WiFi
         // address), so type 1 = `EndpointLocal`. Real Tailscale
@@ -211,14 +240,17 @@ impl Runtime {
         let dual = DualTransport::new(magic_ctl.clone(), non_disco_rx, derp_transport);
         let hint: Arc<dyn wg_engine::DirectPathHint> = Arc::new(magic_ctl.clone());
         let engine_running = engine.start_with_hint(dual, Some(hint))?;
+        suprx_trace("up6: wg engine pump started");
         info!("wg-engine: pump running with DualTransport(Magic+Derp)");
 
         let stack = Stack::start(StackConfig::new(), engine_running)?;
+        suprx_trace("up7: netstack poll started");
         info!("netstack: poll thread running (no local IP yet)");
 
         // 9. First control-plane session: Noise IK + H2 + register +
         // MapClient. M13: factored into a helper so reconnect can call
         // it again on long-poll failures.
+        suprx_trace("up8: pre bootstrap_control_session (server-key/Noise/h2/register)");
         let map = bootstrap_control_session(
             &config,
             &ks,
@@ -228,6 +260,7 @@ impl Runtime {
             &state_dir,
             BootstrapPhase::Initial,
         )?;
+        suprx_trace("up9: control session up (registered + map started)");
         info!("control.map.started");
 
         let (signal_tx, signal_rx) = unbounded();
@@ -1179,6 +1212,7 @@ fn bootstrap_control_session(
     phase: BootstrapPhase,
 ) -> Result<MapClient, ts_control::ControlError> {
     info!(?phase, "control.bootstrap.start");
+    suprx_trace("cs1: pre fetch_server_key (first HTTPS/TLS)");
 
     // 1. Fetch server's Noise pubkey via cache (M13.5 Stage 2). Cache
     // TTL is 1 h; on a Noise failure below we invalidate + retry to
@@ -1188,6 +1222,7 @@ fn bootstrap_control_session(
         config.capver,
         state_dir,
     )?;
+    suprx_trace("cs2: server key received");
     info!(server_pub = %server_pub, "control.key.received");
 
     // 2. Noise IK handshake.
@@ -1206,7 +1241,9 @@ fn bootstrap_control_session(
     let header_b64 = hs.build_init_header()?;
     info!(b64_len = header_b64.len(), "control.noise.init.built");
 
+    suprx_trace("cs3: pre dial_and_upgrade (TCP connect + 101)");
     let mut upgraded = ts_control::upgrade::dial_and_upgrade(&config.control_url, &header_b64)?;
+    suprx_trace("cs4: upgraded (101); noise handshake next");
     info!(leftover = upgraded.leftover.len(), "control.upgrade.101");
 
     let server_response = read_server_response(&mut upgraded)?;
@@ -1231,10 +1268,12 @@ fn bootstrap_control_session(
     let mut noise_stream = NoiseStream::new(upgraded.tcp, nt, leftover);
     consume_early_payload(&mut noise_stream)?;
 
+    suprx_trace("cs5: noise handshake complete; opening h2");
     // 3. HTTP/2 over the Noise tunnel.
     let async_stream = AsyncNoiseStream::spawn(noise_stream);
     info!("opening HTTP/2 over Noise");
     let mut conn = Http2Conn::open(async_stream)?;
+    suprx_trace("cs6: h2 handshake complete (tokio block_on worked!)");
     info!("control.http2.handshake.complete");
 
     // 4. Register. Ephemeral=true is baked into ts_control::register so
@@ -1252,6 +1291,7 @@ fn bootstrap_control_session(
         &config.hostname,
         host_authority,
     )?;
+    suprx_trace("cs7: REGISTERED with control plane!");
     info!(
         machine_authorized = outcome.machine_authorized,
         node_key_expired = outcome.node_key_expired,

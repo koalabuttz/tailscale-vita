@@ -49,12 +49,15 @@ pub(crate) fn run(cfg: LogConfig) {
 
         for line in drained {
             state.write_line(&line);
-            // Workaround: bootstrap thread allocated this String via
-            // taipool; writer-thread free crashes the SUPRX. Leak
-            // until S2 introduces a thread-safe allocator wrapper or
-            // a transfer-of-ownership protocol that keeps alloc and
-            // free on the same thread. See `lib.rs` notes.
-            std::mem::forget(line);
+            // `line` drops here, freeing it on the writer thread. This is
+            // safe now: the SUPRX `#[global_allocator]` is `std::alloc::System`
+            // (newlib's single global, `__malloc_lock`-protected heap), so a
+            // String allocated on the producer thread frees fine here. The old
+            // `mem::forget` workaround existed only for taipool, whose
+            // alloc/free heap-identity split (System memalign vs taipool free)
+            // crashed cross-thread frees — that allocator was dropped in
+            // M15-A3 S7. Forgetting instead leaked every drained line at the
+            // log-emission rate (~835 KB/s on hardware → 32 MB OOM in ~40 s).
         }
 
         let dropped = LOGS_DROPPED.swap(0, Ordering::Relaxed);
