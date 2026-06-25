@@ -93,6 +93,22 @@ pub struct Stack {
     _engine: Option<wg_engine::EngineRunning>,
 }
 
+/// A `Send + Clone` handle to a running [`Stack`], for creating sockets
+/// (`TcpListener::bind_handle`, `TcpStream::connect_handle`) from threads
+/// that do **not** own the `Stack`. `Stack` itself isn't shareable, but an
+/// in-process service (e.g. ts-ftp binding PASV data listeners on its own
+/// thread) needs to create sockets where the `Stack` lives elsewhere.
+///
+/// Holds an `Arc<StackInner>`, so it keeps the shared netstack state alive
+/// but does NOT keep the poll thread running — that ends with the `Stack`.
+/// Creating sockets after the `Stack` is dropped yields sockets that never
+/// get polled; services should stop before the runtime tears down (the
+/// LocalAPI/ts-ftp `Drop`-then-join lifecycle ensures this).
+#[derive(Clone)]
+pub struct StackHandle {
+    pub(crate) inner: Arc<StackInner>,
+}
+
 impl Stack {
     pub fn start(
         cfg: StackConfig,
@@ -139,6 +155,14 @@ impl Stack {
     /// Internal handle to the shared state. Cloned into per-socket types.
     pub(crate) fn inner(&self) -> Arc<StackInner> {
         Arc::clone(&self.inner)
+    }
+
+    /// A `Send + Clone` [`StackHandle`] for creating sockets from threads
+    /// that don't own this `Stack`. See [`StackHandle`].
+    pub fn handle(&self) -> StackHandle {
+        StackHandle {
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     /// Replace the iface's IPv4 address list. Called by the demo from

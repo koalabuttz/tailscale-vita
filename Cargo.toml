@@ -12,6 +12,7 @@ members = [
     "crates/ts-derp",
     "crates/ts-disco",
     "crates/ts-magicsock",
+    "crates/ts-ftp",
     "crates/tailscale-vita",
     "crates/tailscale-vita-demo",
     "crates/tailscale-vita-rt",

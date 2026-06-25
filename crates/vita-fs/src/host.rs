@@ -27,3 +27,18 @@ pub(super) fn remove_file(path: &Path) -> io::Result<()> {
 pub(super) fn rename(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
+
+pub(super) fn read_dir(path: &Path) -> io::Result<Vec<super::DirEntry>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        let is_dir = meta.is_dir();
+        out.push(super::DirEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir,
+            size: if is_dir { 0 } else { meta.len() },
+        });
+    }
+    Ok(out)
+}

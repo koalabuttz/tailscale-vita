@@ -1631,6 +1631,7 @@ dependencies = [
  "ts-control",
  "ts-derp",
  "ts-disco",
+ "ts-ftp",
  "ts-magicsock",
  "vita-chan",
  "vita-fs",
@@ -1957,6 +1958,18 @@ dependencies = [
  "rand",
  "rand_core",
  "zerocopy",
+]
+
+[[package]]
+name = "ts-ftp"
+version = "0.1.0"
+dependencies = [
+ "netstack",
+ "serde",
+ "vita-fs",
+ "vita-log",
+ "vita-sync",
+ "vita-thread",
 ]
 
 [[package]]

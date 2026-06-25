@@ -82,3 +82,50 @@ pub fn remove_file(path: &Path) -> io::Result<()> {
 pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
     imp::rename(from, to)
 }
+
+/// One entry returned by [`read_dir`]: a bare name plus the minimal
+/// metadata an FTP `LIST` needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirEntry {
+    /// Entry name only (no path components).
+    pub name: String,
+    /// True if this entry is a directory.
+    pub is_dir: bool,
+    /// Size in bytes (0 for directories).
+    pub size: u64,
+}
+
+/// List a directory's entries. `NotFound` if the directory is absent.
+/// `.` and `..` are omitted; order is filesystem-defined.
+pub fn read_dir(path: &Path) -> io::Result<Vec<DirEntry>> {
+    imp::read_dir(path)
+}
+
+#[cfg(all(test, not(target_os = "vita")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_dir_lists_files_and_dirs() {
+        let dir = std::env::temp_dir().join(format!("vita-fs-rd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+
+        let mut entries = read_dir(&dir).unwrap();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], DirEntry { name: "a.txt".into(), is_dir: false, size: 5 });
+        assert_eq!(entries[1], DirEntry { name: "sub".into(), is_dir: true, size: 0 });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_dir_missing_is_not_found() {
+        let p = std::env::temp_dir().join("vita-fs-definitely-absent-zzz");
+        let _ = std::fs::remove_dir_all(&p);
+        assert_eq!(read_dir(&p).unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+}

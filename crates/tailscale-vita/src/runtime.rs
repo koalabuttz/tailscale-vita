@@ -83,6 +83,13 @@ pub struct Runtime {
     /// M14 LocalAPI server handle. `None` if bind failed at startup
     /// or LocalAPI was disabled in config. Dropped on shutdown.
     _localapi: Option<crate::localapi::LocalApiServer>,
+    /// Optional FTP-on-the-tailnet service. `None` if `config.ftp.enabled`
+    /// is false or the bind failed. Dropped (stop + join) on shutdown.
+    _ts_ftp: Option<ts_ftp::TsFtpServer>,
+    /// Node's tailnet IPv4, published on the first MapResponse (in
+    /// `run_event_loop`, alongside `stack.set_local_addrs`). Shared with
+    /// the ts-ftp service for PASV `227` replies. `None` until registered.
+    tailnet_ip: ts_ftp::TailnetIp,
 }
 
 /// Out-of-band signals the management UI can send to the running
@@ -286,6 +293,25 @@ impl Runtime {
             }
         };
 
+        // M16: tailnet-IP holder, published on the first MapResponse (see
+        // run_event_loop). Shared with the optional ts-ftp service so its
+        // PASV `227` replies advertise the right address.
+        let tailnet_ip: ts_ftp::TailnetIp = Arc::new(Mutex::new(None));
+
+        // M16: spawn the FTP service if enabled. Bind failure is non-fatal —
+        // the daemon keeps running without FTP. `stack.handle()` is a Send
+        // handle so the FTP thread can bind PASV listeners on its own.
+        let ts_ftp = if config.ftp.enabled {
+            ts_ftp::TsFtpServer::spawn(
+                stack.handle(),
+                config.ftp.clone(),
+                Arc::clone(&tailnet_ip),
+            )
+        } else {
+            info!("ts-ftp.disabled (config.ftp.enabled = false)");
+            None
+        };
+
         Ok(Self {
             config,
             state_dir,
@@ -302,6 +328,8 @@ impl Runtime {
             signal_rx: Some(signal_rx),
             snapshot,
             _localapi: localapi,
+            _ts_ftp: ts_ftp,
+            tailnet_ip,
         })
     }
 
@@ -717,6 +745,9 @@ impl Runtime {
                             "netstack.local_addrs.from_mapresponse"
                         );
                         stack.set_local_addrs(local_cidrs);
+                        // M16: publish the tailnet IP for the ts-ftp service's
+                        // PASV replies (first IPv4 addr; same one smoltcp uses).
+                        *self.tailnet_ip.lock() = snap.our_addrs.first().map(|a| a.addr);
                         local_addrs_set = true;
                     }
 

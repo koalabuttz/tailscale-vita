@@ -13,7 +13,39 @@ extern "C" {
     fn sceIoRemove(path: *const c_char) -> c_int;
     fn sceIoRename(from: *const c_char, to: *const c_char) -> c_int;
     fn sceIoSyncByFd(fd: c_int, flag: c_int) -> c_int;
+    fn sceIoDopen(path: *const c_char) -> c_int;
+    fn sceIoDread(fd: c_int, dir: *mut SceIoDirent) -> c_int;
+    fn sceIoDclose(fd: c_int) -> c_int;
 }
+
+/// `SceIoStat` (0x58 bytes) — kernel file-status struct. We only read
+/// `st_attr` (dir bit) and `st_size`; timestamps are opaque 16-byte
+/// `SceDateTime`s we never decode. Layout per
+/// `vitasdk .../psp2common/kernel/iofilemgr.h`.
+#[repr(C)]
+struct SceIoStat {
+    st_mode: i32,         // 0x00
+    st_attr: u32,         // 0x04  SCE_SO_IF* attribute bits
+    st_size: i64,         // 0x08
+    st_ctime: [u8; 16],   // 0x10  SceDateTime
+    st_atime: [u8; 16],   // 0x20  SceDateTime
+    st_mtime: [u8; 16],   // 0x30  SceDateTime
+    st_private: [u32; 6], // 0x40
+}
+
+/// `SceIoDirent` (0x160 bytes) — one directory entry filled by
+/// `sceIoDread`. `d_name` is a NUL-terminated C string (≤255 + NUL).
+#[repr(C)]
+struct SceIoDirent {
+    d_stat: SceIoStat,      // 0x00
+    d_name: [c_char; 256],  // 0x58
+    d_private: *mut c_void, // 0x158
+    dummy: c_int,           // 0x15C
+}
+
+/// `st_attr` directory test: `(attr & SCE_SO_IFMT) == SCE_SO_IFDIR`.
+const SCE_SO_IFMT: u32 = 0x0038;
+const SCE_SO_IFDIR: u32 = 0x0010;
 
 const SCE_O_RDONLY: c_int = 0x0001;
 const SCE_O_WRONLY: c_int = 0x0002;
@@ -155,4 +187,42 @@ pub(super) fn rename(from: &Path, to: &Path) -> io::Result<()> {
         return Err(sce_err(rc, "sceIoRename"));
     }
     Ok(())
+}
+
+pub(super) fn read_dir(path: &Path) -> io::Result<Vec<super::DirEntry>> {
+    let cp = cstr(&norm(path)?)?;
+    // SAFETY: cp is null-terminated.
+    let fd = unsafe { sceIoDopen(cp.as_ptr()) };
+    if fd < 0 {
+        if fd == SCE_ERRNO_ENOENT {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        return Err(sce_err(fd, "sceIoDopen"));
+    }
+    let mut out = Vec::new();
+    loop {
+        // Zeroed is valid: repr(C) POD, d_private becomes null (unused).
+        let mut dirent: SceIoDirent = unsafe { std::mem::zeroed() };
+        // SAFETY: fd valid; dirent is a valid writable SceIoDirent.
+        let rc = unsafe { sceIoDread(fd, &mut dirent) };
+        if rc < 0 {
+            unsafe { sceIoDclose(fd) };
+            return Err(sce_err(rc, "sceIoDread"));
+        }
+        if rc == 0 {
+            break; // no more entries
+        }
+        // SAFETY: the kernel NUL-terminates d_name within the 256-byte buffer.
+        let name = unsafe { std::ffi::CStr::from_ptr(dirent.d_name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let is_dir = (dirent.d_stat.st_attr & SCE_SO_IFMT) == SCE_SO_IFDIR;
+        let size = if is_dir { 0 } else { dirent.d_stat.st_size.max(0) as u64 };
+        out.push(super::DirEntry { name, is_dir, size });
+    }
+    unsafe { sceIoDclose(fd) };
+    Ok(out)
 }

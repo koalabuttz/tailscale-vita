@@ -34,7 +34,7 @@ use crate::buf::{make_tcp_buffers, DEFAULT_TCP_RX_BUF, DEFAULT_TCP_TX_BUF};
 use crate::handle::HandleSlot;
 use crate::poll::poke;
 use crate::tcp::TcpStream;
-use crate::{Stack, StackInner};
+use crate::{Stack, StackHandle, StackInner};
 
 /// How long `accept_timeout` sleeps between polls of the socket pool.
 /// 50 ms keeps accept latency invisible against DERP-relayed RTT.
@@ -59,6 +59,17 @@ impl TcpListener {
     /// listener can hold; the (pool_size+1)th SYN gets RST'd and the
     /// client retries.
     pub fn bind(stack: &Stack, port: u16, pool_size: usize) -> io::Result<Self> {
+        Self::bind_inner(stack.inner(), port, pool_size)
+    }
+
+    /// Like [`bind`](Self::bind), but from a [`StackHandle`] — usable on a
+    /// thread that doesn't own the `Stack`. ts-ftp uses this to bind a
+    /// fresh PASV data-channel listener mid-session, on its own thread.
+    pub fn bind_handle(handle: &StackHandle, port: u16, pool_size: usize) -> io::Result<Self> {
+        Self::bind_inner(Arc::clone(&handle.inner), port, pool_size)
+    }
+
+    fn bind_inner(inner: Arc<StackInner>, port: u16, pool_size: usize) -> io::Result<Self> {
         if port == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -66,7 +77,6 @@ impl TcpListener {
             ));
         }
         let pool_size = pool_size.max(1);
-        let inner = stack.inner();
 
         let mut pool = Vec::with_capacity(pool_size);
         {

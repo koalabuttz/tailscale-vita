@@ -1,0 +1,19 @@
+[package]
+name = "ts-ftp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# ts-ftp: a minimal FTP server bound to the tailnet IP, the first optional
+# in-process "service" on the tailscale-vita runtime. Plaintext (WireGuard
+# already encrypts the pipe) + permissive auth (the tailnet ACL is the
+# boundary). Serves the Vita filesystem via vita-fs; binds the netstack via
+# a StackHandle so PASV data listeners can be created off the runtime thread.
+[dependencies]
+netstack    = { path = "../netstack" }
+vita-fs     = { path = "../vita-fs" }
+vita-log    = { path = "../vita-log" }
+vita-thread = { path = "../vita-thread" }
+vita-sync   = { path = "../vita-sync" }
+serde       = { workspace = true }

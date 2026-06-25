@@ -75,6 +75,13 @@ pub struct Config {
     /// another homebrew on the device.
     #[serde(default = "default_localapi_port")]
     pub localapi_port: Option<u16>,
+
+    /// `[ftp]` — optional FTP server on the tailnet IP, so the Vita's
+    /// filesystem is reachable from any network. Disabled by default (it
+    /// exposes the filesystem; the tailnet ACL is the boundary). See
+    /// [`ts_ftp::FtpConfig`].
+    #[serde(default)]
+    pub ftp: ts_ftp::FtpConfig,
 }
 
 impl Config {
@@ -158,6 +165,18 @@ capver              = 138
 # Runtime startup and just keeps the process alive so the SUPRX can
 # run. Default false (M10 demo behavior).
 # suprx_host_only   = false
+
+# FTP server on the tailnet IP — reach the Vita's files from any network
+# with a standard FTP client. Off by default: it exposes the filesystem,
+# gated only by your tailnet ACL. Plaintext is fine — WireGuard encrypts
+# the tunnel. `root` jails the client; `..` cannot escape above it.
+[ftp]
+enabled         = false
+port            = 21
+root            = "ux0:"
+read_only       = false
+passive_port_lo = 30000
+passive_port_hi = 30009
 "#;
 
 fn default_hostname() -> String {
@@ -218,6 +237,7 @@ mod tests {
             capver: 138,
             suprx_host_only: false,
             localapi_port: Some(crate::localapi::DEFAULT_PORT),
+            ftp: ts_ftp::FtpConfig::default(),
         };
         assert_eq!(cfg.host_authority(), "192.0.2.1:8080");
     }
@@ -237,6 +257,7 @@ mod tests {
             capver: 138,
             suprx_host_only: false,
             localapi_port: Some(crate::localapi::DEFAULT_PORT),
+            ftp: ts_ftp::FtpConfig::default(),
         };
         assert_eq!(cfg.host_authority(), "controlplane.tailscale.com");
     }
