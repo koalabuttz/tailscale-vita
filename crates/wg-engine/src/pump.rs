@@ -48,7 +48,12 @@ pub(crate) fn run<T: Transport + ?Sized>(
     info!(peers = indices.count(), "wg-engine pump starting");
 
     let hint_ref = direct_path_hint.as_deref();
-    prime_handshakes(&indices, &*transport, hint_ref);
+    // NOTE: do NOT prime handshakes to every peer at startup. Real WireGuard
+    // initiates ON-DEMAND (handle_outbound's encapsulate starts the handshake
+    // on the first real outbound packet to a peer). Blasting all 31 peers here
+    // floods the ~30 idle ones into perpetual ConnectionExpired churn on every
+    // tick (~120 errors/s, masking the real session) and risks both-initiator
+    // handshake collisions during a peer roam.
 
     let mut last_tick = Instant::now();
 
@@ -102,7 +107,14 @@ fn pick_addr(
     peer: &Peer,
     hint: Option<&dyn DirectPathHint>,
 ) -> Option<TransportAddr> {
-    let pick = if let Some(h) = hint {
+    let pick = if let Some(auth) = peer.auth_src_load() {
+        // WireGuard roaming: reply to where the peer's last AUTHENTICATED packet
+        // actually arrived from. This beats a possibly-stale Disco endpoint for
+        // a roaming/symmetric-NAT peer and is exactly what makes Disco pongs
+        // work (reply to the ping's source). Falls through to Disco/DERP below
+        // only until the first authenticated packet sets this.
+        Some(auth)
+    } else if let Some(h) = hint {
         if let Some(udp) = h.alive_endpoint(&peer.pubkey) {
             Some(TransportAddr::Udp(udp))
         } else {
@@ -126,31 +138,6 @@ fn pick_addr(
         }
     }
     pick
-}
-
-fn prime_handshakes<T: Transport + ?Sized>(
-    indices: &Indices,
-    transport: &T,
-    hint: Option<&dyn DirectPathHint>,
-) {
-    let snapshot: Vec<Arc<Peer>> = indices.by_pubkey.read().values().cloned().collect();
-    for peer in snapshot {
-        let addr = match pick_addr(&peer, hint) {
-            Some(a) => a,
-            None => continue,
-        };
-        let outcome = call_tunn(&peer, |tunn, buf| tunn.encapsulate(&[], buf));
-        match outcome {
-            Outcome::Network(bytes) => {
-                send_outbound(transport, &peer.pubkey, addr, &bytes);
-                peer.stats.lock().handshakes_started += 1;
-                debug!(peer_pub = %short_hex(&peer.pubkey), n = bytes.len(), "handshake init queued");
-            }
-            _ => {
-                trace!(peer_pub = %short_hex(&peer.pubkey), "no handshake init produced (already up?)");
-            }
-        }
-    }
 }
 
 fn handle_inbound<T: Transport + ?Sized>(
@@ -188,22 +175,48 @@ fn handle_inbound<T: Transport + ?Sized>(
         let mut tun_outputs: Vec<Vec<u8>> = Vec::new();
 
         let first = call_tunn(&peer, |tunn, buf| tunn.decapsulate(None, datagram, buf));
+        // boringtun's contract: ONLY re-call with empty input when the result
+        // was WriteToNetwork (a handshake msg, whose follow-up keepalive + any
+        // queued packets must be drained). For Done / Err / WriteToTunnel there
+        // is nothing queued, and calling decapsulate(empty) just parses a
+        // zero-length packet → spurious decap error. Guarding on Network avoids
+        // that noise (and a needless tunn lock per datagram).
+        let mut drain = false;
         match first {
             Outcome::Done => {}
-            Outcome::Network(b) => net_outputs.push(b),
+            Outcome::Network(b) => {
+                net_outputs.push(b);
+                drain = true;
+            }
             Outcome::TunnelV4(b) => tun_outputs.push(b),
             Outcome::TunnelV6 => {}
         }
 
-        // If the first call produced output, the peer's session may have more
-        // queued. Drain by re-calling with empty input until Done.
-        loop {
-            let next = call_tunn(&peer, |tunn, buf| tunn.decapsulate(None, &[], buf));
-            match next {
+        while drain {
+            match call_tunn(&peer, |tunn, buf| tunn.decapsulate(None, &[], buf)) {
                 Outcome::Done => break,
                 Outcome::Network(b) => net_outputs.push(b),
                 Outcome::TunnelV4(b) => tun_outputs.push(b),
                 Outcome::TunnelV6 => {}
+            }
+        }
+
+        // On an AUTHENTICATED inbound (the Tunn accepted it → produced output),
+        // remember where this peer actually reached us from so replies go
+        // straight back there (handles a roaming/symmetric-NAT peer; mirrors
+        // how Disco pongs reply to the ping's source). pick_addr prefers this
+        // over the Disco endpoint.
+        //
+        // CRITICAL: only roam to DIRECT (UDP) sources. Tailscale sprays some
+        // packets over DERP as a backup path; if we let a DERP-relayed
+        // arrival flip auth_src to a DERP addr, our replies go out over DERP
+        // — which is NOT delivering for this peer — even though the direct
+        // UDP path is live (keepalives + Disco round-trip on it). Wire
+        // captures showed 15/16 replies wrongly egressing via DERP this way.
+        // A DERP arrival must never hijack a working direct reply path.
+        if !net_outputs.is_empty() || !tun_outputs.is_empty() {
+            if matches!(src_addr, TransportAddr::Udp(_)) {
+                peer.set_auth_src(src_addr);
             }
         }
 
@@ -290,6 +303,16 @@ fn tick_timers<T: Transport + ?Sized>(
 ) {
     let snapshot: Vec<Arc<Peer>> = indices.by_pubkey.read().values().cloned().collect();
     for peer in snapshot {
+        // Skip peers we've never heard from. `update_timers` on a peer with no
+        // established session just returns `ConnectionExpired` every tick — with
+        // ~30 idle tailnet peers that's ~120 errors/s of pure noise that burns
+        // the pump's time, adds latency to real inbound/reply servicing (which
+        // makes the active peer re-handshake → session churn → badkey decap
+        // failures), and drowns the real error signal. Only tick peers with a
+        // live session (we've received at least one authenticated packet).
+        if peer.stats.lock().last_rx.is_none() {
+            continue;
+        }
         let addr = match pick_addr(&peer, hint) {
             Some(a) => a,
             None => continue,

@@ -86,6 +86,13 @@ pub struct Peer {
     pub our_index: u32,
     pub allowed_ips: Vec<Ipv4Cidr>,
     pub transport_addr: ArcSwap<Option<TransportAddr>>,
+    /// WireGuard-style roaming endpoint: the source of the most recent
+    /// AUTHENTICATED inbound packet (a handshake/data that the `Tunn` accepted).
+    /// Replies go here first — exactly like a Disco pong replies to the ping's
+    /// source — so a roaming/symmetric-NAT peer is answered at wherever it
+    /// actually reached us from, not a possibly-stale Disco-discovered endpoint.
+    /// Set only on authenticated packets (safe re: M12's "don't roam on junk").
+    pub auth_src: ArcSwap<Option<TransportAddr>>,
     /// `Tunn` is `!Sync`. Held only on the wg_engine thread; never held
     /// across I/O or filesystem operations.
     pub tunn: Mutex<Tunn>,
@@ -101,6 +108,14 @@ impl Peer {
 
     pub fn set_transport_addr(&self, addr: TransportAddr) {
         self.transport_addr.store(Arc::new(Some(addr)));
+    }
+
+    pub fn auth_src_load(&self) -> Option<TransportAddr> {
+        *self.auth_src.load().as_ref()
+    }
+
+    pub fn set_auth_src(&self, addr: TransportAddr) {
+        self.auth_src.store(Arc::new(Some(addr)));
     }
 }
 

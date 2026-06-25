@@ -17,7 +17,7 @@
 //! writes pongs first. PLAN-V1 §"DERP relay protocol" calls this out
 //! because servers tear down conns within ~10 s of an unanswered ping.
 
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use vita_thread::{self as thread, JoinHandle};
@@ -28,8 +28,8 @@ use vita_sync::Mutex;
 use vita_log::{debug, info, trace, warn};
 
 use crate::frame::{
-    parse_peer_gone, parse_ping, parse_recv_packet, parse_restarting, read_frame,
-    write_note_preferred, write_pong, write_send_packet, FrameType,
+    parse_peer_gone, parse_ping, parse_recv_packet, parse_restarting, write_note_preferred,
+    write_pong, write_send_packet, FrameType,
 };
 use crate::handshake::{dial_and_handshake, DerpTls};
 use crate::magic::{KEEPALIVE_DEADLINE, READ_TICK};
@@ -222,6 +222,9 @@ fn io_loop(
     info!(region, is_home = initial_home, "derp.conn.thread.start");
     // Per-poll read timeout; rustls inherits this on the underlying TcpStream.
     let _ = tls.sock.set_read_timeout(Some(READ_TICK));
+    // Resumable reader: preserves partial frames across the READ_TICK timeout
+    // so sustained inbound (multi-frame WG relay) doesn't desync the stream.
+    let mut frame_reader = crate::frame::FrameReader::new();
     let mut last_rx = Instant::now();
     let mut tx_count: u64 = 0;
     let mut rx_count: u64 = 0;
@@ -261,9 +264,9 @@ fn io_loop(
             );
         }
 
-        // 2. Try one read with READ_TICK timeout.
-        match read_frame(&mut tls) {
-            Ok((ty, payload)) => {
+        // 2. Try to read one frame (preserving partial bytes across timeouts).
+        match frame_reader.poll_frame(&mut tls) {
+            Ok(Some((ty, payload))) => {
                 last_rx = Instant::now();
                 rx_count += 1;
                 if let HandleAction::Restart { delay } =
@@ -278,10 +281,8 @@ fn io_loop(
                     return;
                 }
             }
-            Err(DerpError::Io(e))
-                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-            {
-                // No frame ready; loop.
+            Ok(None) => {
+                // No complete frame yet; partial bytes are preserved. Loop.
             }
             Err(e) => {
                 warn!(region, error = %e, rx_total = rx_count, "derp.rx.error");

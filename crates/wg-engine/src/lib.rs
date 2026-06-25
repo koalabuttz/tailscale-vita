@@ -81,12 +81,39 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Add or replace a peer entry by pubkey. Allocates a fresh
-    /// `our_index` and a fresh `Tunn`. If the pubkey already exists, the
-    /// old peer is removed and replaced.
+    /// Add or update a peer entry by pubkey.
+    ///
+    /// Fast path: if the peer already exists with the SAME `allowed_ips`,
+    /// this is an attribute update (endpoint roam, online/offline, DERP-home,
+    /// NetInfo) — NOT a new peer. We PRESERVE the existing `Tunn` + `our_index`
+    /// so the established WireGuard session survives, and only refresh the
+    /// endpoint. Only a new pubkey or a changed route set allocates a fresh
+    /// `Tunn`.
+    ///
+    /// Why this matters: the old code did an unconditional remove+recreate,
+    /// reassigning `our_index` on EVERY control-plane peer update (constant in
+    /// a live tailnet). That tore down the session; the peer kept sending data
+    /// to the old receiver-index, which `route_inbound` dropped as unroutable
+    /// Junk — so real inbound ping/TCP almost never decrypted while Disco
+    /// (magicsock) still pong'd. (wg data-plane bug, root-caused 2026-06-24.)
     pub fn upsert_peer(&self, cfg: PeerConfig) -> Result<(), WgError> {
         let pubkey_bytes: [u8; 32] = *cfg.pubkey.as_bytes();
-        // Drop any existing entry with this pubkey first.
+
+        // Fast path: same peer, same route set → update endpoint in place,
+        // keep the live session. The read guard is dropped after `.cloned()`.
+        let existing = self.indices.by_pubkey.read().get(&pubkey_bytes).cloned();
+        if let Some(peer) = existing {
+            if peer.allowed_ips == cfg.allowed_ips {
+                if let Some(ep) = cfg.initial_endpoint {
+                    peer.set_transport_addr(ep);
+                }
+                return Ok(());
+            }
+            // allowed_ips changed: a genuine route-set change for this peer.
+            // Fall through to a full rebuild (rare).
+        }
+
+        // New peer, or changed route set: (re)build with a fresh Tunn.
         self.indices.remove(&pubkey_bytes);
 
         let our_index = self.next_idx.fetch_add(1, Ordering::Relaxed);
@@ -104,6 +131,7 @@ impl Engine {
             our_index,
             allowed_ips: cfg.allowed_ips,
             transport_addr: ArcSwap::from(Arc::new(cfg.initial_endpoint)),
+            auth_src: ArcSwap::from(Arc::new(None)),
             tunn: Mutex::new(tunn),
             stats: Mutex::new(PeerStats::default()),
         });

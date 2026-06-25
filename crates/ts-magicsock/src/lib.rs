@@ -86,8 +86,19 @@ const PING_INTERVAL: Duration = Duration::from_secs(5);
 /// A direct path is "alive" if we've received a Pong for it within
 /// this many seconds.
 const ALIVE_TTL: Duration = Duration::from_secs(30);
-/// recv_from timeout; bounds how long we wait between ping pumps.
-const RECV_TIMEOUT: Duration = Duration::from_millis(500);
+/// recv_from timeout; bounds how long we wait between ping pumps AND how long
+/// an enqueued outbound packet waits before the worker drains+sends it (the
+/// M16 worker-thread send fix). Lowered from 500ms so WG handshakes/replies
+/// egress promptly.
+const RECV_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// Outbound send queue: `MagicSocketCtl::send_to` enqueues here and the v4
+/// worker drains+transmits it on its own thread. M16 fix — on the Vita's
+/// sceNet, a `sendto` from the wg-pump thread while the worker is parked in a
+/// blocking `recv_from` on the SAME fd does not reliably egress (Disco pongs
+/// work only because they're sent from the worker thread after recv returns).
+type TxQueue = Arc<Mutex<VecDeque<(SocketAddr, Vec<u8>)>>>;
+
 /// Max receive buffer (Disco packets are small; WG handshake max ~256
 /// bytes; Tailscale's MTU is 1280; round up).
 const RECV_BUF: usize = 64 * 1024;
@@ -222,6 +233,9 @@ pub struct MagicSocketCtl {
     /// Our node public key — encoded into outbound Pings (and inbound
     /// CMM-triggered Pings) so receivers can correlate disco→node.
     our_node_pub: NodePublicKey,
+    /// Outbound send queue drained+transmitted by the v4 worker thread.
+    /// `send_to` pushes here instead of calling `socket.send_to` cross-thread.
+    tx_queue: TxQueue,
 }
 
 /// Spawned worker side. Drop joins the receive thread(s) — both v4
@@ -279,6 +293,7 @@ impl MagicSocket {
         let socket_v4 = Arc::new(socket_v4);
         let state = Arc::new(Mutex::new(MagicState::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let tx_queue: TxQueue = Arc::new(Mutex::new(VecDeque::new()));
         // Share the disco-priv via Arc so the ctl side can decrypt
         // CallMeMaybe frames that arrive via DERP (Stage 4). The worker
         // also holds an Arc; both sides read-only — no mutation.
@@ -293,6 +308,7 @@ impl MagicSocket {
             local_addr_v6,
             our_disco_priv: Arc::clone(&our_disco_priv),
             our_node_pub,
+            tx_queue: Arc::clone(&tx_queue),
         };
 
         // Spawn the v4 worker. It owns the ping-pump cadence (the v6
@@ -305,6 +321,7 @@ impl MagicSocket {
         let v4_non_disco_tx = non_disco_tx.clone();
         let v4_send_v4 = Arc::clone(&socket_v4);
         let v4_send_v6 = socket_v6.as_ref().map(Arc::clone);
+        let v4_tx_queue = Arc::clone(&tx_queue);
         let worker_v4 = thread::Builder::new()
             .name("ts-magicsock-v4")
             .stack_size(256 * 1024)
@@ -319,6 +336,9 @@ impl MagicSocket {
                     v4_non_disco_tx,
                     (v4_send_v4, v4_send_v6),
                     /* run_ping_pump = */ true,
+                    // Only the v4 worker drains the outbound queue (it holds
+                    // both send sockets and dispatches by address family).
+                    Some(v4_tx_queue),
                 );
             })
             .map_err(MagicError::Io)?;
@@ -346,6 +366,7 @@ impl MagicSocket {
                         non_disco_tx,
                         (v6_send_v4, v6_send_v6),
                         /* run_ping_pump = */ false,
+                        None, // v6 worker doesn't drain the (v4-dispatched) tx queue
                     );
                 })
                 .map_err(MagicError::Io)?;
@@ -474,8 +495,16 @@ impl MagicSocketCtl {
     /// we don't have a v6 socket (Vita), returns `AddrNotAvailable`
     /// — peer falls back to DERP or its v4 endpoints.
     pub fn send_to(&self, addr: SocketAddr, bytes: &[u8]) -> std::io::Result<usize> {
-        let socket = self.socket_for(addr)?;
-        socket.send_to(bytes, addr)
+        // M16 fix: ENQUEUE for the v4 worker thread to transmit, rather than
+        // calling `socket.send_to` from this (caller's) thread. On the Vita's
+        // sceNet, a `sendto` issued while the worker is parked in a blocking
+        // `recv_from` on the same fd does not reliably egress; the worker
+        // drains this queue and sends on its own thread (the path that works,
+        // same as Disco pongs). Still validate the address family so the
+        // v6-without-v6-socket error surfaces to the caller as before.
+        let _ = self.socket_for(addr)?;
+        self.tx_queue.lock().push_back((addr, bytes.to_vec()));
+        Ok(bytes.len())
     }
 
     /// Internal: pick the right socket for an outbound address.
@@ -750,6 +779,7 @@ fn worker_loop(
     non_disco_tx: Sender<NonDiscoPacket>,
     send_sockets: (Arc<UdpSocket>, Option<Arc<UdpSocket>>),
     run_ping_pump: bool,
+    tx_queue: Option<TxQueue>,
 ) {
     info!(local = ?socket.local_addr(), run_ping_pump, "magicsock.worker.start");
     let mut buf = vec![0u8; RECV_BUF];
@@ -798,6 +828,32 @@ fn worker_loop(
             Err(e) => {
                 warn!(error = %e, "magicsock.recv_from.error");
                 break;
+            }
+        }
+
+        // Drain the outbound queue HERE — immediately after recv_from returns,
+        // while the socket is "warm" from just doing I/O. This is the exact
+        // lifecycle that makes Disco pongs egress (they're sent inline in the
+        // recv handler). Draining at the loop TOP (~50 ms after the last recv,
+        // socket "cold") let 32-byte keepalives out but silently dropped 96-byte
+        // data/echo-reply frames on the Vita's sceNet — they never reached any
+        // peer despite send_to returning Ok. Sending warm fixes that.
+        if let Some(q) = &tx_queue {
+            loop {
+                let item = q.lock().pop_front();
+                match item {
+                    Some((addr, bytes)) => {
+                        let sock = if addr.is_ipv4() {
+                            &send_v4
+                        } else {
+                            send_v6.as_ref().unwrap_or(&send_v4)
+                        };
+                        if let Err(e) = sock.send_to(&bytes, addr) {
+                            warn!(%addr, error = %e, "magicsock.tx_queue.send_failed");
+                        }
+                    }
+                    None => break,
+                }
             }
         }
     }

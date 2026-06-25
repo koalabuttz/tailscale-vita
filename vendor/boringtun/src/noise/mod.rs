@@ -335,6 +335,17 @@ impl Tunn {
         self.timer_tick(TimerName::TimeLastPacketSent);
         self.timer_tick_session_established(false, index); // New session established, we are not the initiator
 
+        // tailscale-vita patch: adopt the just-established responder session as
+        // the current one (the initiator path at handle_handshake_response does
+        // this; the responder path upstream does NOT, leaving `self.current`
+        // pointing at an empty/stale slot until the first inbound data packet).
+        // Without this, `encapsulate` finds no current session and initiates a
+        // COMPETING handshake, and with a roaming peer that re-handshakes often,
+        // `current` flickers so most outbound replies are dropped ("queued for
+        // handshake"). We only ever send replies to already-received packets,
+        // so adopting it immediately is safe (the don't-send-first rule holds).
+        self.set_current_session(index);
+
         tracing::debug!(message = "Sending handshake_response", local_idx = index);
 
         Ok(TunnResult::WriteToNetwork(packet))

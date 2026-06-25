@@ -119,6 +119,88 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<(FrameType, Vec<u8>), DerpError>
     Ok((ty, payload))
 }
 
+/// Resumable framed reader over a timeout-bounded byte stream.
+///
+/// FIX (DERP read desync): the io_loop sets a ~100 ms read timeout on the TLS
+/// stream and called [`read_frame`] (which uses `read_exact`) once per loop.
+/// `read_exact` gives NO partial-read guarantee — when a frame straddles the
+/// read-timeout boundary it consumes bytes into its buffer, then returns
+/// `WouldBlock`/`TimedOut`, and those bytes are DISCARDED. The next read starts
+/// mid-frame → stream desync → bogus frame type → the io_loop tears the home
+/// DERP conn down. A single CMM frame fits one read (no straddle), which is why
+/// CMM worked but sustained WG data didn't.
+///
+/// `FrameReader` accumulates bytes across calls so a straddling frame is never
+/// lost: [`poll_frame`](Self::poll_frame) reads at most one chunk (preserving
+/// the buffer on timeout) and returns the next complete frame once enough bytes
+/// have arrived.
+#[derive(Default)]
+pub struct FrameReader {
+    buf: Vec<u8>,
+}
+
+impl FrameReader {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Read at most one chunk from `r` (respecting its read timeout) and return
+    /// the next complete frame if one is now buffered. `Ok(None)` = "need more
+    /// bytes" (timeout/WouldBlock or a partial frame); the buffer is preserved,
+    /// call again. `Err` is a real IO/protocol error (including EOF).
+    pub fn poll_frame<R: Read>(
+        &mut self,
+        r: &mut R,
+    ) -> Result<Option<(FrameType, Vec<u8>)>, DerpError> {
+        // A full frame may already be buffered from a prior read.
+        if let Some(f) = self.try_extract()? {
+            return Ok(Some(f));
+        }
+        let mut tmp = [0u8; 8192];
+        match r.read(&mut tmp) {
+            Ok(0) => Err(DerpError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "derp connection closed by peer",
+            ))),
+            Ok(n) => {
+                self.buf.extend_from_slice(&tmp[..n]);
+                self.try_extract()
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Timeout: keep the partial buffer and resume on the next call.
+                Ok(None)
+            }
+            Err(e) => Err(DerpError::Io(e)),
+        }
+    }
+
+    /// Extract one complete frame from the buffer if present, consuming it.
+    fn try_extract(&mut self) -> Result<Option<(FrameType, Vec<u8>)>, DerpError> {
+        if self.buf.len() < FRAME_HEADER_LEN {
+            return Ok(None);
+        }
+        let ty = FrameType::from_byte(self.buf[0])?;
+        let len =
+            u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]]) as usize;
+        if len > MAX_PAYLOAD {
+            return Err(DerpError::FrameTooLarge {
+                len,
+                cap: MAX_PAYLOAD,
+            });
+        }
+        let total = FRAME_HEADER_LEN + len;
+        if self.buf.len() < total {
+            return Ok(None); // header parsed; payload not fully arrived yet
+        }
+        let payload = self.buf[FRAME_HEADER_LEN..total].to_vec();
+        self.buf.drain(..total);
+        Ok(Some((ty, payload)))
+    }
+}
+
 // ---------- typed helpers ------------------------------------------------
 
 /// `FrameSendPacket`: `dst_pubkey(32) || wg_bytes`.
