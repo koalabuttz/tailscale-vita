@@ -61,8 +61,9 @@ End-to-end, against either self-hosted Headscale or real `tailscale.com`:
 - Taildrop, MagicDNS, exit-node routing, subnet-route advertisement.
 - OAuth / interactive login. Auth key only, in `config.toml`.
 - UPnP / NAT-PMP / PCP port-mapping clients.
-- LiveArea management UI. Configuration is `config.toml`-driven, restart
-  to apply.
+- Configuration UI. The on-device dashboard (M17-A) is READ-ONLY —
+  status + peer list + disco ping. Settings stay `config.toml`-driven,
+  restart to apply (a settings editor is M17-B).
 
 See [`PLAN-V1.md`](PLAN-V1.md) for the original strategic scope-cut.
 

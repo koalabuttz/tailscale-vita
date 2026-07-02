@@ -110,11 +110,16 @@ you re-upload its VPK.** You must re-install via VitaShell each time:
 3. Confirm "overwrite existing app" if prompted.
 4. Press PS → launch the **Tailscale-Vita Demo** bubble.
 
-The demo runs for ~120 seconds, then exits cleanly. Watch for:
+The demo runs until you exit via the PS button (or `run_window_secs`
+elapses in normal mode). Watch for:
 
 - LiveArea launch screen flashes briefly.
-- Brief black screen while the demo runs (no UI; logging only).
-- Auto-return to LiveArea ~120 s later.
+- **The M17-A dashboard** (docs/PLAN-M17A.md): status header (hostname,
+  tailnet IP, lifecycle, DERP home, uptime, ACL tags), a scrollable
+  peer list (online dot, tailnet IP, `direct N ms` / `relay` path
+  cell), and a footer with poll staleness. D-pad scrolls; X sends a
+  disco ping to the selected peer. Cold start shows
+  "waiting for runtime (SUPRX)..." until the first LocalAPI poll lands.
 
 ## 6. Pull the log
 
