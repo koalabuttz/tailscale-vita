@@ -27,4 +27,43 @@ fn main() {
     // produced binaries with a stale BUILD_UNIX. The diagnostic was
     // useless precisely when we needed it (M14C bringup).
     println!("cargo::rerun-if-changed=NONEXISTENT_FORCE_RERUN");
+
+    // M17-A S1 (docs/PLAN-M17A.md): the dashboard UI links vita2d plus
+    // the Sce stubs that arm-vita-eabi-gcc's default specs do NOT
+    // auto-link (only base stubs like SceNet/SceIofilemgr come free).
+    // Everything sits in one --start-group..--end-group span so
+    // static-archive ordering can't break the link. Gated on the vita
+    // target: host builds/tests never see these flags.
+    println!("cargo::rerun-if-env-changed=VITASDK");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("vita") {
+        let vitasdk =
+            std::env::var("VITASDK").unwrap_or_else(|_| "/home/david/vitasdk".into());
+        println!("cargo::rustc-link-search=native={vitasdk}/arm-vita-eabi/lib");
+        println!("cargo::rustc-link-arg=-Wl,--start-group");
+        for lib in [
+            "vita2d",
+            // Referenced by libvita2d.a (per nm): GXM render, display
+            // swap, common-dialog update, app budget query, PGF font.
+            "SceGxm_stub",
+            "SceDisplay_stub",
+            "SceCommonDialog_stub",
+            "SceAppMgr_stub",
+            "ScePgf_stub",
+            "SceSysmodule_stub",
+            // Input for the dashboard.
+            "SceCtrl_stub",
+            // vita2d's texture/TTF loader objects reference these; the
+            // linker only pulls archive members we actually use, and
+            // unused ones cost zero bytes — listed so a future
+            // vita2d_load_PNG_file call doesn't break the link.
+            "freetype",
+            "png16",
+            "jpeg",
+            "z",
+            "m",
+        ] {
+            println!("cargo::rustc-link-arg=-l{lib}");
+        }
+        println!("cargo::rustc-link-arg=-Wl,--end-group");
+    }
 }

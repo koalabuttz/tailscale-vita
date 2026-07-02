@@ -25,6 +25,7 @@ use netstack::TcpListener;
 use tailscale_vita::{Config, ConfigError, Runtime};
 
 mod handler;
+mod ui;
 
 const CONFIG_PATH: &str = "ux0:/data/tailscale-vita/config.toml";
 const ACCEPT_POLL: Duration = Duration::from_millis(500);
@@ -115,14 +116,14 @@ fn run() -> Result<(), DemoError> {
         "demo.config.loaded"
     );
 
-    // M11 Phase 2: if the SUPRX is the runtime owner, demo just keeps
-    // the process alive. SUPRX module_start has already spawned the
-    // bootstrap thread before we got here.
+    // M11 Phase 2 / M17-A: if the SUPRX is the runtime owner, the eboot
+    // keeps the process alive AND owns the screen — the dashboard UI
+    // runs here (S1: render spike; see docs/PLAN-M17A.md). It must NOT
+    // call Runtime::up — the SUPRX's bootstrap thread already owns the
+    // runtime in this same process.
     if config.suprx_host_only {
-        info!("demo: suprx_host_only=true — skipping Runtime::up; sleeping forever to host the SUPRX");
-        loop {
-            thread::sleep(Duration::from_secs(60));
-        }
+        info!("demo: suprx_host_only=true — SUPRX owns the runtime; starting dashboard UI");
+        ui::run_spike();
     }
 
     if config.auth_key.is_empty() {
