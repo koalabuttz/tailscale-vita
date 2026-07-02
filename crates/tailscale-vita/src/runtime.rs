@@ -1045,14 +1045,7 @@ fn push_delta_to_engine(
     );
 
     for p in &delta.upserted {
-        let allowed_ips: Vec<Ipv4Cidr> = p
-            .allowed_ips
-            .iter()
-            .map(|a| Ipv4Cidr {
-                addr: a.addr,
-                prefix: a.prefix,
-            })
-            .collect();
+        let allowed_ips = engine_allowed_ips(&p.allowed_ips);
         let pubkey = x25519_dalek::PublicKey::from(p.node_key);
         let region = if p.home_derp != 0 {
             p.home_derp
@@ -1095,15 +1088,7 @@ fn push_delta_to_engine(
     for r in &delta.rekeyed {
         let old = x25519_dalek::PublicKey::from(r.old_key);
         engine.remove_peer(&old);
-        let allowed_ips: Vec<Ipv4Cidr> = r
-            .snapshot
-            .allowed_ips
-            .iter()
-            .map(|a| Ipv4Cidr {
-                addr: a.addr,
-                prefix: a.prefix,
-            })
-            .collect();
+        let allowed_ips = engine_allowed_ips(&r.snapshot.allowed_ips);
         let new_pubkey = x25519_dalek::PublicKey::from(r.snapshot.node_key);
         let region = if r.snapshot.home_derp != 0 {
             r.snapshot.home_derp
@@ -1127,6 +1112,23 @@ fn push_delta_to_engine(
         });
         info!(node_id = r.snapshot.node_id, "control.map.peer.rekeyed");
     }
+}
+
+/// Convert a peer's netmap AllowedIPs into the engine's route set.
+/// Default routes (prefix 0 — an exit node's 0.0.0.0/0 offer) are
+/// dropped: the Vita never routes through exit nodes, and installing
+/// one into the engine's longest-prefix index makes it swallow every
+/// destination whose /32 is missing (2026-07-02 data-plane bug —
+/// every echo reply was sent to the exit node). Subnet routes with
+/// prefix >= 1 are kept; the /32 tailnet addrs always win LPM.
+fn engine_allowed_ips(list: &[ts_control::AllowedIp]) -> Vec<Ipv4Cidr> {
+    list.iter()
+        .filter(|a| a.prefix > 0)
+        .map(|a| Ipv4Cidr {
+            addr: a.addr,
+            prefix: a.prefix,
+        })
+        .collect()
 }
 
 /// Cap on the reconnect backoff. Linux/macOS tailscaled uses ~1 min;
@@ -1658,6 +1660,31 @@ fn build_local_endpoints(control_url: &str, magic_local: SocketAddr) -> Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exit-node default routes must never reach the engine's LPM index;
+    /// everything else passes through (2026-07-02 data-plane bug).
+    #[test]
+    fn engine_allowed_ips_drops_default_routes() {
+        let list = vec![
+            ts_control::AllowedIp {
+                addr: "100.64.0.2".parse().unwrap(),
+                prefix: 32,
+            },
+            ts_control::AllowedIp {
+                addr: "0.0.0.0".parse().unwrap(),
+                prefix: 0,
+            },
+            ts_control::AllowedIp {
+                addr: "192.168.50.0".parse().unwrap(),
+                prefix: 24,
+            },
+        ];
+        let out = engine_allowed_ips(&list);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|c| c.prefix > 0));
+        assert!(out.iter().any(|c| c.prefix == 32));
+        assert!(out.iter().any(|c| c.prefix == 24));
+    }
 
     /// Asserts `actual` lies in `[base * (1-frac), base * (1+frac)]`.
     /// Used to validate jittered backoff without flaking on the RNG.

@@ -288,7 +288,20 @@ fn node_to_snapshot(n: &NodeWire) -> Option<PeerSnapshot> {
     } else {
         parse_nodekey_with_prefix(&n.disco_key, "discokey:")
     };
-    let allowed_ips = parse_addrs(&n.allowed_ips);
+    // CapVer >= 112 contract ("2025-01-14: Client interprets AllowedIPs
+    // of nil as meaning same as Addresses" — tailcfg V112; we advertise
+    // 138): control OMITS Node.AllowedIPs for peers whose route set
+    // equals their Addresses, i.e. nearly every normal node. An absent/
+    // empty list therefore means "derive from Addresses", NOT "no
+    // routes". Without this, every ordinary peer entered wg-engine with
+    // zero AllowedIPs, the outbound IP lookup missed all /32s, and any
+    // exit node's explicitly-sent 0.0.0.0/0 swallowed EVERY data frame
+    // (root cause of the wg data-plane bug, found 2026-07-02: all echo
+    // replies were encrypted for + sent to the exit node `tailscale-1`).
+    let mut allowed_ips = parse_addrs(&n.allowed_ips);
+    if allowed_ips.is_empty() {
+        allowed_ips = parse_addrs(&n.addresses);
+    }
     let home_derp = if n.home_derp != 0 {
         n.home_derp
     } else {
@@ -404,6 +417,39 @@ mod tests {
 
     fn key_bytes(byte: u8) -> NodeKeyBytes {
         [byte; 32]
+    }
+
+    /// CapVer >= 112: control omits AllowedIPs when it equals Addresses.
+    /// An empty wire list must derive the route set from Addresses —
+    /// NOT produce a peer with zero AllowedIPs (which made every data
+    /// frame fall through to an exit node's 0.0.0.0/0; 2026-07-02 bug).
+    #[test]
+    fn omitted_allowed_ips_derives_from_addresses() {
+        let mut n = node(1, 0x11, "100.64.0.2");
+        n.allowed_ips = vec![]; // control omitted the field (V112+)
+        n.addresses = vec![
+            "100.64.0.2/32".into(),
+            "fd7a:115c:a1e0::1/128".into(), // v6 filtered out
+        ];
+        let snap = node_to_snapshot(&n).unwrap();
+        assert_eq!(
+            snap.allowed_ips,
+            vec![AllowedIp {
+                addr: "100.64.0.2".parse().unwrap(),
+                prefix: 32
+            }]
+        );
+    }
+
+    /// When control DOES send AllowedIPs (exit nodes, subnet routers),
+    /// the explicit list wins verbatim — no derivation.
+    #[test]
+    fn explicit_allowed_ips_used_verbatim() {
+        let mut n = node(1, 0x11, "100.64.0.2");
+        n.allowed_ips = vec!["100.64.0.2/32".into(), "0.0.0.0/0".into()];
+        let snap = node_to_snapshot(&n).unwrap();
+        assert_eq!(snap.allowed_ips.len(), 2);
+        assert!(snap.allowed_ips.iter().any(|a| a.prefix == 0));
     }
 
     #[test]
