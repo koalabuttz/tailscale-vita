@@ -33,6 +33,41 @@ pub use error::WgError;
 pub use peer::{DirectPathHint, Ipv4Cidr, Peer, PeerConfig, PeerStats, TransportAddr};
 pub use transport::{NoopTransport, Transport, UdpTransport};
 
+/// Fork-B diagnostic: bounded ring of outbound path-selection decisions,
+/// pre-formatted for raw tracing. `handle_outbound` (data), `tick_timers`
+/// (timer keepalives) and `handle_inbound` (src-addr replies) record here;
+/// the egress probe's harvest loop drains it into `wgsel:` trace lines.
+/// Answers "which PEER did the engine map this reply to, and why did
+/// pick_addr choose that endpoint" — the question send-level records
+/// structurally cannot (see docs/EGRESS-PROBE.md).
+pub mod selection_log {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    static LOG: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+    const CAP: usize = 96;
+
+    pub(crate) fn record(line: String) {
+        let mut g = match LOG.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if g.len() >= CAP {
+            g.pop_front();
+        }
+        g.push_back(line);
+    }
+
+    /// Drain all recorded selection lines.
+    pub fn take() -> Vec<String> {
+        let mut g = match LOG.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        g.drain(..).collect()
+    }
+}
+
 use indices::Indices;
 
 /// Caller-supplied engine configuration.
@@ -259,5 +294,191 @@ impl Drop for EngineRunning {
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
+    }
+}
+
+/// Outcome of [`data_plane_selftest`]. Each field is a stage of the WG
+/// data-plane crypto round-trip; `summary()` renders a one-line trace + verdict.
+#[derive(Debug, Default, Clone)]
+pub struct SelfTestReport {
+    /// init → response → keepalive handshake dance completed (B reached `Done`).
+    pub handshake_ok: bool,
+    /// An EMPTY-payload transport frame (the working production case: keepalive,
+    /// type-4 datalen=0, 32 B) decapsulated cleanly (`Done`).
+    pub keepalive_ok: bool,
+    /// A NON-EMPTY-payload transport frame (the suspect: type-4 datalen>0)
+    /// decapsulated to `WriteToTunnelV4` — i.e. the AEAD tag verified.
+    pub data_ok: bool,
+    /// On-wire length of the non-empty data frame we built (header+ct+tag).
+    pub data_len: usize,
+    /// Decrypted payload bytes equal the bytes we sent (catches silent
+    /// corruption that somehow still passes the tag).
+    pub roundtrip_match: bool,
+    /// First failing stage's category + any underlying `WireGuardError`,
+    /// else empty. A `String` (one tiny alloc at startup) so the exact error
+    /// variant reaches the trace — `InvalidAeadTag` is the Fork-A signature.
+    pub note: String,
+}
+
+impl SelfTestReport {
+    /// One-line summary for the SUPRX raw trace, ending in a fork verdict:
+    /// `AEAD_NONEMPTY_MISCOMPILE` (Fork A — on-device crypto), or
+    /// `CRYPTO_OK_NETWORK_SUSPECT` (Fork B — egress).
+    pub fn summary(&self) -> String {
+        let verdict = if !self.handshake_ok {
+            "HANDSHAKE_FAILED"
+        } else if self.keepalive_ok && !self.data_ok {
+            "AEAD_NONEMPTY_MISCOMPILE"
+        } else if self.data_ok && self.roundtrip_match {
+            "CRYPTO_OK_NETWORK_SUSPECT"
+        } else {
+            "INCONCLUSIVE"
+        };
+        format!(
+            "hs={} ka={} data={} dlen={} match={} note={} VERDICT={}",
+            self.handshake_ok as u8,
+            self.keepalive_ok as u8,
+            self.data_ok as u8,
+            self.data_len,
+            self.roundtrip_match as u8,
+            if self.note.is_empty() { "-" } else { self.note.as_str() },
+            verdict,
+        )
+    }
+}
+
+/// In-process WG data-plane crypto self-test. Stands up two `Tunn`s, runs a
+/// full handshake between them, then exercises both an EMPTY-payload frame
+/// (the production case that reaches peers) and a NON-EMPTY-payload frame (the
+/// one that mysteriously never does), decapsulating each locally.
+///
+/// This isolates crypto from the network with zero peers and zero sockets:
+/// if the empty frame round-trips on a target but the non-empty one does not,
+/// the AEAD seal is miscompiling for non-empty payloads on that target (a
+/// ChaCha20Poly1305/SIMD cross-compile hazard) — proving the bug is local crypto,
+/// not UDP egress. If both round-trip, on-device crypto is sound and the bug is
+/// in the network path. See `summary()` for the verdict mapping.
+pub fn data_plane_selftest() -> SelfTestReport {
+    use boringtun::noise::TunnResult;
+    use rand_core::{OsRng, RngCore};
+
+    let mut report = SelfTestReport::default();
+
+    // Two ephemeral peers (A = initiator, B = responder).
+    let a_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+    let a_public = x25519_dalek::PublicKey::from(&a_secret);
+    let b_secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+    let b_public = x25519_dalek::PublicKey::from(&b_secret);
+    let mut a = Tunn::new(a_secret, b_public, None, None, OsRng.next_u32(), None);
+    let mut b = Tunn::new(b_secret, a_public, None, None, OsRng.next_u32(), None);
+
+    let mut buf = [0u8; 2048];
+
+    // --- Handshake: init (A→B) → response (B→A) → keepalive (A→B) → Done (B). ---
+    let init = match a.encapsulate(&[], &mut buf) {
+        TunnResult::WriteToNetwork(p) => p.to_vec(),
+        other => {
+            report.note = format!("init_not_network:{}", tunn_kind(&other));
+            return report;
+        }
+    };
+    let resp = match b.decapsulate(None, &init, &mut buf) {
+        TunnResult::WriteToNetwork(p) => p.to_vec(),
+        other => {
+            report.note = format!("resp_not_network:{}", tunn_kind(&other));
+            return report;
+        }
+    };
+    let keepalive = match a.decapsulate(None, &resp, &mut buf) {
+        TunnResult::WriteToNetwork(p) => p.to_vec(),
+        other => {
+            report.note = format!("keepalive_not_network:{}", tunn_kind(&other));
+            return report;
+        }
+    };
+    match b.decapsulate(None, &keepalive, &mut buf) {
+        TunnResult::Done => report.handshake_ok = true,
+        other => {
+            report.note = format!("hs_keepalive:{}", tunn_kind(&other));
+            return report;
+        }
+    }
+
+    // --- Empty-payload control (the production case that DOES reach peers). ---
+    let ka_frame = match a.encapsulate(&[], &mut buf) {
+        TunnResult::WriteToNetwork(p) => p.to_vec(),
+        other => {
+            report.note = format!("ka_encap:{}", tunn_kind(&other));
+            return report;
+        }
+    };
+    match b.decapsulate(None, &ka_frame, &mut buf) {
+        TunnResult::Done => report.keepalive_ok = true,
+        other => report.note = format!("ka_decap:{}", tunn_kind(&other)),
+    }
+
+    // --- Non-empty-payload test (the suspect: type-4 datalen>0). ---
+    // A minimal but VALID IPv4 packet: a clean decap runs boringtun's
+    // post-decryption IP validation (`validate_decapsulated_packet`), which
+    // reads the total-length field (bytes 2..4, big-endian) and rejects the
+    // packet as `InvalidPacket` if it exceeds the buffer. So the length field
+    // MUST equal the real length, or we'd misread a perfectly-decrypted frame
+    // as a failure. version=4, IHL=5 (0x45); total_length = 64; rest filler.
+    let mut payload = [0u8; 64];
+    let total_len = payload.len() as u16;
+    payload[0] = 0x45;
+    payload[2..4].copy_from_slice(&total_len.to_be_bytes());
+    for (i, byte) in payload.iter_mut().enumerate().skip(4) {
+        *byte = (i as u8).wrapping_mul(7).wrapping_add(1);
+    }
+    let data_frame = match a.encapsulate(&payload, &mut buf) {
+        TunnResult::WriteToNetwork(p) => p.to_vec(),
+        other => {
+            report.note = format!("data_encap:{}", tunn_kind(&other));
+            return report;
+        }
+    };
+    report.data_len = data_frame.len();
+    let mut out = [0u8; 2048];
+    match b.decapsulate(None, &data_frame, &mut out) {
+        TunnResult::WriteToTunnelV4(p, _) => {
+            report.data_ok = true;
+            report.roundtrip_match = &p[..] == &payload[..];
+        }
+        other => report.note = format!("data_decap:{}", tunn_kind(&other)),
+    }
+
+    report
+}
+
+/// Compact label for a `TunnResult` (variant + the `WireGuardError` for `Err`),
+/// for the self-test `note`. `InvalidAeadTag` here would be the Fork-A signature.
+fn tunn_kind(r: &boringtun::noise::TunnResult<'_>) -> String {
+    use boringtun::noise::TunnResult;
+    match r {
+        TunnResult::Done => "Done".to_string(),
+        TunnResult::Err(e) => format!("Err({e:?})"),
+        TunnResult::WriteToNetwork(_) => "Network".to_string(),
+        TunnResult::WriteToTunnelV4(..) => "TunnelV4".to_string(),
+        TunnResult::WriteToTunnelV6(..) => "TunnelV6".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod selftest_tests {
+    use super::*;
+
+    /// Baseline: on the host (x86_64) the full crypto round-trip must pass.
+    /// This is what makes a FAIL on the Vita target meaningful — if this
+    /// passes on host but the on-device `wgst:` trace shows `data=0`, the
+    /// AEAD is miscompiling for non-empty payloads on the Vita target.
+    #[test]
+    fn data_plane_selftest_passes_on_host() {
+        let r = data_plane_selftest();
+        assert!(
+            r.handshake_ok && r.keepalive_ok && r.data_ok && r.roundtrip_match,
+            "selftest should fully pass on host: {r:?} ({})",
+            r.summary()
+        );
     }
 }

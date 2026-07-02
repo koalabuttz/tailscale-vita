@@ -227,6 +227,13 @@ fn handle_inbound<T: Transport + ?Sized>(
         // packet arrived via Udp(addr), we already validated that
         // path with Disco and addr is reachable.
         for bytes in net_outputs {
+            crate::selection_log::record(format!(
+                "k=r peer={} idx={} to={} n={}",
+                short_hex(&peer.pubkey),
+                peer.our_index,
+                fmt_sel(&Some(src_addr)),
+                bytes.len(),
+            ));
             send_outbound(transport, &peer.pubkey, src_addr, &bytes);
         }
 
@@ -270,7 +277,24 @@ fn handle_outbound<T: Transport + ?Sized>(
             return;
         }
     };
-    let addr = match pick_addr(&peer, hint) {
+    // Fork-B: record the FULL selection — which peer the allowed-ips
+    // index resolved this inner dst to, and every pick_addr input — so
+    // the probe's `wgsel:` trace attributes each data frame to a peer
+    // object (pubkey + our_index disambiguates zombie instances).
+    let picked = pick_addr(&peer, hint);
+    crate::selection_log::record(format!(
+        "k=d dst={dst} peer={} idx={} pick={} auth={} hint={} ta={} n={}",
+        short_hex(&peer.pubkey),
+        peer.our_index,
+        fmt_sel(&picked),
+        fmt_sel(&peer.auth_src_load()),
+        hint.and_then(|h| h.alive_endpoint(&peer.pubkey))
+            .map(|sa| format!("udp:{sa}"))
+            .unwrap_or_else(|| "none".into()),
+        fmt_sel(&peer.transport_addr_load()),
+        plaintext.len(),
+    ));
+    let addr = match picked {
         Some(a) => a,
         None => {
             trace!(peer_pub = %short_hex(&peer.pubkey), "no known transport addr; dropping");
@@ -319,8 +343,29 @@ fn tick_timers<T: Transport + ?Sized>(
         };
         let outcome = call_tunn(&peer, |tunn, buf| tunn.update_timers(buf));
         if let Outcome::Network(bytes) = outcome {
+            crate::selection_log::record(format!(
+                "k=t peer={} idx={} pick={} auth={} hint={} ta={} n={}",
+                short_hex(&peer.pubkey),
+                peer.our_index,
+                fmt_sel(&Some(addr)),
+                fmt_sel(&peer.auth_src_load()),
+                hint.and_then(|h| h.alive_endpoint(&peer.pubkey))
+                    .map(|sa| format!("udp:{sa}"))
+                    .unwrap_or_else(|| "none".into()),
+                fmt_sel(&peer.transport_addr_load()),
+                bytes.len(),
+            ));
             send_outbound(transport, &peer.pubkey, addr, &bytes);
         }
+    }
+}
+
+/// Compact `TransportAddr` formatting for selection-log lines.
+fn fmt_sel(a: &Option<TransportAddr>) -> String {
+    match a {
+        None => "none".into(),
+        Some(TransportAddr::Udp(sa)) => format!("udp:{sa}"),
+        Some(TransportAddr::Derp { region, .. }) => format!("derp:{region}"),
     }
 }
 

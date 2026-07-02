@@ -99,6 +99,35 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(50);
 /// work only because they're sent from the worker thread after recv returns).
 type TxQueue = Arc<Mutex<VecDeque<(SocketAddr, Vec<u8>)>>>;
 
+/// One completed `sendto` on the tx_queue drain path, including the ACTUAL
+/// byte count sceNet reported — the signal the fire-and-forget send path
+/// otherwise discards. On the Vita, newlib passes `sceNetSendto`'s return
+/// through verbatim for any value >= 0 and std never checks `ret == len`,
+/// so a short or zero accept is invisible unless recorded here (Fork-B E3
+/// instrumentation of the WG data-plane egress bug).
+#[derive(Clone, Debug)]
+pub struct SendRecord {
+    pub dst: SocketAddr,
+    /// First byte of the datagram (WG message type / Disco magic / STUN).
+    pub byte0: u8,
+    /// Bytes requested.
+    pub req: usize,
+    /// `Ok(bytes sceNet reported sent)` or `Err((kind, raw errno))`.
+    pub ret: Result<usize, (std::io::ErrorKind, Option<i32>)>,
+}
+
+/// Ring of recent drain-path send results. Bounded; oldest dropped.
+type SendLog = Arc<Mutex<VecDeque<SendRecord>>>;
+const SEND_LOG_CAP: usize = 256;
+
+fn push_send_record(log: &SendLog, rec: SendRecord) {
+    let mut g = log.lock();
+    if g.len() >= SEND_LOG_CAP {
+        g.pop_front();
+    }
+    g.push_back(rec);
+}
+
 /// Max receive buffer (Disco packets are small; WG handshake max ~256
 /// bytes; Tailscale's MTU is 1280; round up).
 const RECV_BUF: usize = 64 * 1024;
@@ -236,6 +265,9 @@ pub struct MagicSocketCtl {
     /// Outbound send queue drained+transmitted by the v4 worker thread.
     /// `send_to` pushes here instead of calling `socket.send_to` cross-thread.
     tx_queue: TxQueue,
+    /// Recent drain-path send results (actual returned byte counts).
+    /// Drained via `take_send_records` by the egress-probe / diagnostics.
+    send_log: SendLog,
 }
 
 /// Spawned worker side. Drop joins the receive thread(s) — both v4
@@ -294,6 +326,7 @@ impl MagicSocket {
         let state = Arc::new(Mutex::new(MagicState::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let tx_queue: TxQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let send_log: SendLog = Arc::new(Mutex::new(VecDeque::new()));
         // Share the disco-priv via Arc so the ctl side can decrypt
         // CallMeMaybe frames that arrive via DERP (Stage 4). The worker
         // also holds an Arc; both sides read-only — no mutation.
@@ -309,6 +342,7 @@ impl MagicSocket {
             our_disco_priv: Arc::clone(&our_disco_priv),
             our_node_pub,
             tx_queue: Arc::clone(&tx_queue),
+            send_log: Arc::clone(&send_log),
         };
 
         // Spawn the v4 worker. It owns the ping-pump cadence (the v6
@@ -322,6 +356,7 @@ impl MagicSocket {
         let v4_send_v4 = Arc::clone(&socket_v4);
         let v4_send_v6 = socket_v6.as_ref().map(Arc::clone);
         let v4_tx_queue = Arc::clone(&tx_queue);
+        let v4_send_log = Arc::clone(&send_log);
         let worker_v4 = thread::Builder::new()
             .name("ts-magicsock-v4")
             .stack_size(256 * 1024)
@@ -339,6 +374,7 @@ impl MagicSocket {
                     // Only the v4 worker drains the outbound queue (it holds
                     // both send sockets and dispatches by address family).
                     Some(v4_tx_queue),
+                    Some(v4_send_log),
                 );
             })
             .map_err(MagicError::Io)?;
@@ -367,6 +403,7 @@ impl MagicSocket {
                         (v6_send_v4, v6_send_v6),
                         /* run_ping_pump = */ false,
                         None, // v6 worker doesn't drain the (v4-dispatched) tx queue
+                        None,
                     );
                 })
                 .map_err(MagicError::Io)?;
@@ -505,6 +542,27 @@ impl MagicSocketCtl {
         let _ = self.socket_for(addr)?;
         self.tx_queue.lock().push_back((addr, bytes.to_vec()));
         Ok(bytes.len())
+    }
+
+    /// Drain the worker's send-result ring — one `SendRecord` per actual
+    /// `sendto` executed on the tx_queue drain path, including the true
+    /// returned byte count that the fire-and-forget `send_to` above
+    /// structurally cannot report (it returns a synthetic `Ok(len)` at
+    /// enqueue time). Fork-B E3 instrumentation; consumed by the
+    /// egress-shape probe. Bounded ring (256), oldest dropped.
+    pub fn take_send_records(&self) -> Vec<SendRecord> {
+        self.send_log.lock().drain(..).collect()
+    }
+
+    /// Send a datagram directly on the CALLER's thread, bypassing the
+    /// tx_queue/worker drain, and return sceNet's actual byte count.
+    /// This is the exact send context STUN probes (`stun_probe`) and
+    /// `ping_now` use — a known-delivering context — exposed so the
+    /// egress-shape probe can compare queue-drain vs direct sends of
+    /// byte-identical payloads.
+    pub fn send_direct(&self, addr: SocketAddr, bytes: &[u8]) -> std::io::Result<usize> {
+        let socket = self.socket_for(addr)?;
+        socket.send_to(bytes, addr)
     }
 
     /// Internal: pick the right socket for an outbound address.
@@ -780,6 +838,7 @@ fn worker_loop(
     send_sockets: (Arc<UdpSocket>, Option<Arc<UdpSocket>>),
     run_ping_pump: bool,
     tx_queue: Option<TxQueue>,
+    send_log: Option<SendLog>,
 ) {
     info!(local = ?socket.local_addr(), run_ping_pump, "magicsock.worker.start");
     let mut buf = vec![0u8; RECV_BUF];
@@ -832,12 +891,15 @@ fn worker_loop(
         }
 
         // Drain the outbound queue HERE — immediately after recv_from returns,
-        // while the socket is "warm" from just doing I/O. This is the exact
-        // lifecycle that makes Disco pongs egress (they're sent inline in the
-        // recv handler). Draining at the loop TOP (~50 ms after the last recv,
-        // socket "cold") let 32-byte keepalives out but silently dropped 96-byte
-        // data/echo-reply frames on the Vita's sceNet — they never reached any
-        // peer despite send_to returning Ok. Sending warm fixes that.
+        // while the socket is "warm" from just doing I/O (the lifecycle that
+        // makes Disco pongs egress). NOTE (2026-07-02): warm-sending did NOT
+        // fix the data-plane bug — 96-byte type-4 data frames still never
+        // reach any peer through this drain, while 32-byte keepalives and
+        // handshakes through the SAME send below DO. The drain stays here
+        // because it's a correct place to send; the `send_log` ring records
+        // the ACTUAL returned byte count of every send (previously discarded
+        // — a short/zero sceNetSendto accept was invisible). See
+        // docs/EGRESS-PROBE.md for the Fork-B investigation this feeds.
         if let Some(q) = &tx_queue {
             loop {
                 let item = q.lock().pop_front();
@@ -848,8 +910,32 @@ fn worker_loop(
                         } else {
                             send_v6.as_ref().unwrap_or(&send_v4)
                         };
-                        if let Err(e) = sock.send_to(&bytes, addr) {
-                            warn!(%addr, error = %e, "magicsock.tx_queue.send_failed");
+                        let res = sock.send_to(&bytes, addr);
+                        if let Some(log) = &send_log {
+                            push_send_record(
+                                log,
+                                SendRecord {
+                                    dst: addr,
+                                    byte0: bytes.first().copied().unwrap_or(0),
+                                    req: bytes.len(),
+                                    ret: match &res {
+                                        Ok(n) => Ok(*n),
+                                        Err(e) => Err((e.kind(), e.raw_os_error())),
+                                    },
+                                },
+                            );
+                        }
+                        match res {
+                            Ok(n) if n != bytes.len() => warn!(
+                                %addr,
+                                sent = n,
+                                requested = bytes.len(),
+                                "magicsock.tx_queue.short_send"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!(%addr, error = %e, "magicsock.tx_queue.send_failed");
+                            }
                         }
                     }
                     None => break,
@@ -1654,6 +1740,49 @@ mod tests {
             let v6_addr: SocketAddr = "[::1]:1".parse().unwrap();
             let _ = ctl.send_to(v6_addr, b"\x00");
         }
+    }
+
+    /// Fork-B E3: the drain-path send ring records the ACTUAL byte
+    /// count returned by the OS `sendto`, and `send_direct` returns it
+    /// synchronously. On the host both must equal the requested length;
+    /// on the Vita a divergence here is the smoking gun the discarded
+    /// `Ok(usize)` has been hiding.
+    #[test]
+    fn send_records_capture_actual_return_counts() {
+        let priv_key = DiscoPrivateKey::random();
+        let node = NodePublicKey::from([0u8; 32]);
+        let (non_tx, _non_rx) = unbounded::<NonDiscoPacket>();
+        let (_sock, ctl) = MagicSocket::bind(
+            loopback(0),
+            DiscoPrivateKey::from_bytes(*priv_key.as_bytes()),
+            node,
+            non_tx,
+        )
+        .unwrap();
+        // A real receiver so the loopback send can't error.
+        let receiver = std::net::UdpSocket::bind(loopback(0)).unwrap();
+        let dst = receiver.local_addr().unwrap();
+
+        // Queue path: enqueued now, transmitted by the worker within
+        // ~RECV_TIMEOUT. Wait generously, then check the ring.
+        let payload = b"probe";
+        let _ = ctl.take_send_records(); // flush any startup noise
+        ctl.send_to(dst, payload).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        let recs = ctl.take_send_records();
+        let rec = recs
+            .iter()
+            .find(|r| r.dst == dst)
+            .expect("drain-path send should be recorded");
+        assert_eq!(rec.req, payload.len());
+        assert_eq!(rec.byte0, b'p');
+        assert_eq!(rec.ret, Ok(payload.len()));
+
+        // Direct path: synchronous, returns the OS count immediately.
+        let n = ctl.send_direct(dst, payload).unwrap();
+        assert_eq!(n, payload.len());
+        // Direct sends bypass the drain, so no new ring entry for them.
+        assert!(ctl.take_send_records().iter().all(|r| r.dst != dst));
     }
 
     /// Address-family dispatch correctness: when no v6 socket is

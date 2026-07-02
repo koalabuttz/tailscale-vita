@@ -82,6 +82,12 @@ pub struct Config {
     /// [`ts_ftp::FtpConfig`].
     #[serde(default)]
     pub ftp: ts_ftp::FtpConfig,
+
+    /// `[egress_probe]` — Fork-B diagnostic: UDP egress-shape probe for
+    /// the WG data-plane bug. Off by default. See
+    /// [`crate::egress_probe::EgressProbeConfig`] + docs/EGRESS-PROBE.md.
+    #[serde(default)]
+    pub egress_probe: crate::egress_probe::EgressProbeConfig,
 }
 
 impl Config {
@@ -177,6 +183,17 @@ root            = "ux0:"
 read_only       = false
 passive_port_lo = 30000
 passive_port_hi = 30009
+
+# Fork-B diagnostic (docs/EGRESS-PROBE.md): ~15 s after startup, send a
+# battery of tagged UDP shapes through the production send path to each
+# target, to learn which shapes actually egress. Run
+# scripts/egress-probe-listener.py on each target host. Off by default.
+[egress_probe]
+enabled            = false
+targets            = []      # e.g. ["192.168.8.101:9999"]
+rounds             = 5
+initial_delay_secs = 15
+spacing_ms         = 250
 "#;
 
 fn default_hostname() -> String {
@@ -238,6 +255,7 @@ mod tests {
             suprx_host_only: false,
             localapi_port: Some(crate::localapi::DEFAULT_PORT),
             ftp: ts_ftp::FtpConfig::default(),
+            egress_probe: Default::default(),
         };
         assert_eq!(cfg.host_authority(), "192.0.2.1:8080");
     }
@@ -258,6 +276,7 @@ mod tests {
             suprx_host_only: false,
             localapi_port: Some(crate::localapi::DEFAULT_PORT),
             ftp: ts_ftp::FtpConfig::default(),
+            egress_probe: Default::default(),
         };
         assert_eq!(cfg.host_authority(), "controlplane.tailscale.com");
     }

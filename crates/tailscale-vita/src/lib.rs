@@ -20,6 +20,7 @@
 
 mod config;
 pub mod dual_transport;
+pub mod egress_probe;
 mod error;
 pub mod lifecycle;
 pub mod localapi;
@@ -32,5 +33,5 @@ pub use dual_transport::DualTransport;
 pub use error::{ConfigError, RuntimeError};
 pub use lifecycle::{FatalKind, LifecycleTracker, OnlineState};
 pub use localapi::LocalApiServer;
-pub use runtime::{ControlHandle, ControlSignal, RunStats, Runtime};
+pub use runtime::{wg_selftest_line, ControlHandle, ControlSignal, RunStats, Runtime};
 pub use snapshot::{AclSummary, AllowedIpView, PeerView, RuntimeSnapshot};

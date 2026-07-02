@@ -324,6 +324,13 @@ fn run_runtime() {
     trace("rr1: run_runtime entry");
     info!("suprx.runtime.start");
 
+    // One-shot WG data-plane crypto self-test, BEFORE any network setup so it's
+    // fully isolated (no sockets, no peers) and runs even if the control plane
+    // never comes up. Collapses the data-plane bug fork: VERDICT=
+    // AEAD_NONEMPTY_MISCOMPILE (on-device crypto) vs CRYPTO_OK_NETWORK_SUSPECT
+    // (UDP egress). See memory wg_dataplane_peer_session_bug.
+    trace(&format!("wgst: {}", tailscale_vita::wg_selftest_line()));
+
     // Mirror vitacompanion's pattern: SUPRX is injected before
     // SceShell's network stack is fully ready. 3s pause keeps us out
     // of `sceNetCtlInetGetState`-races.

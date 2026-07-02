@@ -178,6 +178,16 @@ fn suprx_trace(msg: &str) {
 #[cfg(not(target_os = "vita"))]
 fn suprx_trace(_msg: &str) {}
 
+/// One-shot WG data-plane crypto self-test. Runs the in-process
+/// encapsulate/decapsulate round-trip in [`wg_engine::data_plane_selftest`]
+/// and returns its one-line trace summary + fork verdict. Called once at SUPRX
+/// startup to localize the data-plane bug to crypto vs network without touching
+/// the wire. The `SelfTestReport` type stays inside wg-engine — we return a
+/// formatted `String` so callers (tailscale-vita-rt) need no extra dependency.
+pub fn wg_selftest_line() -> String {
+    wg_engine::data_plane_selftest().summary()
+}
+
 impl Runtime {
     /// Block until the v1 control plane is up: fetch server key, load
     /// keystore, complete Noise+HTTP/2 handshake, register, spin up
@@ -311,6 +321,24 @@ impl Runtime {
             info!("ts-ftp.disabled (config.ftp.enabled = false)");
             None
         };
+
+        // Fork-B diagnostic: UDP egress-shape probe (E2/E3). Config-gated,
+        // off by default. ~15 s after startup it sends a tagged shape
+        // battery through the production tx_queue path (plus a direct-send
+        // control) to the configured listener targets; results land in
+        // phase2-trace.txt as `wgpr:` lines and at the listener
+        // (scripts/egress-probe-listener.py). See docs/EGRESS-PROBE.md.
+        if config.egress_probe.enabled {
+            let trace_fn: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| {
+                suprx_trace(s);
+                info!("{}", s);
+            });
+            crate::egress_probe::spawn(
+                magic_ctl.clone(),
+                config.egress_probe.clone(),
+                trace_fn,
+            );
+        }
 
         Ok(Self {
             config,
