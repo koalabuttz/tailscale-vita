@@ -18,17 +18,20 @@ This guide covers installing, updating, and recovering the Tailscale plugin on a
    ```
    Produces `build/tailscale_vita_plugin.suprx` (~1.7 MB).
 
-2. **FTP the plugin to ux0:**
+2. **FTP the plugin to `ur0:tai/`.** taiHEN/Ensō reads its config and loads
+   plugins from `ur0:tai/` (the standard plugins — henkaku, vitacompanion, … —
+   live there too), NOT `ux0:tai/`. Push to the same path the config stanza
+   references:
    ```
    curl -T crates/tailscale-vita-plugin/build/tailscale_vita_plugin.suprx \
-        "ftp://$VITA_IP:1337/ux0:/tai/tailscale-vita-plugin.suprx"
+        "ftp://$VITA_IP:1337/ur0:/tai/tailscale-vita-plugin.suprx"
    ```
 
-3. **Append the taiHEN config stanza.** The file at `ux0:/tai/config.txt` controls which plugins taiHEN loads at boot. Pull it, append the contents of `taihen-config-fragment.txt`, push it back:
+3. **Append the taiHEN config stanza.** The file at `ur0:/tai/config.txt` controls which plugins taiHEN loads at boot. Pull it, append the contents of `taihen-config-fragment.txt`, push it back:
    ```
-   curl -s "ftp://$VITA_IP:1337/ux0:/tai/config.txt" -o /tmp/config.txt
+   curl -s "ftp://$VITA_IP:1337/ur0:/tai/config.txt" -o /tmp/config.txt
    cat taihen-config-fragment.txt >> /tmp/config.txt
-   curl -T /tmp/config.txt "ftp://$VITA_IP:1337/ux0:/tai/config.txt"
+   curl -T /tmp/config.txt "ftp://$VITA_IP:1337/ur0:/tai/config.txt"
    ```
 
 4. **Reboot the Vita.** taiHEN only re-reads its config at boot — there's no hot-reload that affects new plugin loads safely.
@@ -48,7 +51,7 @@ This guide covers installing, updating, and recovering the Tailscale plugin on a
 After a code change:
 
 1. Rebuild: `crates/tailscale-vita-plugin/build.sh`.
-2. FTP the new `.suprx` to `ux0:/tai/tailscale-vita-plugin.suprx` (overwrites the old one).
+2. FTP the new `.suprx` to `ur0:/tai/tailscale-vita-plugin.suprx` (overwrites the old one).
 3. **Reboot.** taiHEN won't reload an existing plugin's binary mid-session — the running plugin keeps the old code in memory. Full reboot is the cleanest way to swap binaries.
 
 You can technically `taiHEN unload`/`load` via `taiReloadConfig` from a payload, but that path is fragile and the plugin's own threads / heap won't tear down cleanly. Reboot is faster + safer.
@@ -58,7 +61,7 @@ You can technically `taiHEN unload`/`load` via `taiReloadConfig` from a payload,
 If the plugin crashes during `module_start` or otherwise misbehaves:
 
 - **Demo dies, Vita stays alive**: this is the intended behavior of `*TVIT00010` staging. Just don't relaunch the demo. The plugin only loads inside that title's process.
-- **If `module_start` hangs (Vita appears frozen on demo launch)**: hold the power button to force-shutdown. On next boot, immediately enter VitaShell BEFORE launching the demo. Remove the plugin file: `delete ux0:/tai/tailscale-vita-plugin.suprx`. Or edit `ux0:/tai/config.txt` to comment-out the `*TVIT00010` stanza. Reboot.
+- **If `module_start` hangs (Vita appears frozen on demo launch)**: hold the power button to force-shutdown. On next boot, immediately enter VitaShell BEFORE launching the demo. Remove the plugin file: `delete ur0:/tai/tailscale-vita-plugin.suprx`. Or edit `ur0:/tai/config.txt` to comment-out the `*TVIT00010` stanza. Reboot.
 - **If somehow promoted to `*main` and breaks SceShell** (NOT the default — only if you edited the stanza): boot into Safe Mode (hold L + R + Start + PS during boot to recover). From Safe Mode you can re-flash HENkaku or restore via Vita Update Blocker.
 
 The default `*TVIT00010` config is intentionally low-risk: a misbehaving plugin can only break the one app that loads it.
