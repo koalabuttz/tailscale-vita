@@ -1647,9 +1647,13 @@ name = "tailscale-vita-demo"
 version = "0.1.0"
 dependencies = [
  "netstack",
+ "serde",
+ "serde_json",
  "tailscale-vita",
  "vita-chan",
+ "vita-fs",
  "vita-log",
+ "vita-thread",
 ]
 
 [[package]]
