@@ -14,6 +14,8 @@
 //! "fill in auth_key" message.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -118,12 +120,14 @@ fn run() -> Result<(), DemoError> {
 
     // M11 Phase 2 / M17-A: if the SUPRX is the runtime owner, the eboot
     // keeps the process alive AND owns the screen — the dashboard UI
-    // runs here (S1: render spike; see docs/PLAN-M17A.md). It must NOT
-    // call Runtime::up — the SUPRX's bootstrap thread already owns the
-    // runtime in this same process.
+    // runs here (docs/PLAN-M17A.md). It must NOT call Runtime::up —
+    // the SUPRX's bootstrap thread already owns the runtime in this
+    // same process; the dashboard reads its LocalAPI over loopback.
     if config.suprx_host_only {
         info!("demo: suprx_host_only=true — SUPRX owns the runtime; starting dashboard UI");
-        ui::run_spike();
+        let never_exit = AtomicBool::new(false);
+        ui::run_dashboard(&never_exit);
+        return Ok(());
     }
 
     if config.auth_key.is_empty() {
@@ -167,41 +171,59 @@ fn run() -> Result<(), DemoError> {
             runtime.shutdown();
         })?;
 
-    // 5. Accept loop on the main thread.
-    let deadline = run_window.map(|s| Instant::now() + Duration::from_secs(s));
-    let mut accept_count = 0u32;
-    loop {
-        if let Some(d) = deadline {
-            if Instant::now() >= d {
-                break;
+    // 5. Accept loop on a worker thread (M17-A S4: the main thread now
+    //    belongs to the dashboard renderer). When the accept loop ends
+    //    (run_window deadline or listener error) it signals both the
+    //    runtime worker and the UI, then cleans up the listener.
+    let ui_exit = Arc::new(AtomicBool::new(false));
+    let accept_handle = thread::Builder::new()
+        .name("demo-accept".into())
+        .stack_size(256 * 1024)
+        .spawn({
+            let ui_exit = Arc::clone(&ui_exit);
+            move || {
+                let deadline = run_window.map(|s| Instant::now() + Duration::from_secs(s));
+                let mut accept_count = 0u32;
+                loop {
+                    if let Some(d) = deadline {
+                        if Instant::now() >= d {
+                            break;
+                        }
+                    }
+                    match listener.accept_timeout(ACCEPT_POLL) {
+                        Ok((stream, peer)) => {
+                            accept_count += 1;
+                            info!(%peer, count = accept_count, "demo.accept");
+                            handler::serve(stream, peer);
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                            ) =>
+                        {
+                            // No connection in this window; loop.
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "demo.accept.error");
+                            break;
+                        }
+                    }
+                }
+                // Stop the runtime worker; drop the listener (removes
+                // its pool sockets from netstack); release the UI.
+                let _ = stop_tx.send(());
+                drop(listener);
+                ui_exit.store(true, Ordering::Release);
+                info!(accept_count, "demo.accept.done");
             }
-        }
-        match listener.accept_timeout(ACCEPT_POLL) {
-            Ok((stream, peer)) => {
-                accept_count += 1;
-                info!(%peer, count = accept_count, "demo.accept");
-                handler::serve(stream, peer);
-            }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                // No connection in this window; loop.
-            }
-            Err(e) => {
-                warn!(error = %e, "demo.accept.error");
-                break;
-            }
-        }
-    }
+        })?;
 
-    // 6. Stop the runtime worker, drop the listener (which removes
-    //    its pool sockets from netstack).
-    let _ = stop_tx.send(());
+    // 6. Dashboard on the main thread until the accept loop ends.
+    ui::run_dashboard(&ui_exit);
+
+    let _ = accept_handle.join();
     let _ = runtime_handle.join();
-    drop(listener);
-    info!(accept_count, "M10 demo done");
+    info!("M10 demo done");
     Ok(())
 }

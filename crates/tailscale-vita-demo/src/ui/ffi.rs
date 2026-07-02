@@ -26,6 +26,7 @@ extern "C" {
     pub fn vita2d_end_drawing();
     pub fn vita2d_set_clear_color(color: c_uint);
     pub fn vita2d_draw_rectangle(x: c_float, y: c_float, w: c_float, h: c_float, color: c_uint);
+    pub fn vita2d_draw_fill_circle(x: c_float, y: c_float, radius: c_float, color: c_uint);
 
     /// Loads the Vita system font (ScePgf). NULL on failure.
     pub fn vita2d_load_default_pgf() -> *mut Vita2dPgf;
@@ -55,9 +56,9 @@ pub struct SceCtrlData {
     pub ly: u8,
     pub rx: u8,
     pub ry: u8,
-    /// Per-button analog pressure (up/right/down/left, lt/rt, l1/r1,
-    /// triangle/circle/cross/square) — unused by the dashboard.
-    pub pressure: [u8; 12],
+    /// Header calls these reserved (per-button fields exist only on
+    /// the Ext variants); unused by the dashboard — layout padding.
+    pub reserved_buttons: [u8; 12],
     pub reserved: [u8; 4],
 }
 

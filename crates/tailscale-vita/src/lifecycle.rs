@@ -43,7 +43,7 @@ pub enum FatalKind {
     Security,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub enum OnlineState {
     /// Initial state — no map event and no DERP rx seen yet.
     Connecting,

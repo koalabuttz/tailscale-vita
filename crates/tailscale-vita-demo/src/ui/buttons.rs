@@ -1,3 +1,5 @@
+#![allow(dead_code)] // complete button set by design; the UI uses a subset
+
 //! SceCtrl button-mask helpers. Pure (no FFI) so they're host-testable;
 //! bit values verified against psp2common/ctrl.h `SceCtrlButtons`.
 

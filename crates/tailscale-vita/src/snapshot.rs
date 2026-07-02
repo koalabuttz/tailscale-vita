@@ -18,13 +18,13 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::lifecycle::OnlineState;
 
 /// Top-level published runtime state. Cheap to clone; small enough to
 /// hand out by value when needed.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeSnapshot {
     /// Unix time the snapshot was last refreshed by the event loop.
     pub updated_at_unix: u64,
@@ -67,7 +67,7 @@ pub struct RuntimeSnapshot {
 /// reach every peer + service the ACL allows for untagged nodes —
 /// which on most personal tailnets is "everything." UIs should
 /// surface this in a high-visibility way (red badge in LiveArea, etc.).
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AclSummary {
     /// Tags assigned to our node, e.g. `["tag:vita"]`. Empty when
     /// untagged.
@@ -80,7 +80,7 @@ pub struct AclSummary {
 
 /// Per-peer info LocalAPI consumers see. Constructed by merging
 /// `PeerSnapshot` (from netmap) with magicsock's direct-path state.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerView {
     /// Full 64-char hex node-key (sans `nodekey:` prefix).
     pub node_key_hex: String,
@@ -116,7 +116,7 @@ pub struct PeerView {
 /// Wire-friendly form of `ts_control::AllowedIp`. Kept as `addr` +
 /// `prefix` rather than collapsed to a string so JSON consumers can
 /// route on either independently.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AllowedIpView {
     pub addr: Ipv4Addr,
     pub prefix: u8,
