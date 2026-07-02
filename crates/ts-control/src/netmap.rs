@@ -45,6 +45,10 @@ pub struct PeerSnapshot {
     /// peers running pre-M12 clients. Strings that don't parse as
     /// SocketAddr are silently dropped (logged at trace level).
     pub endpoints: Vec<SocketAddr>,
+    /// M17-B: RFC3339 last-seen; typically only set for offline peers.
+    pub last_seen: Option<String>,
+    /// M17-B: RFC3339 key-expiry (`0001-…` = expiry disabled).
+    pub key_expiry: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +80,11 @@ pub struct NetMap {
     /// `--tags=tag:vita` and writing an ACL"). Surfaced in
     /// `RuntimeSnapshot.acl.tags` for LocalAPI consumers.
     pub our_tags: Vec<String>,
+    /// M17-B: our own node's RFC3339 key-expiry, captured from the self
+    /// Node on each full MapResponse. `None` if the server omitted it;
+    /// `0001-…` zero value means expiry is disabled. Surfaced as
+    /// `RuntimeSnapshot.our_key_expiry` — the silent-drop-off warning.
+    pub our_key_expiry: Option<String>,
     pub peers: HashMap<NodeKeyBytes, PeerSnapshot>,
     /// Secondary index: server-assigned NodeID → NodeKey. Lets us
     /// resolve `PeersRemoved` and `PeersChangedPatch` entries (which
@@ -148,6 +157,14 @@ impl NetMap {
             if node.tags != self.our_tags {
                 info!(tags = ?node.tags, "control.map.our_tags.set");
                 self.our_tags = node.tags.clone();
+            }
+            // M17-B: capture our own key-expiry so the UI can warn before
+            // the node silently drops off the tailnet. Only overwrite on a
+            // present value — a PeersChanged frame carrying peers but not a
+            // fresh self Node shouldn't clear it.
+            if node.key_expiry.is_some() && node.key_expiry != self.our_key_expiry {
+                info!(key_expiry = ?node.key_expiry, "control.map.our_key_expiry.set");
+                self.our_key_expiry = node.key_expiry.clone();
             }
         }
 
@@ -278,7 +295,13 @@ fn apply_patch_fields(peer: &mut PeerSnapshot, patch: &PeerChangeWire) {
     if let Some(endpoints) = &patch.endpoints {
         peer.endpoints = parse_endpoints(endpoints);
     }
-    // last_seen / key_expiry: v1 doesn't consume.
+    // M17-B: sparse patches carry these when a peer goes idle / rekeys.
+    if patch.last_seen.is_some() {
+        peer.last_seen = patch.last_seen.clone();
+    }
+    if patch.key_expiry.is_some() {
+        peer.key_expiry = patch.key_expiry.clone();
+    }
 }
 
 fn node_to_snapshot(n: &NodeWire) -> Option<PeerSnapshot> {
@@ -316,6 +339,8 @@ fn node_to_snapshot(n: &NodeWire) -> Option<PeerSnapshot> {
         home_derp,
         online: n.online.unwrap_or(false),
         endpoints: parse_endpoints(&n.endpoints),
+        last_seen: n.last_seen.clone(),
+        key_expiry: n.key_expiry.clone(),
     })
 }
 

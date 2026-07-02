@@ -369,6 +369,17 @@ pub(crate) struct NodeWire {
     /// write an ACL.
     #[serde(rename = "Tags", default, deserialize_with = "null_or_default")]
     pub tags: Vec<String>,
+    /// RFC3339 key-expiry (tailcfg `Node.KeyExpiry`). Present on the
+    /// self Node and every peer; long-standing field, not CapVer-gated.
+    /// M17-B surfaces the SELF value as the "node dropping off soon"
+    /// warning. Zero value (`0001-01-01T00:00:00Z`) = expiry disabled.
+    #[serde(rename = "KeyExpiry", default)]
+    pub key_expiry: Option<String>,
+    /// RFC3339 last-seen (tailcfg `Node.LastSeen`, `*time.Time`).
+    /// Typically populated only for offline/idle peers; None/omitted
+    /// for currently-online peers. M17-B shows it in peer detail.
+    #[serde(rename = "LastSeen", default)]
+    pub last_seen: Option<String>,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]

@@ -1464,6 +1464,8 @@ fn publish_snapshot(
                 direct_path_alive: direct_endpoint.is_some(),
                 direct_path_endpoint: direct_endpoint,
                 direct_path_rtt_ms: direct_rtt,
+                last_seen: peer.last_seen.clone(),
+                key_expiry: peer.key_expiry.clone(),
             },
         );
     }
@@ -1495,6 +1497,7 @@ fn publish_snapshot(
         magic_local: magic_ctl.local_addr(),
         public_endpoint,
         acl,
+        our_key_expiry: netmap.our_key_expiry.clone(),
         peers,
     };
     *out.write() = new_snap;

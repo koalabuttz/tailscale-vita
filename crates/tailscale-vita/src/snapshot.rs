@@ -58,6 +58,11 @@ pub struct RuntimeSnapshot {
     /// access (the load-bearing security boundary in
     /// `memory/vita_threat_model.md`).
     pub acl: AclSummary,
+    /// M17-B: our own node's RFC3339 key-expiry. `None` if the server
+    /// omitted it; `0001-…` zero value means expiry disabled. The
+    /// dashboard warns before this passes (a silent tailnet drop-off).
+    #[serde(default)]
+    pub our_key_expiry: Option<String>,
     /// Per-peer view, keyed by node-key hex.
     pub peers: HashMap<String, PeerView>,
 }
@@ -111,6 +116,12 @@ pub struct PeerView {
     /// Last-measured RTT on the alive path, milliseconds. None when
     /// no alive path exists.
     pub direct_path_rtt_ms: Option<u64>,
+    /// M17-B: RFC3339 last-seen; usually only set for offline peers.
+    #[serde(default)]
+    pub last_seen: Option<String>,
+    /// M17-B: RFC3339 key-expiry (`0001-…` = expiry disabled).
+    #[serde(default)]
+    pub key_expiry: Option<String>,
 }
 
 /// Wire-friendly form of `ts_control::AllowedIp`. Kept as `addr` +
@@ -140,6 +151,7 @@ impl RuntimeSnapshot {
             magic_local,
             public_endpoint: None,
             acl: AclSummary::default(),
+            our_key_expiry: None,
             peers: HashMap::new(),
         }
     }
@@ -205,6 +217,8 @@ mod tests {
             direct_path_alive: true,
             direct_path_endpoint: Some("166.198.24.1:29944".parse().unwrap()),
             direct_path_rtt_ms: Some(68),
+            last_seen: None,
+            key_expiry: Some("2027-01-15T00:00:00Z".into()),
         };
         let json = serde_json::to_string(&peer).unwrap();
         assert!(json.contains("\"name\":\"phone\""));

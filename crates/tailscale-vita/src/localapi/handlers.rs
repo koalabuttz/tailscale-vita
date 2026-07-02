@@ -265,6 +265,7 @@ mod tests {
                 tags: vec!["tag:vita".into()],
                 has_tags: true,
             },
+            our_key_expiry: Some("2027-01-15T00:00:00Z".into()),
             peers: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -281,6 +282,8 @@ mod tests {
                         direct_path_alive: true,
                         direct_path_endpoint: Some("166.198.24.1:29944".parse().unwrap()),
                         direct_path_rtt_ms: Some(68),
+                        last_seen: None,
+                        key_expiry: None,
                     },
                 );
                 m
