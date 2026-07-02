@@ -6,7 +6,9 @@
 
 use std::net::Ipv4Addr;
 
-use tailscale_vita::{OnlineState, RuntimeSnapshot};
+use tailscale_vita::{OnlineState, PeerView, RuntimeSnapshot};
+
+use super::timefmt;
 
 /// Semantic color class; render.rs maps to RGBA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,6 +18,76 @@ pub enum Tone {
     Bad,
     Dim,
     Normal,
+}
+
+/// Top-level dashboard tab, cycled with L/R.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tab {
+    Peers,
+    Settings,
+    Debug,
+}
+
+impl Tab {
+    pub const ALL: [Tab; 3] = [Tab::Peers, Tab::Settings, Tab::Debug];
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Peers => "Peers",
+            Tab::Settings => "Settings",
+            Tab::Debug => "Debug",
+        }
+    }
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|&t| t == self).unwrap_or(0)
+    }
+    pub fn next(self) -> Tab {
+        Self::ALL[(self.index() + 1) % Self::ALL.len()]
+    }
+    pub fn prev(self) -> Tab {
+        Self::ALL[(self.index() + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+/// A row in the Settings tab. `Reconnect` is a live action; the two ftp
+/// rows are config toggles (rewrite config.toml, relaunch to apply).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingRow {
+    FtpEnabled,
+    FtpReadOnly,
+    Reconnect,
+}
+
+impl SettingRow {
+    pub const ALL: [SettingRow; 3] =
+        [SettingRow::FtpEnabled, SettingRow::FtpReadOnly, SettingRow::Reconnect];
+
+    /// Display label + right-hand value string for the current state.
+    /// `ftp_enabled`/`ftp_read_only` are the live config.toml values
+    /// (`None` = couldn't read the file).
+    pub fn render(
+        self,
+        ftp_enabled: Option<bool>,
+        ftp_read_only: Option<bool>,
+    ) -> (String, String, Tone) {
+        let on_off = |b: Option<bool>| match b {
+            Some(true) => ("ON".to_string(), Tone::Good),
+            Some(false) => ("OFF".to_string(), Tone::Dim),
+            None => ("?".to_string(), Tone::Warn),
+        };
+        match self {
+            SettingRow::FtpEnabled => {
+                let (v, t) = on_off(ftp_enabled);
+                ("ts-ftp server".into(), v, t)
+            }
+            SettingRow::FtpReadOnly => {
+                let (v, t) = on_off(ftp_read_only);
+                ("ts-ftp read-only".into(), v, t)
+            }
+            SettingRow::Reconnect => {
+                ("Reconnect to control".into(), "press X".into(), Tone::Normal)
+            }
+        }
+    }
 }
 
 pub struct HeaderVm {
@@ -40,6 +112,8 @@ pub struct PeerRow {
     /// Ping target — present only when the peer is online with a
     /// tailnet IP.
     pub ping_ip: Option<Ipv4Addr>,
+    /// Full node-key hex — exact key for the peer-detail lookup.
+    pub node_key: String,
 }
 
 pub struct DashVm {
@@ -136,7 +210,158 @@ fn peer_row(p: &tailscale_vita::PeerView) -> PeerRow {
         path,
         path_tone,
         ping_ip: if p.online { p.tailscale_ip } else { None },
+        node_key: p.node_key_hex.clone(),
     }
+}
+
+/// ACL posture line for the Settings/header panel — the threat-model
+/// priority. Green when tagged, red when the auth-key was untagged
+/// (full untagged-node ACL reach).
+pub fn acl_line(snap: &RuntimeSnapshot) -> (String, Tone) {
+    if snap.acl.has_tags {
+        (format!("ACL tags: {}", snap.acl.tags.join(" ")), Tone::Good)
+    } else {
+        (
+            "ACL: UNTAGGED auth-key — full untagged-node reach".into(),
+            Tone::Bad,
+        )
+    }
+}
+
+/// Self key-expiry line + tone for the header/settings warning.
+pub fn key_expiry_line(snap: &RuntimeSnapshot, now_unix: u64) -> (String, Tone) {
+    let line = timefmt::fmt_key_expiry(&snap.our_key_expiry, now_unix);
+    let tone = if timefmt::key_expiry_is_warning(&snap.our_key_expiry, now_unix) {
+        Tone::Bad
+    } else {
+        Tone::Dim
+    };
+    (line, tone)
+}
+
+/// Debug-tab rows: runtime internals the main card omits. `(label,
+/// value, tone)`. Pure — reads only the snapshot + build string.
+pub fn build_debug_rows(
+    snap: &RuntimeSnapshot,
+    now_unix: u64,
+    build: &str,
+) -> Vec<(String, String, Tone)> {
+    let mut rows = Vec::new();
+    rows.push(("lifecycle".into(), format!("{:?}", snap.lifecycle), Tone::Normal));
+    if let Some(reason) = &snap.fatal_reason {
+        rows.push(("fatal".into(), reason.clone(), Tone::Bad));
+    }
+    rows.push((
+        "updated".into(),
+        format!("{} s ago", now_unix.saturating_sub(snap.updated_at_unix)),
+        Tone::Dim,
+    ));
+    rows.push((
+        "uptime".into(),
+        fmt_duration_secs(now_unix.saturating_sub(snap.started_at_unix)),
+        Tone::Dim,
+    ));
+    rows.push(("peers".into(), snap.peer_count.to_string(), Tone::Normal));
+    rows.push((
+        "DERP home".into(),
+        if snap.derp_home_region == 0 {
+            "none".into()
+        } else {
+            snap.derp_home_region.to_string()
+        },
+        Tone::Normal,
+    ));
+    rows.push((
+        "DERP alive".into(),
+        if snap.alive_derp_regions.is_empty() {
+            "none".into()
+        } else {
+            snap.alive_derp_regions
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        },
+        Tone::Normal,
+    ));
+    rows.push(("magic UDP".into(), snap.magic_local.to_string(), Tone::Dim));
+    rows.push((
+        "public".into(),
+        snap.public_endpoint
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "none (no STUN)".into()),
+        Tone::Dim,
+    ));
+    let (kx, kt) = key_expiry_line(snap, now_unix);
+    rows.push(("self key".into(), kx.trim_start_matches("key: ").into(), kt));
+    rows.push(("build".into(), build.into(), Tone::Dim));
+    rows
+}
+
+/// Peer-detail overlay lines for the peer whose node-key hex is `key`.
+/// `None` if that peer vanished from the snapshot. `(label, value)`.
+pub fn peer_detail_lines(
+    snap: &RuntimeSnapshot,
+    key: &str,
+    now_unix: u64,
+) -> Option<Vec<(String, String)>> {
+    let p: &PeerView = snap.peers.get(key)?;
+    let mut rows = vec![
+        ("name".into(), first_label(&p.name)),
+        (
+            "tailnet IP".into(),
+            p.tailscale_ip.map(|i| i.to_string()).unwrap_or_else(|| "—".into()),
+        ),
+        ("online".into(), if p.online { "yes".into() } else { "no".into() }),
+        ("node id".into(), p.node_id.to_string()),
+        (
+            "DERP home".into(),
+            if p.home_derp == 0 { "none".into() } else { p.home_derp.to_string() },
+        ),
+        (
+            "direct path".into(),
+            match (p.direct_path_alive, p.direct_path_rtt_ms) {
+                (true, Some(ms)) => format!("yes, {ms} ms"),
+                (true, None) => "yes".into(),
+                (false, _) => "no (relay)".into(),
+            },
+        ),
+    ];
+    if let Some(ep) = &p.direct_path_endpoint {
+        rows.push(("via".into(), ep.to_string()));
+    }
+    rows.push((
+        "allowed IPs".into(),
+        if p.allowed_ips.is_empty() {
+            "—".into()
+        } else {
+            p.allowed_ips.join(" ")
+        },
+    ));
+    rows.push((
+        "endpoints".into(),
+        if p.endpoints.is_empty() {
+            "—".into()
+        } else {
+            p.endpoints.join(" ")
+        },
+    ));
+    // last_seen is only meaningful for offline peers (Tailscale omits it
+    // for online ones; a stale value can linger after reconnect).
+    if !p.online {
+        let ls = timefmt::fmt_last_seen(&p.last_seen, now_unix);
+        if !ls.is_empty() {
+            rows.push(("last seen".into(), ls.trim_start_matches("last seen ").into()));
+        }
+    }
+    rows.push((
+        "key".into(),
+        timefmt::fmt_key_expiry(&p.key_expiry, now_unix)
+            .trim_start_matches("key: ")
+            .into(),
+    ));
+    rows.push(("node key".into(), format!("{}…", &p.node_key_hex[..16.min(p.node_key_hex.len())])));
+    Some(rows)
 }
 
 /// Peer names arrive as FQDNs ("lewis.tail1234.ts.net."); display the
@@ -201,6 +426,8 @@ mod tests {
             direct_path_alive: direct.is_some(),
             direct_path_endpoint: None,
             direct_path_rtt_ms: direct,
+            last_seen: None,
+            key_expiry: None,
         }
     }
 
@@ -293,5 +520,86 @@ mod tests {
         assert_eq!(fmt_duration_secs(37 * 60), "37m");
         assert_eq!(fmt_duration_secs(2 * 3600 + 14 * 60), "2h14m");
         assert_eq!(fmt_duration_secs(3 * 86400 + 3600), "3d1h");
+    }
+
+    #[test]
+    fn tab_cycles_both_ways() {
+        assert_eq!(Tab::Peers.next(), Tab::Settings);
+        assert_eq!(Tab::Debug.next(), Tab::Peers);
+        assert_eq!(Tab::Peers.prev(), Tab::Debug);
+        assert_eq!(Tab::Settings.index(), 1);
+    }
+
+    #[test]
+    fn setting_row_renders_states() {
+        let (l, v, t) = SettingRow::FtpEnabled.render(Some(true), Some(false));
+        assert_eq!(l, "ts-ftp server");
+        assert_eq!(v, "ON");
+        assert_eq!(t, Tone::Good);
+        let (_, v, t) = SettingRow::FtpReadOnly.render(Some(true), Some(false));
+        assert_eq!(v, "OFF");
+        assert_eq!(t, Tone::Dim);
+        let (_, v, t) = SettingRow::FtpEnabled.render(None, None);
+        assert_eq!(v, "?");
+        assert_eq!(t, Tone::Warn);
+        let (l, _, _) = SettingRow::Reconnect.render(None, None);
+        assert_eq!(l, "Reconnect to control");
+    }
+
+    #[test]
+    fn acl_line_flags_untagged() {
+        let mut s = snap_with(vec![]);
+        let (line, tone) = acl_line(&s);
+        assert!(line.contains("UNTAGGED"));
+        assert_eq!(tone, Tone::Bad);
+        s.acl.tags = vec!["tag:vita".into()];
+        s.acl.has_tags = true;
+        let (line, tone) = acl_line(&s);
+        assert!(line.contains("tag:vita"));
+        assert_eq!(tone, Tone::Good);
+    }
+
+    #[test]
+    fn key_expiry_line_warns() {
+        let now = 1_782_950_400; // 2026-07-02
+        let mut s = snap_with(vec![]);
+        s.our_key_expiry = Some("2026-07-09T00:00:00Z".into()); // 7 days
+        let (line, tone) = key_expiry_line(&s, now);
+        assert!(line.contains("expires in 7 days"));
+        assert_eq!(tone, Tone::Bad);
+        s.our_key_expiry = None;
+        let (line, tone) = key_expiry_line(&s, now);
+        assert!(line.contains("never"));
+        assert_eq!(tone, Tone::Dim);
+    }
+
+    #[test]
+    fn debug_rows_include_internals() {
+        let mut s = snap_with(vec![peer("a.x.", true, Some(3), 1)]);
+        s.public_endpoint = Some("1.2.3.4:41641".parse().unwrap());
+        s.alive_derp_regions = vec![1, 2];
+        let rows = build_debug_rows(&s, 1_000_010, "build-xyz");
+        let labels: Vec<&str> = rows.iter().map(|(l, _, _)| l.as_str()).collect();
+        assert!(labels.contains(&"lifecycle"));
+        assert!(labels.contains(&"public"));
+        assert!(labels.contains(&"DERP alive"));
+        assert!(labels.contains(&"build"));
+        let pub_row = rows.iter().find(|(l, _, _)| l == "public").unwrap();
+        assert_eq!(pub_row.1, "1.2.3.4:41641");
+    }
+
+    #[test]
+    fn peer_detail_lines_for_known_key() {
+        let mut s = snap_with(vec![]);
+        let mut pv = peer("lewis.ts.net.", true, Some(4), 1);
+        pv.node_key_hex = "cd".repeat(32);
+        pv.endpoints = vec!["192.168.8.211:54415".into()];
+        s.peers.insert("mapkey-1".into(), pv);
+        let lines = peer_detail_lines(&s, "mapkey-1", 1_000_000).unwrap();
+        let get = |k: &str| lines.iter().find(|(l, _)| l == k).map(|(_, v)| v.clone());
+        assert_eq!(get("name").as_deref(), Some("lewis"));
+        assert_eq!(get("direct path").as_deref(), Some("yes, 4 ms"));
+        assert_eq!(get("endpoints").as_deref(), Some("192.168.8.211:54415"));
+        assert!(peer_detail_lines(&s, "no-such-key", 1_000_000).is_none());
     }
 }

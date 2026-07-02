@@ -1,6 +1,8 @@
-//! M17-A S3/S4 — the dashboard event loop (vita-only). Main-thread
-//! render at vblank; input with edge-detection + D-pad key-repeat;
-//! viewmodel rebuilt only when the poller's generation moves.
+//! M17-A/B/C — dashboard event loop (vita-only). Main-thread render at
+//! vblank; tabbed UI (Peers / Settings / Debug) with a peer-detail
+//! overlay; input via buttons (edge + D-pad repeat), left stick, and the
+//! front touchscreen; UI actions (ping / reconnect / config toggle) run
+//! on the worker thread. See docs/PLAN-M17BC.md.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,33 +11,27 @@ use std::time::{Duration, Instant};
 use vita_chan::bounded;
 use vita_log::info;
 
-use super::client::{self, PingRequest, PingState, Shared};
-use super::render::{Renderer, VIEWPORT_ROWS};
-use super::viewmodel::{self, DashVm, Tone};
+use super::client::{self, ActionState, Shared, UiAction};
+use super::render::{self, Renderer, VIEWPORT_ROWS};
+use super::viewmodel::{self, DashVm, SettingRow, Tab, Tone};
 use super::{buttons, ffi};
 
 const REPEAT_FIRST: Duration = Duration::from_millis(250);
 const REPEAT_NEXT: Duration = Duration::from_millis(120);
-/// How long a finished ping result stays in the footer.
-const PING_LINE_TTL: Duration = Duration::from_secs(12);
-/// After this long with zero successful polls, hint at the SUPRX.
+const ACTION_LINE_TTL: Duration = Duration::from_secs(12);
 const RUNTIME_HINT_AFTER: Duration = Duration::from_secs(30);
+/// Left-stick deflection thresholds (0..255, center 128).
+const STICK_UP: u8 = 96;
+const STICK_DOWN: u8 = 160;
 
-/// D-pad auto-repeat state for one direction.
 struct Repeat {
     held_since: Option<Instant>,
     last_fire: Instant,
 }
-
 impl Repeat {
     fn new() -> Self {
-        Self {
-            held_since: None,
-            last_fire: Instant::now(),
-        }
+        Self { held_since: None, last_fire: Instant::now() }
     }
-
-    /// Returns true when the action should fire this frame.
     fn tick(&mut self, held: bool, now: Instant) -> bool {
         if !held {
             self.held_since = None;
@@ -45,15 +41,13 @@ impl Repeat {
             None => {
                 self.held_since = Some(now);
                 self.last_fire = now;
-                true // fire immediately on press
+                true
             }
             Some(since) => {
-                let due = if now.duration_since(since) < REPEAT_FIRST {
+                if now.duration_since(since) < REPEAT_FIRST {
                     return false;
-                } else {
-                    REPEAT_NEXT
-                };
-                if now.duration_since(self.last_fire) >= due {
+                }
+                if now.duration_since(self.last_fire) >= REPEAT_NEXT {
                     self.last_fire = now;
                     true
                 } else {
@@ -64,25 +58,33 @@ impl Repeat {
     }
 }
 
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub fn run(exit: &AtomicBool) {
     let renderer = Renderer::init();
-
     let shared: Arc<Mutex<Shared>> = Shared::new();
-    // bounded(1): at most one queued ping; the UI refuses to queue more
-    // while one is in flight anyway.
-    let (ping_tx, ping_rx) = bounded::<PingRequest>(1);
-    client::spawn_poller(Arc::clone(&shared), ping_rx);
+    let (action_tx, action_rx) = bounded::<UiAction>(1);
+    client::spawn_worker(Arc::clone(&shared), action_rx);
 
     let started = Instant::now();
+    let mut tab = Tab::Peers;
+    let mut snapshot: Option<tailscale_vita::RuntimeSnapshot> = None;
     let mut vm: Option<DashVm> = None;
     let mut seen_generation: u64 = 0;
-    let mut selected: usize = 0;
-    // Selection identity: rows re-sort on every snapshot (a peer coming
-    // online shifts positions), so a bare index would silently retarget
-    // — and X would ping the wrong peer. Track (name, ip) and re-locate
-    // after each viewmodel rebuild.
+
+    let mut peers_selected: usize = 0;
     let mut selected_key: Option<(String, String)> = None;
+    let mut settings_selected: usize = 0;
+    let mut debug_scroll: usize = 0;
+    let mut detail_key: Option<String> = None;
+
     let mut prev_buttons: u32 = 0;
+    let mut prev_touch = false;
     let mut rep_up = Repeat::new();
     let mut rep_down = Repeat::new();
     let mut first_frame_logged = false;
@@ -94,111 +96,208 @@ pub fn run(exit: &AtomicBool) {
         }
         let now = Instant::now();
 
-        // ── Input ──
+        // ── Input: buttons, stick, touch ──
         let pad = unsafe {
-            let mut pad = std::mem::zeroed::<ffi::SceCtrlData>();
-            let _ = ffi::sceCtrlPeekBufferPositive(0, &mut pad, 1);
-            pad
+            let mut p = std::mem::zeroed::<ffi::SceCtrlData>();
+            let _ = ffi::sceCtrlPeekBufferPositive(0, &mut p, 1);
+            p
         };
         let pressed = pad.buttons & !prev_buttons;
         prev_buttons = pad.buttons;
+        let held_up = pad.buttons & buttons::UP != 0 || pad.ly < STICK_UP;
+        let held_down = pad.buttons & buttons::DOWN != 0 || pad.ly > STICK_DOWN;
+        let fire_up = rep_up.tick(held_up, now);
+        let fire_down = rep_down.tick(held_down, now);
 
-        // ── Poll shared state; rebuild the viewmodel on change ──
-        let (generation, snapshot, ping, last_error, failures, last_ok) = {
+        let touch = read_touch();
+        let tap = touch.filter(|_| !prev_touch); // rising edge = a tap
+        prev_touch = touch.is_some();
+
+        // ── Pull worker state; rebuild viewmodel on generation change ──
+        let (generation, snap_opt, action, last_error, failures, last_ok, ftp_en, ftp_ro) = {
             let s = shared.lock().unwrap_or_else(|p| p.into_inner());
             (
                 s.generation,
-                if s.generation != seen_generation {
-                    s.snapshot.clone()
-                } else {
-                    None
-                },
-                s.ping.clone(),
+                if s.generation != seen_generation { s.snapshot.clone() } else { None },
+                s.action.clone(),
                 s.last_error.clone(),
                 s.consecutive_failures,
                 s.last_ok_at,
+                s.ftp_enabled,
+                s.ftp_read_only,
             )
         };
         if generation != seen_generation {
             seen_generation = generation;
-            if let Some(snap) = snapshot {
+            if let Some(snap) = snap_opt {
                 vm = Some(viewmodel::build(&snap, now_unix()));
-                // Re-locate the selected peer in the re-sorted rows.
                 if let (Some(vm), Some((name, ip))) = (&vm, &selected_key) {
-                    if let Some(i) = vm
-                        .rows
-                        .iter()
-                        .position(|r| &r.name == name && &r.ip == ip)
-                    {
-                        selected = i;
+                    if let Some(i) = vm.rows.iter().position(|r| &r.name == name && &r.ip == ip) {
+                        peers_selected = i;
                     }
                 }
+                snapshot = Some(snap);
             }
         }
 
-        // ── Navigation + ping action ──
-        if let Some(vm) = &vm {
-            let len = vm.rows.len();
-            if len > 0 {
-                selected = selected.min(len - 1);
-                if rep_up.tick(pad.buttons & buttons::UP != 0, now) && selected > 0 {
-                    selected -= 1;
+        let action_idle = !matches!(action, ActionState::InFlight { .. });
+        let send = |a: UiAction| {
+            if action_idle {
+                let _ = action_tx.try_send(a);
+            }
+        };
+
+        // ── Navigation / actions (overlay captures input when open) ──
+        if detail_key.is_some() {
+            if pressed & (buttons::CIRCLE | buttons::TRIANGLE | buttons::CROSS) != 0 {
+                detail_key = None;
+            }
+        } else {
+            // Tab switch: L/R shoulders, or a tap on the tab bar.
+            if pressed & buttons::LTRIGGER != 0 {
+                tab = tab.prev();
+            }
+            if pressed & buttons::RTRIGGER != 0 {
+                tab = tab.next();
+            }
+            if let Some((tx, ty)) = tap {
+                if let Some(t) = render::tab_at(tx, ty) {
+                    tab = t;
                 }
-                if rep_down.tick(pad.buttons & buttons::DOWN != 0, now) && selected + 1 < len {
-                    selected += 1;
-                }
-                let row = &vm.rows[selected];
-                selected_key = Some((row.name.clone(), row.ip.clone()));
-                if pressed & buttons::CROSS != 0 {
-                    let idle = !matches!(ping, PingState::InFlight { .. });
-                    if idle {
-                        let row = &vm.rows[selected];
-                        if let Some(ip) = row.ping_ip {
-                            let _ = ping_tx.try_send(PingRequest {
-                                ip,
-                                peer_name: row.name.clone(),
-                            });
+            }
+
+            match tab {
+                Tab::Peers => {
+                    if let Some(vm) = &vm {
+                        let len = vm.rows.len();
+                        if len > 0 {
+                            peers_selected = peers_selected.min(len - 1);
+                            if fire_up && peers_selected > 0 {
+                                peers_selected -= 1;
+                            }
+                            if fire_down && peers_selected + 1 < len {
+                                peers_selected += 1;
+                            }
+                            // Touch: tap a peer row to select it.
+                            if let Some((_, ty)) = tap {
+                                if let Some(slot) = render::peer_slot_at(ty) {
+                                    let (start, _) =
+                                        viewmodel::scroll_window(len, peers_selected, VIEWPORT_ROWS);
+                                    let idx = start + slot;
+                                    if idx < len {
+                                        peers_selected = idx;
+                                    }
+                                }
+                            }
+                            let row = &vm.rows[peers_selected];
+                            selected_key = Some((row.name.clone(), row.ip.clone()));
+                            if pressed & buttons::CROSS != 0 {
+                                if let Some(ip) = row.ping_ip {
+                                    send(UiAction::Ping { ip, peer_name: row.name.clone() });
+                                }
+                            }
+                            if pressed & buttons::CIRCLE != 0 {
+                                detail_key = Some(row.node_key.clone());
+                            }
                         }
+                    }
+                }
+                Tab::Settings => {
+                    let n = SettingRow::ALL.len();
+                    if fire_up && settings_selected > 0 {
+                        settings_selected -= 1;
+                    }
+                    if fire_down && settings_selected + 1 < n {
+                        settings_selected += 1;
+                    }
+                    if pressed & buttons::CROSS != 0 {
+                        match SettingRow::ALL[settings_selected] {
+                            SettingRow::FtpEnabled => send(UiAction::ToggleFtp { key: "enabled" }),
+                            SettingRow::FtpReadOnly => {
+                                send(UiAction::ToggleFtp { key: "read_only" })
+                            }
+                            SettingRow::Reconnect => send(UiAction::Reconnect),
+                        }
+                    }
+                }
+                Tab::Debug => {
+                    if fire_down {
+                        debug_scroll += 1;
+                    }
+                    if fire_up {
+                        debug_scroll = debug_scroll.saturating_sub(1);
                     }
                 }
             }
         }
 
         // ── Draw ──
-        match &vm {
-            Some(vm) => {
-                let window = viewmodel::scroll_window(vm.rows.len(), selected, VIEWPORT_ROWS);
-                let ping_line = match &ping {
-                    PingState::Idle => None,
-                    PingState::InFlight { peer_name } => {
-                        Some((format!("pinging {peer_name}..."), Tone::Warn))
+        let now_u = now_unix();
+        match (&vm, &snapshot) {
+            (Some(vm), Some(snap)) => {
+                renderer.begin();
+                renderer.header(vm, tab);
+                let action_line = action_footer(&action);
+                match tab {
+                    Tab::Peers => {
+                        let window =
+                            viewmodel::scroll_window(vm.rows.len(), peers_selected, VIEWPORT_ROWS);
+                        let banner = (failures >= 3)
+                            .then_some("runtime not responding - data is stale");
+                        renderer.peers_body(vm, peers_selected, window, banner);
                     }
-                    PingState::Done { line, ok, at } if at.elapsed() < PING_LINE_TTL => {
-                        Some((line.clone(), if *ok { Tone::Good } else { Tone::Bad }))
+                    Tab::Settings => {
+                        let acl = viewmodel::acl_line(snap);
+                        let kx = viewmodel::key_expiry_line(snap, now_u);
+                        let rows: Vec<(String, String, Tone)> = SettingRow::ALL
+                            .iter()
+                            .map(|r| r.render(ftp_en, ftp_ro))
+                            .collect();
+                        renderer.settings_body(
+                            (&acl.0, acl.1),
+                            (&kx.0, kx.1),
+                            &rows,
+                            settings_selected,
+                        );
                     }
-                    PingState::Done { .. } => None,
+                    Tab::Debug => {
+                        let rows = viewmodel::build_debug_rows(snap, now_u, env!("BUILD_TIMESTAMP"));
+                        let max = rows.len().saturating_sub(1);
+                        debug_scroll = debug_scroll.min(max);
+                        renderer.debug_body(&rows, debug_scroll);
+                    }
+                }
+                let legend = match tab {
+                    Tab::Peers => "L/R tab  UP/DN select  X ping  O detail",
+                    Tab::Settings => "L/R tab  UP/DN select  X activate",
+                    Tab::Debug => "L/R tab  UP/DN scroll",
                 };
-                // Poll failures after we HAVE a snapshot → show stale data
-                // plus a warning banner rather than blanking the screen.
-                let banner = (failures >= 3).then(|| "runtime not responding - data is stale");
-                renderer.frame(
-                    vm,
-                    selected,
-                    window,
-                    ping_line.as_ref().map(|(l, t)| (l.as_str(), *t)),
-                    banner,
+                renderer.footer(
+                    action_line.as_ref().map(|(l, t)| (l.as_str(), *t)),
+                    (&vm.staleness, vm.staleness_tone),
+                    legend,
                 );
+                // Peer-detail overlay (any tab).
+                if let Some(key) = &detail_key {
+                    match viewmodel::peer_detail_lines(snap, key, now_u) {
+                        Some(lines) => {
+                            let title = lines
+                                .iter()
+                                .find(|(l, _)| l == "name")
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or_else(|| "peer".into());
+                            renderer.detail_overlay(&title, &lines);
+                        }
+                        None => detail_key = None, // peer vanished
+                    }
+                }
+                renderer.end();
             }
-            None => {
-                // No snapshot yet: cold start, runtime still booting, or
-                // the SUPRX never loaded.
+            _ => {
                 let (headline, tone) = if last_ok.is_some() {
                     ("connecting to tailnet...", Tone::Warn)
                 } else if started.elapsed() > RUNTIME_HINT_AFTER {
-                    (
-                        "runtime not detected - is the SUPRX in ur0:tai/config.txt?",
-                        Tone::Bad,
-                    )
+                    ("runtime not detected - is the SUPRX in ur0:tai/config.txt?", Tone::Bad)
                 } else {
                     ("waiting for runtime (SUPRX)...", Tone::Warn)
                 };
@@ -214,10 +313,32 @@ pub fn run(exit: &AtomicBool) {
     }
 }
 
-/// Wall-clock unix seconds (device RTC).
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// Footer line for the current action state (drops after TTL).
+fn action_footer(action: &ActionState) -> Option<(String, Tone)> {
+    match action {
+        ActionState::Idle => None,
+        ActionState::InFlight { label } => Some((label.clone(), Tone::Warn)),
+        ActionState::Done { line, ok, at } if at.elapsed() < ACTION_LINE_TTL => {
+            Some((line.clone(), if *ok { Tone::Good } else { Tone::Bad }))
+        }
+        ActionState::Done { .. } => None,
+    }
+}
+
+/// Poll the front touchscreen; return the first touch mapped to screen
+/// pixels (front panel is 2× the screen), or None if nothing is down.
+fn read_touch() -> Option<(f32, f32)> {
+    let data = unsafe {
+        let mut d = std::mem::zeroed::<ffi::SceTouchData>();
+        let n = ffi::sceTouchPeek(ffi::SCE_TOUCH_PORT_FRONT, &mut d, 1);
+        if n < 1 {
+            return None;
+        }
+        d
+    };
+    if data.report_num == 0 {
+        return None;
+    }
+    let r = data.report[0];
+    Some((r.x as f32 / ffi::TOUCH_SCALE, r.y as f32 / ffi::TOUCH_SCALE))
 }

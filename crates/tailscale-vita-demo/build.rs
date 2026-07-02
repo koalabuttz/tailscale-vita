@@ -52,6 +52,7 @@ fn main() {
             "SceSysmodule_stub",
             // Input for the dashboard.
             "SceCtrl_stub",
+            "SceTouch_stub",
             // vita2d's texture/TTF loader objects reference these; the
             // linker only pulls archive members we actually use, and
             // unused ones cost zero bytes — listed so a future

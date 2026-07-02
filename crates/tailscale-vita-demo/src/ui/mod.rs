@@ -15,6 +15,8 @@
 
 mod buttons;
 mod client;
+mod config_edit;
+mod timefmt;
 mod viewmodel;
 
 #[cfg(target_os = "vita")]

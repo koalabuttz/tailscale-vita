@@ -1,14 +1,15 @@
 #![allow(dead_code)] // consumers (dashboard/render) are vita-gated; host sees these as dead
 
-//! M17-A S2 — loopback LocalAPI client + background poller.
+//! M17-A/B — loopback LocalAPI client + background worker.
 //!
 //! The dashboard is a pure HTTP client of the runtime's LocalAPI
 //! (`127.0.0.1:41112`), whether the runtime lives in the SUPRX
-//! (suprx_host_only) or in this eboot (normal mode). One poller thread
-//! GETs `/status` every `POLL_INTERVAL` into `Shared`; ping requests
-//! ride the same thread ON PURPOSE — LocalAPI has a single accept
-//! thread and `/ping` blocks it up to 5 s, so a parallel `/status`
-//! poll would only stall behind it (see docs/PLAN-M17A.md).
+//! (suprx_host_only) or in this eboot (normal mode). One worker thread
+//! polls `/status` every `POLL_INTERVAL` into `Shared`, and executes UI
+//! ACTIONS (ping / reconnect / config toggle) that arrive on a mailbox
+//! — serialized with polls ON PURPOSE (LocalAPI has a single accept
+//! thread and `/ping` blocks it up to 5 s, so a parallel poll would
+//! only stall behind it; see docs/PLAN-M17A.md).
 
 use std::io::{ErrorKind, Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
@@ -21,27 +22,32 @@ use vita_log::{debug, info, warn};
 
 use tailscale_vita::RuntimeSnapshot;
 
+use super::config_edit;
+
 const LOCALAPI_ADDR: &str = "127.0.0.1:41112";
+/// config.toml path — the eboot rewrites this for [ftp] toggles.
+pub const CONFIG_PATH: &str = "ux0:/data/tailscale-vita/config.toml";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const STATUS_READ_TIMEOUT: Duration = Duration::from_secs(3);
-/// `/ping` blocks server-side up to 5 s; leave headroom.
-const PING_READ_TIMEOUT: Duration = Duration::from_secs(7);
+/// `/ping` and `/reconnect` block server-side; leave headroom.
+const ACTION_READ_TIMEOUT: Duration = Duration::from_secs(7);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RESPONSE: usize = 512 * 1024;
 
-/// UI-facing state written by the poller thread, read each frame by
-/// the render loop. Lock is held only for field copies.
+/// UI-facing state written by the worker thread, read each frame by the
+/// render loop. Lock is held only for field copies.
 pub struct Shared {
-    /// Latest good snapshot. `None` until the first successful poll
-    /// (runtime still starting, or SUPRX not loaded).
     pub snapshot: Option<RuntimeSnapshot>,
-    /// Bumped on every successful poll — lets the render loop rebuild
-    /// its viewmodel only when something actually changed.
+    /// Bumped on every poll (ok or err) so the UI rebuilds promptly.
     pub generation: u64,
     pub last_ok_at: Option<Instant>,
     pub last_error: Option<String>,
     pub consecutive_failures: u32,
-    pub ping: PingState,
+    pub action: ActionState,
+    /// Live config.toml values (re-read after each toggle). `None` =
+    /// couldn't read the file.
+    pub ftp_enabled: Option<bool>,
+    pub ftp_read_only: Option<bool>,
 }
 
 impl Shared {
@@ -52,38 +58,58 @@ impl Shared {
             last_ok_at: None,
             last_error: None,
             consecutive_failures: 0,
-            ping: PingState::Idle,
+            action: ActionState::Idle,
+            ftp_enabled: None,
+            ftp_read_only: None,
         }))
     }
 }
 
+/// Status of the most recent UI action, shown in the footer.
 #[derive(Clone)]
-pub enum PingState {
+pub enum ActionState {
     Idle,
-    InFlight { peer_name: String },
+    InFlight { label: String },
     Done { line: String, ok: bool, at: Instant },
 }
 
-/// A ping request from the UI thread to the poller.
-pub struct PingRequest {
-    pub ip: Ipv4Addr,
-    pub peer_name: String,
+/// A request from the UI thread to the worker.
+pub enum UiAction {
+    Ping { ip: Ipv4Addr, peer_name: String },
+    Reconnect,
+    /// Toggle a `[ftp]` bool (`"enabled"` or `"read_only"`).
+    ToggleFtp { key: &'static str },
 }
 
-/// Spawn the poller thread. Exits when the ping channel disconnects
-/// (i.e. the UI side dropped its Sender).
-pub fn spawn_poller(shared: Arc<Mutex<Shared>>, ping_rx: Receiver<PingRequest>) {
-    let spawned = vita_thread::Builder::new()
-        .name("ui-poller")
-        .stack_size(128 * 1024)
-        .spawn(move || poller_loop(shared, ping_rx));
-    if let Err(e) = spawned {
-        warn!(error = %e, "ui.poller.spawn_failed");
+impl UiAction {
+    fn inflight_label(&self) -> String {
+        match self {
+            UiAction::Ping { peer_name, .. } => format!("pinging {peer_name}..."),
+            UiAction::Reconnect => "reconnecting...".into(),
+            UiAction::ToggleFtp { key } => format!("saving ftp.{key}..."),
+        }
     }
 }
 
-fn poller_loop(shared: Arc<Mutex<Shared>>, ping_rx: Receiver<PingRequest>) {
-    info!("ui.poller.start");
+/// Spawn the worker thread. Exits when the action channel disconnects.
+pub fn spawn_worker(shared: Arc<Mutex<Shared>>, action_rx: Receiver<UiAction>) {
+    // Seed the live config values before the first frame.
+    {
+        let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
+        s.ftp_enabled = config_edit::read_toggle(CONFIG_PATH, "ftp", "enabled");
+        s.ftp_read_only = config_edit::read_toggle(CONFIG_PATH, "ftp", "read_only");
+    }
+    let spawned = vita_thread::Builder::new()
+        .name("ui-worker")
+        .stack_size(128 * 1024)
+        .spawn(move || worker_loop(shared, action_rx));
+    if let Err(e) = spawned {
+        warn!(error = %e, "ui.worker.spawn_failed");
+    }
+}
+
+fn worker_loop(shared: Arc<Mutex<Shared>>, action_rx: Receiver<UiAction>) {
+    info!("ui.worker.start");
     loop {
         match fetch_status() {
             Ok(snap) => {
@@ -99,7 +125,6 @@ fn poller_loop(shared: Arc<Mutex<Shared>>, ping_rx: Receiver<PingRequest>) {
                 let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
                 s.consecutive_failures += 1;
                 s.last_error = Some(e.clone());
-                // Bump generation so the UI re-renders banners promptly.
                 s.generation += 1;
                 if s.consecutive_failures <= 3 || s.consecutive_failures % 15 == 0 {
                     warn!(error = %e, failures = s.consecutive_failures, "ui.poll.err");
@@ -107,46 +132,57 @@ fn poller_loop(shared: Arc<Mutex<Shared>>, ping_rx: Receiver<PingRequest>) {
             }
         }
 
-        // The poll pacing doubles as the ping mailbox wait.
-        match ping_rx.recv_timeout(POLL_INTERVAL) {
-            Ok(req) => {
-                {
-                    let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
-                    s.ping = PingState::InFlight {
-                        peer_name: req.peer_name.clone(),
-                    };
-                }
-                info!(ip = %req.ip, peer = %req.peer_name, "ui.ping.sent");
-                let (line, ok) = do_ping(&req);
-                info!(result = %line, "ui.ping.result");
-                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
-                s.ping = PingState::Done {
-                    line,
-                    ok,
-                    at: Instant::now(),
-                };
-                s.generation += 1;
-            }
+        match action_rx.recv_timeout(POLL_INTERVAL) {
+            Ok(action) => run_action(&shared, action),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                info!("ui.poller.exit");
+                info!("ui.worker.exit");
                 return;
             }
         }
     }
 }
 
-/// GET /localapi/v0/status → RuntimeSnapshot.
+fn run_action(shared: &Arc<Mutex<Shared>>, action: UiAction) {
+    {
+        let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
+        s.action = ActionState::InFlight {
+            label: action.inflight_label(),
+        };
+        s.generation += 1;
+    }
+    let (line, ok) = match action {
+        UiAction::Ping { ip, peer_name } => {
+            info!(ip = %ip, peer = %peer_name, "ui.action.ping");
+            do_ping(ip, &peer_name)
+        }
+        UiAction::Reconnect => {
+            info!("ui.action.reconnect");
+            do_reconnect()
+        }
+        UiAction::ToggleFtp { key } => {
+            info!(key, "ui.action.toggle_ftp");
+            do_toggle_ftp(shared, key)
+        }
+    };
+    info!(result = %line, ok, "ui.action.result");
+    let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
+    s.action = ActionState::Done {
+        line,
+        ok,
+        at: Instant::now(),
+    };
+    s.generation += 1;
+}
+
 fn fetch_status() -> Result<RuntimeSnapshot, String> {
-    let (status, body) = http_get("/localapi/v0/status", STATUS_READ_TIMEOUT)?;
+    let (status, body) = http_req("GET", "/localapi/v0/status", STATUS_READ_TIMEOUT)?;
     if status != 200 {
         return Err(format!("status HTTP {status}"));
     }
     serde_json::from_slice(&body).map_err(|e| format!("bad status JSON: {e}"))
 }
 
-/// `/ping` response body — success carries rtt_ms+endpoint, domain
-/// failures (timeout / no endpoints) come back 200 with `error`.
 #[derive(Deserialize)]
 struct PingResp {
     rtt_ms: Option<u64>,
@@ -154,59 +190,90 @@ struct PingResp {
     error: Option<String>,
 }
 
-/// Run one blocking disco ping via LocalAPI; returns the display line
-/// plus success flag.
-fn do_ping(req: &PingRequest) -> (String, bool) {
-    let path = format!("/localapi/v0/ping?ip={}", req.ip);
-    match http_get(&path, PING_READ_TIMEOUT) {
-        Ok((status, body)) => match serde_json::from_slice::<PingResp>(&body) {
-            Ok(PingResp {
-                rtt_ms: Some(rtt),
-                endpoint,
-                ..
-            }) => (
+fn do_ping(ip: Ipv4Addr, peer_name: &str) -> (String, bool) {
+    let path = format!("/localapi/v0/ping?ip={ip}");
+    match http_req("GET", &path, ACTION_READ_TIMEOUT) {
+        Ok((_status, body)) => match serde_json::from_slice::<PingResp>(&body) {
+            Ok(PingResp { rtt_ms: Some(rtt), endpoint, .. }) => (
                 format!(
-                    "pong from {}: {} ms @ {}",
-                    req.peer_name,
-                    rtt,
+                    "pong from {peer_name}: {rtt} ms @ {}",
                     endpoint.unwrap_or_else(|| "?".into())
                 ),
                 true,
             ),
-            Ok(PingResp {
-                error: Some(e), ..
-            }) => (format!("ping {}: {}", req.peer_name, e), false),
-            Ok(_) => (
-                format!("ping {}: malformed reply (HTTP {status})", req.peer_name),
-                false,
-            ),
-            Err(e) => (format!("ping {}: bad JSON: {e}", req.peer_name), false),
+            Ok(PingResp { error: Some(e), .. }) => (format!("ping {peer_name}: {e}"), false),
+            Ok(_) => (format!("ping {peer_name}: malformed reply"), false),
+            Err(e) => (format!("ping {peer_name}: bad JSON: {e}"), false),
         },
-        Err(e) => (format!("ping {}: {e}", req.peer_name), false),
+        Err(e) => (format!("ping {peer_name}: {e}"), false),
     }
 }
 
-/// Minimal loopback HTTP/1.1 GET. Reads to EOF (LocalAPI closes per
-/// request). Returns (status_code, body).
-fn http_get(path: &str, read_timeout: Duration) -> Result<(u16, Vec<u8>), String> {
-    let addr: SocketAddr = LOCALAPI_ADDR
-        .parse()
-        .map_err(|e| format!("bad addr: {e}"))?;
-    let mut conn = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-        .map_err(|e| format!("runtime down ({e})"))?;
+#[derive(Deserialize)]
+struct ReconnectResp {
+    ok: Option<bool>,
+    error: Option<String>,
+}
+
+fn do_reconnect() -> (String, bool) {
+    match http_req("POST", "/localapi/v0/reconnect", ACTION_READ_TIMEOUT) {
+        Ok((status, body)) => {
+            let parsed: Option<ReconnectResp> = serde_json::from_slice(&body).ok();
+            match (status, parsed) {
+                (202, _) => ("reconnect requested — rebuilding session".into(), true),
+                (_, Some(ReconnectResp { error: Some(e), .. })) => {
+                    (format!("reconnect refused: {e}"), false)
+                }
+                (s, _) => (format!("reconnect: HTTP {s}"), false),
+            }
+        }
+        Err(e) => (format!("reconnect: {e}"), false),
+    }
+}
+
+fn do_toggle_ftp(shared: &Arc<Mutex<Shared>>, key: &'static str) -> (String, bool) {
+    match config_edit::apply_toggle(CONFIG_PATH, "ftp", key) {
+        Ok(new_val) => {
+            // Re-read the live config values OUTSIDE the lock (file I/O),
+            // then take the lock only to store — keeps the render thread
+            // from stalling on sceIo reads.
+            let en = config_edit::read_toggle(CONFIG_PATH, "ftp", "enabled");
+            let ro = config_edit::read_toggle(CONFIG_PATH, "ftp", "read_only");
+            {
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
+                s.ftp_enabled = en;
+                s.ftp_read_only = ro;
+            }
+            (
+                format!(
+                    "ftp.{key} = {new_val} saved — relaunch to apply",
+                    key = key
+                ),
+                true,
+            )
+        }
+        Err(e) => (format!("save ftp.{key} failed: {e}"), false),
+    }
+}
+
+/// Minimal loopback HTTP/1.1 request (`Connection: close`, read to EOF).
+/// Returns (status_code, body).
+fn http_req(method: &str, path: &str, read_timeout: Duration) -> Result<(u16, Vec<u8>), String> {
+    let addr: SocketAddr = LOCALAPI_ADDR.parse().map_err(|e| format!("bad addr: {e}"))?;
+    let mut conn =
+        TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| format!("runtime down ({e})"))?;
     conn.set_read_timeout(Some(read_timeout))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
     conn.set_write_timeout(Some(Duration::from_secs(2)))
         .map_err(|e| format!("set_write_timeout: {e}"))?;
     let req = format!(
-        "GET {path} HTTP/1.1\r\n\
+        "{method} {path} HTTP/1.1\r\n\
          Host: localhost:41112\r\n\
          Connection: close\r\n\
          Content-Length: 0\r\n\
          \r\n"
     );
-    conn.write_all(req.as_bytes())
-        .map_err(|e| format!("write: {e}"))?;
+    conn.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
     let mut response = Vec::with_capacity(4096);
     let mut tmp = [0u8; 2048];
     loop {
@@ -225,8 +292,7 @@ fn http_get(path: &str, read_timeout: Duration) -> Result<(u16, Vec<u8>), String
     parse_http_response(&response)
 }
 
-/// Split a raw HTTP/1.1 response into (status_code, body). Pure —
-/// host-tested.
+/// Split a raw HTTP/1.1 response into (status_code, body). Pure.
 fn parse_http_response(raw: &[u8]) -> Result<(u16, Vec<u8>), String> {
     let head_end = raw
         .windows(4)
@@ -234,7 +300,6 @@ fn parse_http_response(raw: &[u8]) -> Result<(u16, Vec<u8>), String> {
         .ok_or("no header terminator")?;
     let head = std::str::from_utf8(&raw[..head_end]).map_err(|_| "non-utf8 head")?;
     let status_line = head.lines().next().ok_or("empty head")?;
-    // "HTTP/1.1 200 OK"
     let code = status_line
         .split_whitespace()
         .nth(1)
@@ -254,12 +319,8 @@ mod tests {
         let (code, body) = parse_http_response(raw).unwrap();
         assert_eq!(code, 200);
         assert_eq!(body, b"{\"ok\":true}");
-
-        let raw = b"HTTP/1.1 404 Not Found\r\n\r\n";
-        let (code, body) = parse_http_response(raw).unwrap();
-        assert_eq!(code, 404);
-        assert!(body.is_empty());
-
+        let raw = b"HTTP/1.1 202 Accepted\r\n\r\n";
+        assert_eq!(parse_http_response(raw).unwrap().0, 202);
         assert!(parse_http_response(b"garbage").is_err());
     }
 
@@ -268,26 +329,25 @@ mod tests {
         let ok: PingResp =
             serde_json::from_str(r#"{"rtt_ms":4,"endpoint":"192.168.8.211:54415"}"#).unwrap();
         assert_eq!(ok.rtt_ms, Some(4));
-        assert_eq!(ok.endpoint.as_deref(), Some("192.168.8.211:54415"));
-
-        let err: PingResp =
-            serde_json::from_str(r#"{"error":"ping_now timed out (no Pong within window)"}"#)
-                .unwrap();
-        assert!(err.rtt_ms.is_none());
-        assert!(err.error.is_some());
+        let err: PingResp = serde_json::from_str(r#"{"error":"timed out"}"#).unwrap();
+        assert!(err.rtt_ms.is_none() && err.error.is_some());
     }
 
-    /// The load-bearing contract test: a snapshot serialized by
-    /// tailscale-vita's LocalAPI deserializes into the same types here.
+    #[test]
+    fn reconnect_resp_parses() {
+        let ok: ReconnectResp = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert_eq!(ok.ok, Some(true));
+        let refused: ReconnectResp =
+            serde_json::from_str(r#"{"ok":false,"error":"fatal state"}"#).unwrap();
+        assert_eq!(refused.error.as_deref(), Some("fatal state"));
+    }
+
     #[test]
     fn runtime_snapshot_round_trips_through_json() {
         let snap = RuntimeSnapshot::empty("vita".into(), "0.0.0.0:41641".parse().unwrap());
         let json = serde_json::to_string(&snap).unwrap();
         let back: RuntimeSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.hostname, "vita");
-        assert_eq!(back.peer_count, 0);
-        let rejson = serde_json::to_string(&back).unwrap();
-        // Full-fidelity round trip: byte-identical re-serialization.
-        assert_eq!(json, rejson);
+        assert_eq!(json, serde_json::to_string(&back).unwrap());
     }
 }

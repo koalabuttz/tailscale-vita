@@ -71,3 +71,44 @@ extern "C" {
     pub fn sceCtrlPeekBufferPositive(port: c_int, pad_data: *mut SceCtrlData, count: c_int)
         -> c_int;
 }
+
+// ── Front touchscreen (psp2/touch.h) ──
+// Front-panel logical resolution is 1920×1088 = exactly 2× the 960×544
+// screen, so touch→screen is a flat divide-by-2 (see `TOUCH_SCALE`).
+
+pub const SCE_TOUCH_PORT_FRONT: u32 = 0;
+pub const SCE_TOUCH_SAMPLING_STATE_START: c_int = 1;
+pub const SCE_TOUCH_MAX_REPORT: usize = 8;
+/// Front-panel coord → screen pixel divisor.
+pub const TOUCH_SCALE: f32 = 2.0;
+
+/// psp2/touch.h `SceTouchReport` — 0x10 bytes (header asserts it).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SceTouchReport {
+    pub id: u8,
+    pub force: u8,
+    pub x: i16,
+    pub y: i16,
+    pub reserved: [u8; 8],
+    pub info: u16,
+}
+
+/// psp2/touch.h `SceTouchData` — 0x90 bytes (header asserts it).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SceTouchData {
+    pub time_stamp: u64,
+    pub status: u32,
+    pub report_num: u32,
+    pub report: [SceTouchReport; SCE_TOUCH_MAX_REPORT],
+}
+
+const _: () = assert!(std::mem::size_of::<SceTouchReport>() == 0x10);
+const _: () = assert!(std::mem::size_of::<SceTouchData>() == 0x90);
+
+extern "C" {
+    /// `port` is SceUInt32; `state` is a C enum (int width).
+    pub fn sceTouchSetSamplingState(port: c_uint, state: c_int) -> c_int;
+    pub fn sceTouchPeek(port: c_uint, data: *mut SceTouchData, n_bufs: c_uint) -> c_int;
+}

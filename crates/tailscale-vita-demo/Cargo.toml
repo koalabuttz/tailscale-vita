@@ -15,6 +15,7 @@ tailscale-vita = { path = "../tailscale-vita" }
 # Public crate types we touch directly.
 vita-chan         = { path = "../vita-chan" }
 vita-thread       = { path = "../vita-thread" }
+vita-fs           = { path = "../vita-fs" }
 
 # M17-A: the dashboard deserializes LocalAPI JSON into the exact
 # snapshot types tailscale-vita serializes.
