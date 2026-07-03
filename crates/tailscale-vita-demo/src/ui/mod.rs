@@ -16,6 +16,7 @@
 mod buttons;
 mod client;
 mod config_edit;
+mod qr;
 mod timefmt;
 mod viewmodel;
 

@@ -7,6 +7,7 @@ use std::ffi::CString;
 use vita_log::{info, warn};
 
 use super::ffi;
+use super::qr;
 use super::viewmodel::{DashVm, Tab, Tone};
 
 const fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
@@ -25,6 +26,10 @@ const GOOD: u32 = rgba(96, 220, 130, 255);
 const WARN: u32 = rgba(240, 200, 90, 255);
 const BAD: u32 = rgba(238, 100, 100, 255);
 const DIM: u32 = rgba(120, 126, 140, 255);
+/// QR colors — a light backing (so the code still scans under the dark
+/// app theme) with black modules drawn on top.
+const QR_LIGHT: u32 = rgba(255, 255, 255, 255);
+const QR_DARK: u32 = rgba(0, 0, 0, 255);
 
 pub const SCREEN_W: f32 = 960.0;
 pub const SCREEN_H: f32 = 544.0;
@@ -50,6 +55,14 @@ pub fn tab_cell_w() -> f32 {
 // Settings rows.
 const SET_TOP: i32 = 232;
 const SET_ROW_H: i32 = 44;
+
+// M18 interactive-login (NeedsLogin) full-screen view geometry.
+const LOGIN_TITLE_Y: i32 = 36;
+const LOGIN_SUB_Y: i32 = 64;
+const LOGIN_QR_TOP: i32 = 82;
+/// The QR (incl. its quiet zone) is scaled to end by here, leaving a
+/// strip below for the wrapped AuthURL text + the "waiting" line.
+const LOGIN_QR_MAX_BOTTOM: i32 = 452;
 
 fn tone_color(t: Tone) -> u32 {
     match t {
@@ -139,6 +152,11 @@ impl Renderer {
     fn text_right(&self, right_x: i32, y: i32, color: u32, scale: f32, s: &str) {
         let w = self.text_w(scale, s);
         self.text(right_x - w, y, color, scale, s);
+    }
+    /// Draw `s` horizontally centered on the 960-wide screen at `y`.
+    fn text_center(&self, y: i32, color: u32, scale: f32, s: &str) {
+        let w = self.text_w(scale, s);
+        self.text(((SCREEN_W as i32) - w) / 2, y, color, scale, s);
     }
 
     /// Header card: node line + lifecycle + a sub line + tab bar.
@@ -358,5 +376,82 @@ impl Renderer {
         self.text(MARGIN, 220, tone_color(tone), 1.2, headline);
         self.text(MARGIN, 270, DIM, 0.9, detail);
         self.end();
+    }
+
+    /// M18 full-screen interactive-login view (drawn when the snapshot's
+    /// lifecycle is `NeedsLogin`): the control-plane AuthURL as a big
+    /// centered QR plus the URL as wrapped text. `auth_url` is `None`
+    /// while registration is still starting (no URL published yet).
+    pub fn login_frame(&self, auth_url: Option<&str>) {
+        self.begin();
+        self.text_center(LOGIN_TITLE_Y, TITLE, 1.2, "Log in to your tailnet");
+        self.text_center(
+            LOGIN_SUB_Y,
+            DIM,
+            0.85,
+            "Scan this QR with the Tailscale app / your phone",
+        );
+        match auth_url {
+            // In NeedsLogin but the SUPRX hasn't published an AuthURL yet.
+            None => {
+                self.text_center(280, WARN, 1.0, "starting login...");
+            }
+            Some(url) => {
+                // The QR is the hands-free path (Tailscale / OIDC scan);
+                // the URL text below it is the fallback for non-OIDC
+                // Headscale where the page needs a CLI step. Guard for
+                // encode failure (URL too long for any version) by showing
+                // just the text.
+                let mut y = match qr::encode(url) {
+                    Some(code) => self.draw_qr(&code, LOGIN_QR_TOP) + 24,
+                    None => LOGIN_QR_TOP + 40,
+                };
+                let max_w = (SCREEN_W as i32) - 2 * MARGIN;
+                for line in self.wrap(url, 0.8, max_w) {
+                    // Stop before the bottom so the "waiting" line stays on
+                    // screen even for a long (multi-line) Headscale URL.
+                    if y > (SCREEN_H as i32) - 48 {
+                        break;
+                    }
+                    self.text_center(y, TEXT, 0.8, &line);
+                    y += 24;
+                }
+                let wy = (y + 8).min((SCREEN_H as i32) - 16);
+                self.text_center(wy, WARN, 0.9, "waiting for approval...");
+            }
+        }
+        self.end();
+    }
+
+    /// Draw a QR matrix centered horizontally with a 4-module light
+    /// quiet-zone border (a backing rect so it scans under the dark
+    /// theme), scaled to fit the band below `top`. Returns the screen-y
+    /// just below the code so the caller can place text under it.
+    fn draw_qr(&self, code: &qr::Qr, top: i32) -> i32 {
+        const QUIET: i32 = 4;
+        let total = code.size as i32 + 2 * QUIET; // modules incl. quiet zone
+        // Aim for ~10-12 px/module, shrinking to fit a taller (longer-URL,
+        // higher-version) code into the available vertical band.
+        let module = ((LOGIN_QR_MAX_BOTTOM - top) / total).clamp(3, 12);
+        let side = total * module;
+        let x0 = ((SCREEN_W as i32) - side) / 2;
+        // Light quiet-zone backing behind the whole code.
+        self.rect(x0 as f32, top as f32, side as f32, side as f32, QR_LIGHT);
+        let org_x = x0 + QUIET * module;
+        let org_y = top + QUIET * module;
+        for my in 0..code.size {
+            for mx in 0..code.size {
+                if code.dark[my * code.size + mx] {
+                    self.rect(
+                        (org_x + mx as i32 * module) as f32,
+                        (org_y + my as i32 * module) as f32,
+                        module as f32,
+                        module as f32,
+                        QR_DARK,
+                    );
+                }
+            }
+        }
+        top + side
     }
 }

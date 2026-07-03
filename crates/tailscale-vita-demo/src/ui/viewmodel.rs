@@ -48,18 +48,26 @@ impl Tab {
     }
 }
 
-/// A row in the Settings tab. `Reconnect` is a live action; the two ftp
-/// rows are config toggles (rewrite config.toml, relaunch to apply).
+/// A row in the Settings tab. `Reconnect`/`Relogin` are live actions;
+/// the two ftp rows are config toggles (rewrite config.toml, relaunch to
+/// apply). `Relogin` (M18) re-runs the control session to re-enter the
+/// interactive-login flow after a `NodeKeyExpired` — it shares the
+/// `/reconnect` trigger for now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingRow {
     FtpEnabled,
     FtpReadOnly,
     Reconnect,
+    Relogin,
 }
 
 impl SettingRow {
-    pub const ALL: [SettingRow; 3] =
-        [SettingRow::FtpEnabled, SettingRow::FtpReadOnly, SettingRow::Reconnect];
+    pub const ALL: [SettingRow; 4] = [
+        SettingRow::FtpEnabled,
+        SettingRow::FtpReadOnly,
+        SettingRow::Reconnect,
+        SettingRow::Relogin,
+    ];
 
     /// Display label + right-hand value string for the current state.
     /// `ftp_enabled`/`ftp_read_only` are the live config.toml values
@@ -85,6 +93,9 @@ impl SettingRow {
             }
             SettingRow::Reconnect => {
                 ("Reconnect to control".into(), "press X".into(), Tone::Normal)
+            }
+            SettingRow::Relogin => {
+                ("Re-login (expired key)".into(), "press X".into(), Tone::Warn)
             }
         }
     }
@@ -387,7 +398,10 @@ pub fn fmt_duration_secs(secs: u64) -> String {
 fn lifecycle_display(l: OnlineState) -> (String, Tone) {
     let tone = match l {
         OnlineState::Online => Tone::Good,
-        OnlineState::Connecting | OnlineState::Degraded => Tone::Warn,
+        // M18: NeedsLogin is an actionable wait-state (scan the QR), not
+        // an error — surface it as a warning tone. The full-screen Login
+        // view is rendered separately (S5).
+        OnlineState::Connecting | OnlineState::Degraded | OnlineState::NeedsLogin => Tone::Warn,
         OnlineState::Offline | OnlineState::AuthFailed | OnlineState::SecurityFailed => Tone::Bad,
     };
     (format!("{l:?}"), tone)
@@ -544,6 +558,10 @@ mod tests {
         assert_eq!(t, Tone::Warn);
         let (l, _, _) = SettingRow::Reconnect.render(None, None);
         assert_eq!(l, "Reconnect to control");
+        let (l, v, t) = SettingRow::Relogin.render(None, None);
+        assert_eq!(l, "Re-login (expired key)");
+        assert_eq!(v, "press X");
+        assert_eq!(t, Tone::Warn);
     }
 
     #[test]

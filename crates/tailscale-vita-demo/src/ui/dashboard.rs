@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use vita_chan::bounded;
 use vita_log::info;
 
+use tailscale_vita::OnlineState;
+
 use super::client::{self, ActionState, Shared, UiAction};
 use super::render::{self, Renderer, VIEWPORT_ROWS};
 use super::viewmodel::{self, DashVm, SettingRow, Tab, Tone};
@@ -217,7 +219,9 @@ pub fn run(exit: &AtomicBool) {
                             SettingRow::FtpReadOnly => {
                                 send(UiAction::ToggleFtp { key: "read_only" })
                             }
-                            SettingRow::Reconnect => send(UiAction::Reconnect),
+                            SettingRow::Reconnect | SettingRow::Relogin => {
+                                send(UiAction::Reconnect)
+                            }
                         }
                     }
                 }
@@ -234,77 +238,80 @@ pub fn run(exit: &AtomicBool) {
 
         // ── Draw ──
         let now_u = now_unix();
-        match (&vm, &snapshot) {
-            (Some(vm), Some(snap)) => {
-                renderer.begin();
-                renderer.header(vm, tab);
-                let action_line = action_footer(&action);
-                match tab {
-                    Tab::Peers => {
-                        let window =
-                            viewmodel::scroll_window(vm.rows.len(), peers_selected, VIEWPORT_ROWS);
-                        let banner = (failures >= 3)
-                            .then_some("runtime not responding - data is stale");
-                        renderer.peers_body(vm, peers_selected, window, banner);
-                    }
-                    Tab::Settings => {
-                        let acl = viewmodel::acl_line(snap);
-                        let kx = viewmodel::key_expiry_line(snap, now_u);
-                        let rows: Vec<(String, String, Tone)> = SettingRow::ALL
+        // M18: while the runtime is in NeedsLogin the eboot can't register
+        // — it renders the AuthURL the SUPRX published into the snapshot as
+        // a full-screen QR-login view instead of the tabbed dashboard.
+        if matches!(&snapshot, Some(s) if s.lifecycle == OnlineState::NeedsLogin) {
+            let auth_url = snapshot.as_ref().and_then(|s| s.auth_url.as_deref());
+            renderer.login_frame(auth_url);
+        } else if let (Some(vm), Some(snap)) = (&vm, &snapshot) {
+            renderer.begin();
+            renderer.header(vm, tab);
+            let action_line = action_footer(&action);
+            match tab {
+                Tab::Peers => {
+                    let window =
+                        viewmodel::scroll_window(vm.rows.len(), peers_selected, VIEWPORT_ROWS);
+                    let banner = (failures >= 3)
+                        .then_some("runtime not responding - data is stale");
+                    renderer.peers_body(vm, peers_selected, window, banner);
+                }
+                Tab::Settings => {
+                    let acl = viewmodel::acl_line(snap);
+                    let kx = viewmodel::key_expiry_line(snap, now_u);
+                    let rows: Vec<(String, String, Tone)> = SettingRow::ALL
+                        .iter()
+                        .map(|r| r.render(ftp_en, ftp_ro))
+                        .collect();
+                    renderer.settings_body(
+                        (&acl.0, acl.1),
+                        (&kx.0, kx.1),
+                        &rows,
+                        settings_selected,
+                    );
+                }
+                Tab::Debug => {
+                    let rows = viewmodel::build_debug_rows(snap, now_u, env!("BUILD_TIMESTAMP"));
+                    let max = rows.len().saturating_sub(1);
+                    debug_scroll = debug_scroll.min(max);
+                    renderer.debug_body(&rows, debug_scroll);
+                }
+            }
+            let legend = match tab {
+                Tab::Peers => "L/R tab  UP/DN select  X ping  O detail",
+                Tab::Settings => "L/R tab  UP/DN select  X activate",
+                Tab::Debug => "L/R tab  UP/DN scroll",
+            };
+            renderer.footer(
+                action_line.as_ref().map(|(l, t)| (l.as_str(), *t)),
+                (&vm.staleness, vm.staleness_tone),
+                legend,
+            );
+            // Peer-detail overlay (any tab).
+            if let Some(key) = &detail_key {
+                match viewmodel::peer_detail_lines(snap, key, now_u) {
+                    Some(lines) => {
+                        let title = lines
                             .iter()
-                            .map(|r| r.render(ftp_en, ftp_ro))
-                            .collect();
-                        renderer.settings_body(
-                            (&acl.0, acl.1),
-                            (&kx.0, kx.1),
-                            &rows,
-                            settings_selected,
-                        );
+                            .find(|(l, _)| l == "name")
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_else(|| "peer".into());
+                        renderer.detail_overlay(&title, &lines);
                     }
-                    Tab::Debug => {
-                        let rows = viewmodel::build_debug_rows(snap, now_u, env!("BUILD_TIMESTAMP"));
-                        let max = rows.len().saturating_sub(1);
-                        debug_scroll = debug_scroll.min(max);
-                        renderer.debug_body(&rows, debug_scroll);
-                    }
+                    None => detail_key = None, // peer vanished
                 }
-                let legend = match tab {
-                    Tab::Peers => "L/R tab  UP/DN select  X ping  O detail",
-                    Tab::Settings => "L/R tab  UP/DN select  X activate",
-                    Tab::Debug => "L/R tab  UP/DN scroll",
-                };
-                renderer.footer(
-                    action_line.as_ref().map(|(l, t)| (l.as_str(), *t)),
-                    (&vm.staleness, vm.staleness_tone),
-                    legend,
-                );
-                // Peer-detail overlay (any tab).
-                if let Some(key) = &detail_key {
-                    match viewmodel::peer_detail_lines(snap, key, now_u) {
-                        Some(lines) => {
-                            let title = lines
-                                .iter()
-                                .find(|(l, _)| l == "name")
-                                .map(|(_, v)| v.clone())
-                                .unwrap_or_else(|| "peer".into());
-                            renderer.detail_overlay(&title, &lines);
-                        }
-                        None => detail_key = None, // peer vanished
-                    }
-                }
-                renderer.end();
             }
-            _ => {
-                let (headline, tone) = if last_ok.is_some() {
-                    ("connecting to tailnet...", Tone::Warn)
-                } else if started.elapsed() > RUNTIME_HINT_AFTER {
-                    ("runtime not detected - is the SUPRX in ur0:tai/config.txt?", Tone::Bad)
-                } else {
-                    ("waiting for runtime (SUPRX)...", Tone::Warn)
-                };
-                let detail = last_error.unwrap_or_else(|| "starting".into());
-                renderer.banner_frame(headline, &detail, tone);
-            }
+            renderer.end();
+        } else {
+            let (headline, tone) = if last_ok.is_some() {
+                ("connecting to tailnet...", Tone::Warn)
+            } else if started.elapsed() > RUNTIME_HINT_AFTER {
+                ("runtime not detected - is the SUPRX in ur0:tai/config.txt?", Tone::Bad)
+            } else {
+                ("waiting for runtime (SUPRX)...", Tone::Warn)
+            };
+            let detail = last_error.unwrap_or_else(|| "starting".into());
+            renderer.banner_frame(headline, &detail, tone);
         }
 
         if !first_frame_logged {

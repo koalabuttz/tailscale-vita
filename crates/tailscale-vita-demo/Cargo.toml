@@ -22,6 +22,10 @@ vita-fs           = { path = "../vita-fs" }
 serde             = { workspace = true }
 serde_json        = { workspace = true }
 
+# M18: QR-encode the interactive-login AuthURL (ui/qr.rs). Zero-dep,
+# std-only, forbid(unsafe) — cross-compiles cleanly under -Z build-std.
+qrcodegen         = "1.8"
+
 [package.metadata.vita]
 title_id   = "TVIT00010"
 title_name = "Tailscale-Vita Demo"
