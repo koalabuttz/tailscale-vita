@@ -2159,6 +2159,23 @@ fn interactive_login(
     // bug shipped: `register(...)?` on a dead reused conn killed Runtime::up).
     let key_supplied = !auth_key.is_empty();
 
+    // M19: on the interactive (QR) path, enter NeedsLogin BEFORE the first
+    // publish. `publish_login_state` only *reads* the tracker (it doesn't
+    // set the state), and the tracker still holds its `new()` default of
+    // `Connecting` here — so without this the snapshot would advertise
+    // `Connecting` + login_in_progress for the whole TLS/Noise/h2/register
+    // handshake (a couple seconds) before the AuthURL arrives. The eboot
+    // gates its full-screen login view on `lifecycle == NeedsLogin`, so a
+    // `Connecting` window makes it flash the normal tabbed dashboard (with
+    // stale pre-logout data) until the URL lands (hardware 2026-07-03).
+    // Setting NeedsLogin up front means the "starting login..." spinner
+    // shows immediately, then flips to the QR. Skipped for a supplied
+    // auth_key (that path authorizes in one shot and never shows a QR, so a
+    // NeedsLogin blip would be a spurious flash the other way). Idempotent +
+    // non-sticky: the authorized/abort arms below clear it unconditionally.
+    if !key_supplied {
+        lifecycle.lock().set_needs_login();
+    }
     // M19: signal "login in progress" so the dashboard can show a spinner
     // before the AuthURL (and its QR) arrives. Cleared on authorize /
     // abort below.
@@ -2237,11 +2254,13 @@ fn interactive_login(
         if outcome.machine_authorized {
             // Leave the NeedsLogin wait-state so the dashboard flips off
             // the QR screen immediately, before the event loop's first
-            // snapshot publish. Always clear the in-progress marker set at
-            // loop start (M19), whether or not we ever went pending.
-            if published_needs_login {
-                lifecycle.lock().clear_needs_login();
-            }
+            // snapshot publish. Clear unconditionally: the interactive path
+            // now sets NeedsLogin up front (before `published_needs_login`
+            // could be set), so guarding on that flag would strand the
+            // tracker in NeedsLogin when a re-login authorizes on its first
+            // attempt without ever going pending. clear_needs_login is a
+            // no-op when not in NeedsLogin, so the supplied-key path is fine.
+            lifecycle.lock().clear_needs_login();
             publish_login_state(snapshot, lifecycle, None, false);
             suprx_trace(&format!("login: AUTHORIZED on attempt {attempt}"));
             info!(attempt, "control.login.authorized");
