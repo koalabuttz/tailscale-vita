@@ -53,7 +53,7 @@ pub use netmap::{AllowedIp, NetMap, NetMapDelta, PeerSnapshot, RekeyedPeer};
 pub use noise::{NoiseHandshaker, NoiseTransport};
 pub use persist::{atomic_write, pin_or_load_server_key};
 pub use record::NoiseStream;
-pub use register::{register, RegistrationOutcome};
+pub use register::{logout, register, RegistrationOutcome};
 pub use server_key::{
     fetch_server_key, fetch_server_key_cached, invalidate_server_key_cache,
     SERVER_KEY_CACHE_TTL,

@@ -50,38 +50,20 @@ pub fn register(
     host_authority: &str,
     followup: Option<&str>,
 ) -> Result<RegistrationOutcome, ControlError> {
-    let req = RegisterRequestWire {
-        version: REGISTER_VERSION,
-        node_key: node_pub.to_nodekey_string(),
-        nl_key: nl_pub.to_nlkey_string(),
+    let req = build_request(
         // Empty auth key => omit the whole Auth struct: that is the trigger
         // for the server's interactive (QR) login flow.
-        auth: auth_field(auth_key),
+        auth_field(auth_key),
+        node_pub,
+        nl_pub,
+        backend_log_id,
+        hostname,
         // Present only during the interactive wait-loop: re-POSTing with
         // Followup=<AuthURL> makes the server long-poll until approval.
-        followup: followup.map(str::to_string),
-        hostinfo: HostinfoWire {
-            hostname: hostname.to_string(),
-            app: APP_NAME.to_string(),
-            ipn_version: IPN_VERSION.to_string(),
-            // OS / OSVersion deliberately NOT sent. Setting OS="linux"
-            // (or apparently any value) on RegisterRequest empirically
-            // breaks the DiscoKey-commit path on real Tailscale's coord
-            // server (M14M Phase 11 bisection: register body without OS
-            // → DiscoKey commits, with OS → DiscoKey stays zero).
-            // Suspected cause: Tailscale's enum routes Linux clients
-            // through stricter Go-client validation that we don't
-            // satisfy. Leaving the fields empty puts us in the
-            // "unspecified-OS" path that does commit DiscoKey.
-            os: String::new(),
-            os_version: String::new(),
-            backend_log_id: backend_log_id.to_string(),
-        },
-        timestamp: time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .map_err(|e| ControlError::Transport(format!("rfc3339 format: {e}")))?,
-        ephemeral: true,
-    };
+        followup,
+        // Registration never sets Expiry — that is logout's job.
+        None,
+    )?;
 
     let body = serde_json::to_vec(&req)?;
     let lb = node_pub.to_nodekey_string();
@@ -112,6 +94,117 @@ pub fn register(
     // supplied: a non-empty AuthURL is a hard rejection when it was, but the
     // expected interactive-login prompt when it was not.
     interpret_register_response(parsed, !auth_key.is_empty())
+}
+
+/// Log out: expire the current node key at control. This is a
+/// `RegisterRequest` with `Expiry` = now and `NodeKey` = the **current**
+/// node key (no separate RPC) — "if expiry is in the past and node_key is
+/// the current node key for this node, the node key is expired immediately"
+/// (upstream). The node then shows *expired* in the admin console; it is
+/// deleted only if it were ephemeral, which M19 turned off. No `Auth`, no
+/// `Followup`. Success = the server returned no `Error`; a
+/// `NodeKeyExpired=true` reply **is** the confirmation, not a failure.
+///
+/// The KeyStore is deliberately left untouched: the node key is regenerated
+/// at the *next* login, never here (control must still be able to match the
+/// current key to expire it).
+pub fn logout(
+    conn: &mut Http2Conn,
+    node_pub: &NodePublic,
+    nl_pub: &NLPublic,
+    backend_log_id: &str,
+    hostname: &str,
+    host_authority: &str,
+) -> Result<(), ControlError> {
+    let req = build_request(
+        // No Auth and no Followup on a logout.
+        None,
+        node_pub,
+        nl_pub,
+        backend_log_id,
+        hostname,
+        None,
+        // Expiry=now on the current node key = the logout signal.
+        Some(now_rfc3339()?),
+    )?;
+
+    let body = serde_json::to_vec(&req)?;
+    let lb = node_pub.to_nodekey_string();
+    info!(node_key = %lb, hostname, body_len = body.len(), "control.logout.sent");
+
+    let resp = conn.request(
+        Method::POST,
+        "/machine/register",
+        &body,
+        &[
+            ("content-type", "application/json"),
+            ("ts-lb", &lb),
+        ],
+        host_authority,
+    )?;
+
+    if resp.status != 200 {
+        let body_str = String::from_utf8_lossy(&resp.body).into_owned();
+        warn!(status = resp.status, body = %body_str, "control.logout.fail.http");
+        return Err(ControlError::Http {
+            status: resp.status,
+            body: body_str,
+        });
+    }
+
+    let parsed: RegisterResponseWire = serde_json::from_slice(&resp.body)?;
+    interpret_logout_response(parsed)
+}
+
+/// Build the `RegisterRequestWire` body shared by `register()` and
+/// `logout()`. Both POST to `/machine/register` and differ only in
+/// `auth` / `followup` / `expiry`. `Ephemeral` is `false` for every
+/// registration (M19): a persistent tailnet node that logout *expires*
+/// (not deletes) at control.
+fn build_request(
+    auth: Option<RegisterAuthWire>,
+    node_pub: &NodePublic,
+    nl_pub: &NLPublic,
+    backend_log_id: &str,
+    hostname: &str,
+    followup: Option<&str>,
+    expiry: Option<String>,
+) -> Result<RegisterRequestWire, ControlError> {
+    Ok(RegisterRequestWire {
+        version: REGISTER_VERSION,
+        node_key: node_pub.to_nodekey_string(),
+        nl_key: nl_pub.to_nlkey_string(),
+        auth,
+        followup: followup.map(str::to_string),
+        hostinfo: HostinfoWire {
+            hostname: hostname.to_string(),
+            app: APP_NAME.to_string(),
+            ipn_version: IPN_VERSION.to_string(),
+            // OS / OSVersion deliberately NOT sent. Setting OS="linux"
+            // (or apparently any value) on RegisterRequest empirically
+            // breaks the DiscoKey-commit path on real Tailscale's coord
+            // server (M14M Phase 11 bisection: register body without OS
+            // → DiscoKey commits, with OS → DiscoKey stays zero).
+            // Suspected cause: Tailscale's enum routes Linux clients
+            // through stricter Go-client validation that we don't
+            // satisfy. Leaving the fields empty puts us in the
+            // "unspecified-OS" path that does commit DiscoKey.
+            os: String::new(),
+            os_version: String::new(),
+            backend_log_id: backend_log_id.to_string(),
+        },
+        timestamp: now_rfc3339()?,
+        expiry,
+        ephemeral: false,
+    })
+}
+
+/// Current UTC time as an RFC3339 string, using the same `time`-crate
+/// formatting for both the always-present `Timestamp` and logout's `Expiry`.
+fn now_rfc3339() -> Result<String, ControlError> {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|e| ControlError::Transport(format!("rfc3339 format: {e}")))
 }
 
 /// Build the optional `Auth` object. An empty auth key omits it entirely,
@@ -194,6 +287,25 @@ fn interpret_register_response(
     })
 }
 
+/// Interpret a logout (`Expiry=now`) response. Split out of `logout()` so it
+/// is unit-testable without a live Noise/HTTP2 tunnel. Success = no server
+/// `Error`; `NodeKeyExpired=true` **is** success — the key we just asked to
+/// expire is now expired, which is the whole point.
+fn interpret_logout_response(parsed: RegisterResponseWire) -> Result<(), ControlError> {
+    if !parsed.error.is_empty() {
+        warn!(server_error = %parsed.error, "control.logout.fail.server");
+        return Err(ControlError::Transport(format!(
+            "logout: server Error={}",
+            parsed.error
+        )));
+    }
+    info!(
+        node_key_expired = parsed.node_key_expired,
+        "control.logout.ok"
+    );
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct RegisterRequestWire {
     #[serde(rename = "Version")]
@@ -210,6 +322,10 @@ struct RegisterRequestWire {
     hostinfo: HostinfoWire,
     #[serde(rename = "Timestamp")]
     timestamp: String,
+    /// RFC3339, present only on logout (`Expiry=now` expires the current
+    /// node key). Register omits it (`None`), so the wire body is unchanged.
+    #[serde(rename = "Expiry", skip_serializing_if = "Option::is_none")]
+    expiry: Option<String>,
     #[serde(rename = "Ephemeral", skip_serializing_if = "std::ops::Not::not")]
     ephemeral: bool,
 }
@@ -274,7 +390,8 @@ mod tests {
             followup: followup.map(str::to_string),
             hostinfo: sample_hostinfo(),
             timestamp: "2026-05-04T00:00:00Z".into(),
-            ephemeral: true,
+            expiry: None,
+            ephemeral: false,
         }
     }
 
@@ -302,7 +419,8 @@ mod tests {
                 backend_log_id: "test-blog-id".into(),
             },
             timestamp: "2026-05-04T00:00:00Z".into(),
-            ephemeral: true,
+            expiry: None,
+            ephemeral: false,
         };
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert_eq!(v["Version"], 90);
@@ -321,7 +439,11 @@ mod tests {
         assert!(v["Hostinfo"].get("OS").is_none());
         assert!(v["Hostinfo"].get("OSVersion").is_none());
         assert!(v["Hostinfo"].get("NetInfo").is_none());
-        assert_eq!(v["Ephemeral"], true);
+        // Ephemeral is now false for all registrations (M19 persistence
+        // flip) and skip-if-false, so the key is absent from the wire body.
+        assert!(v.get("Ephemeral").is_none());
+        // Expiry is a logout-only field; register leaves it None => absent.
+        assert!(v.get("Expiry").is_none());
     }
 
     #[test]
@@ -423,5 +545,71 @@ mod tests {
         assert!(!outcome.machine_authorized);
         assert!(outcome.node_key_expired);
         assert!(outcome.pending_auth_url.is_none());
+    }
+
+    #[test]
+    fn logout_body_shape() {
+        // Logout builds the register body with Auth=None, Followup=None and
+        // Expiry=now on the current node key.
+        let node_pub = NodePublic([0x11u8; 32]);
+        let nl_pub = NLPublic([0x33u8; 32]);
+        let req = build_request(
+            None,
+            &node_pub,
+            &nl_pub,
+            "test-blog-id",
+            "vita",
+            None,
+            Some(now_rfc3339().unwrap()),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+
+        // Expiry present and RFC3339-parseable.
+        let expiry = v["Expiry"].as_str().expect("Expiry must be present");
+        assert!(
+            time::OffsetDateTime::parse(
+                expiry,
+                &time::format_description::well_known::Rfc3339
+            )
+            .is_ok(),
+            "Expiry must be RFC3339-parseable, got {expiry:?}"
+        );
+        // No Auth, no Followup on a logout.
+        assert!(v.get("Auth").is_none(), "logout must not send Auth");
+        assert!(v.get("Followup").is_none(), "logout must not send Followup");
+        // NodeKey = the current node key.
+        assert_eq!(v["NodeKey"], node_pub.to_nodekey_string());
+        // Ephemeral flipped to false => absent (skip-if-false).
+        assert!(v.get("Ephemeral").is_none());
+    }
+
+    #[test]
+    fn logout_response_interpretation() {
+        // NodeKeyExpired=true is the expected success confirmation.
+        let expired = RegisterResponseWire {
+            node_key_expired: true,
+            ..Default::default()
+        };
+        assert!(interpret_logout_response(expired).is_ok());
+
+        // An empty/benign response is also success.
+        assert!(interpret_logout_response(RegisterResponseWire::default()).is_ok());
+
+        // A server Error is a failure.
+        let errored = RegisterResponseWire {
+            error: "boom".into(),
+            ..Default::default()
+        };
+        assert!(interpret_logout_response(errored).is_err());
+    }
+
+    #[test]
+    fn register_omits_expiry_when_none() {
+        // Register never sets Expiry, so the field is absent and the wire
+        // body is byte-identical to pre-M19 register requests.
+        let v: serde_json::Value =
+            serde_json::to_value(&sample_request("tskey-auth-abc123", None)).unwrap();
+        assert!(v.get("Expiry").is_none(), "register must not send Expiry");
     }
 }

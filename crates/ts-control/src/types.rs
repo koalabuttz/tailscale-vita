@@ -328,10 +328,35 @@ pub(crate) struct MapResponseWire {
     pub peers_changed_patch: Option<Vec<PeerChangeWire>>,
     #[serde(rename = "Domain", default)]
     pub domain: String,
+    /// M19 identity card: display profiles for the users owning `Node`
+    /// and `Peers`. **Delta**, not a full set — since CapVer 5 control
+    /// sends only new/changed profiles per frame, so `netmap` upserts
+    /// rather than replaces (a no-change frame carries an empty/`null`
+    /// list, which must not blank the accumulated map). CapVer≥138
+    /// serializes the empty case as JSON `null` — reuse `null_or_default`.
+    #[serde(
+        rename = "UserProfiles",
+        default,
+        deserialize_with = "null_or_default"
+    )]
+    pub user_profiles: Vec<UserProfileWire>,
     #[serde(rename = "ControlTime", default)]
     pub control_time: Option<String>,
     // DNSConfig, PacketFilter, ClientVersion, etc. are parsed-and-dropped
     // by serde (no fields). v1 doesn't consume them.
+}
+
+/// Mirrors `tailcfg.UserProfile` — the display identity for a user that
+/// owns one or more nodes. M19 resolves our own `Node.User` against
+/// these to show a human login name in the dashboard identity card.
+#[derive(Deserialize, Default, Debug, Clone)]
+pub(crate) struct UserProfileWire {
+    #[serde(rename = "ID", default)]
+    pub id: i64,
+    #[serde(rename = "LoginName", default)]
+    pub login_name: String,
+    #[serde(rename = "DisplayName", default)]
+    pub display_name: String,
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]
@@ -340,6 +365,12 @@ pub(crate) struct NodeWire {
     pub id: i64,
     #[serde(rename = "StableID", default)]
     pub stable_id: String,
+    /// M19: server-assigned user ID owning this node. Resolved against
+    /// `MapResponse.UserProfiles` to display a human login name. Tagged
+    /// nodes point this at a tag pseudo-user with no human profile.
+    /// `0` = unset/omitted.
+    #[serde(rename = "User", default)]
+    pub user: i64,
     #[serde(rename = "Name", default)]
     pub name: String,
     #[serde(rename = "Key", default)]
@@ -585,6 +616,44 @@ mod tests {
         let body = br#"{"ID":1,"Name":"v","Tags":null}"#;
         let n: NodeWire = serde_json::from_slice(body).unwrap();
         assert!(n.tags.is_empty());
+    }
+
+    #[test]
+    fn node_wire_user_parses() {
+        // M19: Node.User carries the owning user's ID for identity-card
+        // resolution; absent → 0 (unset).
+        let n: NodeWire = serde_json::from_slice(br#"{"ID":1,"User":42}"#).unwrap();
+        assert_eq!(n.user, 42);
+        let n2: NodeWire = serde_json::from_slice(br#"{"ID":1}"#).unwrap();
+        assert_eq!(n2.user, 0);
+    }
+
+    #[test]
+    fn user_profile_wire_parses() {
+        let body = br#"{"ID":42,"LoginName":"dave@example.com","DisplayName":"Dave"}"#;
+        let up: UserProfileWire = serde_json::from_slice(body).unwrap();
+        assert_eq!(up.id, 42);
+        assert_eq!(up.login_name, "dave@example.com");
+        assert_eq!(up.display_name, "Dave");
+    }
+
+    #[test]
+    fn map_response_user_profiles_parse() {
+        let body = br#"{"UserProfiles":[{"ID":1,"LoginName":"a@b"},{"ID":2,"LoginName":"c@d"}]}"#;
+        let resp: MapResponseWire = serde_json::from_slice(body).unwrap();
+        assert_eq!(resp.user_profiles.len(), 2);
+        assert_eq!(resp.user_profiles[0].id, 1);
+        assert_eq!(resp.user_profiles[1].login_name, "c@d");
+    }
+
+    #[test]
+    fn map_response_user_profiles_null_defaults_to_empty() {
+        // CapVer≥138 serializes the empty sequence as JSON `null`;
+        // `null_or_default` maps it to an empty Vec (same pattern as
+        // Peers/Addresses) rather than a deserialize error.
+        let body = br#"{"UserProfiles":null}"#;
+        let resp: MapResponseWire = serde_json::from_slice(body).unwrap();
+        assert!(resp.user_profiles.is_empty());
     }
 
     #[test]

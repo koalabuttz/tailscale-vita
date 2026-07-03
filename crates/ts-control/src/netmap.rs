@@ -21,7 +21,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use vita_log::{debug, info, warn};
 
-use crate::types::{DerpMapWire, MapResponseWire, NodeWire, PeerChangeWire};
+use crate::types::{DerpMapWire, MapResponseWire, NodeWire, PeerChangeWire, UserProfileWire};
 
 /// 32 raw bytes — the binary form of a `nodekey:<hex>` value.
 pub type NodeKeyBytes = [u8; 32];
@@ -70,6 +70,16 @@ pub struct DerpNodeSnapshot {
     pub stun_port: i32,
 }
 
+/// M19: display identity for a user owning one or more nodes, keyed by
+/// server user ID in `NetMap.user_profiles`. Domain form of
+/// `UserProfileWire`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserProfile {
+    pub id: i64,
+    pub login_name: String,
+    pub display_name: String,
+}
+
 #[derive(Default)]
 pub struct NetMap {
     pub our_addrs: Vec<AllowedIp>,
@@ -94,6 +104,17 @@ pub struct NetMap {
     pub last_seq: i64,
     pub session_handle: String,
     pub domain: String,
+    /// M19 identity card: user ID → profile, accumulated by **delta
+    /// upsert** across frames (control sends only new/changed profiles
+    /// since CapVer 5). Never wholesale-replaced — a profile-less frame
+    /// must leave prior identities intact.
+    pub user_profiles: HashMap<i64, UserProfile>,
+    /// M19: our own node's owning user ID, captured from the self Node.
+    /// `None` until a self Node carrying a non-zero `User` arrives.
+    /// Guarded like `our_key_expiry`: a peers-only or `User`-omitting
+    /// frame can't blank it. Resolved lazily against `user_profiles`
+    /// (they can land in different frames) via `our_login_name`.
+    pub our_user_id: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +187,26 @@ impl NetMap {
                 info!(key_expiry = ?node.key_expiry, "control.map.our_key_expiry.set");
                 self.our_key_expiry = node.key_expiry.clone();
             }
+            // M19: capture our owning user ID for the identity card, guarded
+            // exactly like key-expiry above — `User == 0` means the field
+            // was omitted, so a self Node without it (or a later frame)
+            // can't blank a previously-learned id. Resolved to a login name
+            // lazily by `our_login_name` (the UserProfile may arrive in a
+            // different frame).
+            if node.user != 0 && Some(node.user) != self.our_user_id {
+                info!(user = node.user, "control.map.our_user_id.set");
+                self.our_user_id = Some(node.user);
+            }
+        }
+
+        // M19: delta-upsert the identity profiles. Control sends only
+        // new/changed `UserProfiles` per frame (CapVer 5), so we merge
+        // rather than replace — a no-change frame's empty list iterates
+        // zero times and leaves the accumulated map intact. Copies the
+        // `PeersChanged` upsert idiom below, NOT the full-set `Peers`
+        // replace (which would blank identity on every quiescent frame).
+        for up in &resp.user_profiles {
+            self.user_profiles.insert(up.id, user_profile_from_wire(up));
         }
 
         if let Some(dmap) = &resp.derp_map {
@@ -275,6 +316,31 @@ impl NetMap {
         apply_patch_fields(peer, patch);
         delta.patches_applied += 1;
         delta.upserted.push(peer.clone());
+    }
+
+    /// M19 identity card: our own login name, resolving `our_user_id`
+    /// against the accumulated `user_profiles` lazily (id and profile can
+    /// arrive in different frames). Returns `None` until both have landed.
+    /// Tagged nodes point `Node.User` at a tag pseudo-user with no human
+    /// login name (absent profile, or a profile with an empty
+    /// `LoginName`), which also yields `None` — the UI falls back to the
+    /// hostname.
+    pub fn our_login_name(&self) -> Option<&str> {
+        let id = self.our_user_id?;
+        let profile = self.user_profiles.get(&id)?;
+        if profile.login_name.is_empty() {
+            None
+        } else {
+            Some(profile.login_name.as_str())
+        }
+    }
+}
+
+fn user_profile_from_wire(w: &UserProfileWire) -> UserProfile {
+    UserProfile {
+        id: w.id,
+        login_name: w.login_name.clone(),
+        display_name: w.display_name.clone(),
     }
 }
 
@@ -426,7 +492,7 @@ fn parse_derp_regions(dmap: &DerpMapWire) -> HashMap<u16, DerpRegionSnapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{MapResponseWire, NodeWire, PeerChangeWire};
+    use crate::types::{MapResponseWire, NodeWire, PeerChangeWire, UserProfileWire};
 
     fn node(id: i64, hex_byte: u8, addr: &str) -> NodeWire {
         NodeWire {
@@ -658,6 +724,170 @@ mod tests {
         // IPv6 is filtered out; only IPv4 makes it through parse_ipv4_cidr.
         assert_eq!(nm.our_addrs.len(), 1);
         assert_eq!(nm.our_addrs[0].addr, Ipv4Addr::new(100, 64, 0, 1));
+    }
+
+    fn profile(id: i64, login: &str) -> UserProfileWire {
+        UserProfileWire {
+            id,
+            login_name: login.into(),
+            ..Default::default()
+        }
+    }
+
+    /// M19: `UserProfiles` is a delta — control sends only new/changed
+    /// profiles per frame. A profile-less (peers-only / no-change) frame
+    /// must not blank the accumulated map, and a new profile upserts
+    /// alongside the old rather than replacing the set.
+    #[test]
+    fn user_profiles_delta_merge_survives_profileless_frames() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            user_profiles: vec![profile(1, "a@b")],
+            ..Default::default()
+        });
+        assert_eq!(nm.user_profiles.len(), 1);
+
+        // A peers-only frame carries no profiles → prior identity survives.
+        nm.apply(&MapResponseWire {
+            peers_changed: Some(vec![node(2, 0x22, "100.64.0.3")]),
+            ..Default::default()
+        });
+        assert_eq!(nm.user_profiles.len(), 1);
+        assert_eq!(nm.user_profiles[&1].login_name, "a@b");
+
+        // A new profile upserts alongside, doesn't replace.
+        nm.apply(&MapResponseWire {
+            user_profiles: vec![profile(2, "c@d")],
+            ..Default::default()
+        });
+        assert_eq!(nm.user_profiles.len(), 2);
+        assert_eq!(nm.user_profiles[&1].login_name, "a@b");
+        assert_eq!(nm.user_profiles[&2].login_name, "c@d");
+    }
+
+    /// The self user ID and its `UserProfile` can land in different
+    /// frames (either order). `our_login_name` resolves lazily once both
+    /// have arrived.
+    #[test]
+    fn our_login_name_resolves_out_of_order() {
+        // Profile-first: id unknown → None, then self Node arrives.
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            user_profiles: vec![profile(7, "dave@example.com")],
+            ..Default::default()
+        });
+        assert_eq!(nm.our_login_name(), None);
+        nm.apply(&MapResponseWire {
+            node: Some(NodeWire {
+                id: 1,
+                user: 7,
+                addresses: vec!["100.64.0.1/32".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(nm.our_user_id, Some(7));
+        assert_eq!(nm.our_login_name(), Some("dave@example.com"));
+
+        // Id-first: self Node arrives before the profile does.
+        let mut nm2 = NetMap::default();
+        nm2.apply(&MapResponseWire {
+            node: Some(NodeWire {
+                id: 1,
+                user: 7,
+                addresses: vec!["100.64.0.1/32".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(nm2.our_login_name(), None);
+        nm2.apply(&MapResponseWire {
+            user_profiles: vec![profile(7, "dave@example.com")],
+            ..Default::default()
+        });
+        assert_eq!(nm2.our_login_name(), Some("dave@example.com"));
+    }
+
+    /// Tagged nodes point `Node.User` at a tag pseudo-user with no human
+    /// login name — whether the profile is absent or carries an empty
+    /// `LoginName`, `our_login_name` returns None (UI falls back to
+    /// hostname).
+    #[test]
+    fn our_login_name_none_for_tagged_or_missing_profile() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            node: Some(NodeWire {
+                id: 1,
+                user: 99,
+                addresses: vec!["100.64.0.1/32".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(nm.our_user_id, Some(99));
+        // No profile for user 99 yet → None.
+        assert_eq!(nm.our_login_name(), None);
+        // A tag pseudo-user profile (empty LoginName) → still None.
+        nm.apply(&MapResponseWire {
+            user_profiles: vec![UserProfileWire {
+                id: 99,
+                login_name: String::new(),
+                display_name: "tagged-devices".into(),
+            }],
+            ..Default::default()
+        });
+        assert_eq!(nm.our_login_name(), None);
+    }
+
+    /// `our_user_id` uses the same guard as `our_key_expiry`: a self Node
+    /// that omits `User` (== 0) or a peers-only frame must not blank a
+    /// previously-learned id.
+    #[test]
+    fn our_user_id_guarded_against_blanking() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            node: Some(NodeWire {
+                id: 1,
+                user: 7,
+                addresses: vec!["100.64.0.1/32".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(nm.our_user_id, Some(7));
+        // Self Node frame omitting User (user == 0) → preserved.
+        nm.apply(&MapResponseWire {
+            node: Some(NodeWire {
+                id: 1,
+                addresses: vec!["100.64.0.1/32".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(nm.our_user_id, Some(7));
+        // Peers-only frame (no self Node) → preserved.
+        nm.apply(&MapResponseWire {
+            peers_changed: Some(vec![node(2, 0x22, "100.64.0.3")]),
+            ..Default::default()
+        });
+        assert_eq!(nm.our_user_id, Some(7));
+    }
+
+    /// S2 must not disturb Domain capture: a later profile-only frame
+    /// (empty Domain) leaves the learned domain intact.
+    #[test]
+    fn user_profiles_frame_leaves_domain_untouched() {
+        let mut nm = NetMap::default();
+        nm.apply(&MapResponseWire {
+            domain: "example.com".into(),
+            ..Default::default()
+        });
+        assert_eq!(nm.domain, "example.com");
+        nm.apply(&MapResponseWire {
+            user_profiles: vec![profile(1, "a@b")],
+            ..Default::default()
+        });
+        assert_eq!(nm.domain, "example.com");
     }
 
     #[test]
