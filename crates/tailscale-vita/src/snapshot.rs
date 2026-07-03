@@ -70,6 +70,24 @@ pub struct RuntimeSnapshot {
     /// dashboard warns before this passes (a silent tailnet drop-off).
     #[serde(default)]
     pub our_key_expiry: Option<String>,
+    /// M19 identity card: the tailnet's domain (e.g. `example.com`),
+    /// from `MapResponse.Domain`. `None` until the first full map. Read
+    /// from persistent NetMap state on every publish so the 3 s
+    /// full-replace republish can't blank it.
+    #[serde(default)]
+    pub tailnet_domain: Option<String>,
+    /// M19 identity card: our own login name (e.g. `dave@example.com`),
+    /// resolved from `UserProfiles` + `Node.User`. `None` for tagged
+    /// nodes (no human user) or before the profile lands — the UI falls
+    /// back to the hostname.
+    #[serde(default)]
+    pub user_login: Option<String>,
+    /// M19: true while an interactive login is running (between the
+    /// user's `/login-interactive` and the authorized response). With
+    /// `lifecycle == NeedsLogin` + `auth_url` it drives the dashboard's
+    /// three full-screen login modes (spinner / QR / logged-out).
+    #[serde(default)]
+    pub login_in_progress: bool,
     /// Per-peer view, keyed by node-key hex.
     pub peers: HashMap<String, PeerView>,
 }
@@ -160,6 +178,9 @@ impl RuntimeSnapshot {
             public_endpoint: None,
             acl: AclSummary::default(),
             our_key_expiry: None,
+            tailnet_domain: None,
+            user_login: None,
+            login_in_progress: false,
             peers: HashMap::new(),
         }
     }
@@ -200,6 +221,47 @@ mod tests {
         assert!(json.contains("\"hostname\":\"vita\""));
         assert!(json.contains("\"lifecycle\":\"Connecting\""));
         assert!(json.contains("\"peer_count\":0"));
+    }
+
+    #[test]
+    fn snapshot_identity_fields_default_when_absent() {
+        // SUPRX and eboot are versioned independently; a snapshot JSON
+        // written by an older binary (no M19 identity fields) must still
+        // parse thanks to `#[serde(default)]`.
+        let json = r#"{
+            "updated_at_unix": 1,
+            "started_at_unix": 1,
+            "hostname": "vita",
+            "our_addrs": [],
+            "lifecycle": "Connecting",
+            "fatal_reason": null,
+            "peer_count": 0,
+            "derp_home_region": 0,
+            "alive_derp_regions": [],
+            "magic_local": "0.0.0.0:41641",
+            "public_endpoint": null,
+            "acl": {"tags": [], "has_tags": false},
+            "peers": {}
+        }"#;
+        let snap: RuntimeSnapshot = serde_json::from_str(json).expect("parse legacy snapshot");
+        assert_eq!(snap.tailnet_domain, None);
+        assert_eq!(snap.user_login, None);
+        assert!(!snap.login_in_progress);
+    }
+
+    #[test]
+    fn snapshot_serializes_identity_fields() {
+        let mut snap = RuntimeSnapshot::empty(
+            "vita".into(),
+            "0.0.0.0:41641".parse().unwrap(),
+        );
+        snap.tailnet_domain = Some("example.com".into());
+        snap.user_login = Some("dave@example.com".into());
+        snap.login_in_progress = true;
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"tailnet_domain\":\"example.com\""));
+        assert!(json.contains("\"user_login\":\"dave@example.com\""));
+        assert!(json.contains("\"login_in_progress\":true"));
     }
 
     #[test]

@@ -68,6 +68,11 @@ pub struct Runtime {
     /// `self.stack` panics if shutdown has already been called.
     stack: Option<Stack>,
     map: Option<MapClient>,
+    /// M19: mirrors `config.tailnet.want_running`, seeded at `up()`. A
+    /// parked boot (`false`) skips interactive login + MapClient::start
+    /// and publishes `Stopped`; the event loop flips it on `/up`//`/down`
+    /// signals to park/resume without a process restart.
+    want_running: bool,
     lifecycle: Mutex<LifecycleTracker>,
     /// Sender side of the M13.5 Stage 4 control-signal channel.
     /// Cloned out via `controller()` for management UIs.
@@ -108,6 +113,20 @@ pub enum ControlSignal {
     /// any pending backoff. Used after a config tweak the user just
     /// made, or as a manual "kick the daemon" gesture.
     ForceReconnect,
+    /// M19: flip `want_running`. `true` = `/up` (resume from Stopped),
+    /// `false` = `/down` (park: close the control session + drop WG
+    /// peers, hold `OnlineState::Stopped`). Live state only — the eboot
+    /// persists the bit in config.toml.
+    SetWantRunning(bool),
+    /// M19: `/logout` — expire the node key at control (a RegisterRequest
+    /// with `Expiry = now`), drop the session + WG peers, delete the
+    /// persisted map-session state, and park logged-out (`NeedsLogin`,
+    /// no auto re-login). The node key is regenerated at the next login.
+    Logout,
+    /// M19: `/login-interactive` — start an interactive (QR) login now.
+    /// Used post-logout (the "press ✕ to log in" screen) and as a manual
+    /// re-authenticate. Drives the stop-aware `interactive_login`.
+    LoginInteractive,
 }
 
 /// Sender-side handle for `ControlSignal`. Returned from
@@ -292,17 +311,49 @@ impl Runtime {
         // followup re-poll cannot reuse it — a fresh conn is established
         // per attempt inside the loop (which also survives transient
         // control errors instead of aborting the whole runtime).
-        suprx_trace("up5: pre interactive_login (fresh conn per attempt)");
-        let (conn, backend_log_id) = interactive_login(
-            &config,
-            &mut ks,
-            &host_authority,
-            &state_dir,
-            &snapshot,
-            &lifecycle,
-        )?;
-        suprx_trace("up7: REGISTERED + authorized");
-        info!("control.login.authorized");
+        // M19: generate the BackendLogID unconditionally (a parked boot
+        // needs one too — it is reused when the first `/up` bootstraps).
+        let backend_log_id = generate_backend_log_id();
+        info!(backend_log_id = %backend_log_id, "control.backend_log_id.generated");
+
+        // M19: `want_running = false` boots parked — skip interactive
+        // login (and MapClient::start below) and publish Stopped, but
+        // still build the full data plane so a later `/up` resumes via
+        // the normal reconnect bootstrap.
+        let want_running = config.tailnet.want_running;
+        let conn = if want_running {
+            suprx_trace("up5: pre interactive_login (fresh conn per attempt)");
+            let mut no_abort = || None::<LoginAbort>;
+            match interactive_login(
+                &config,
+                &mut ks,
+                &host_authority,
+                &state_dir,
+                &snapshot,
+                &lifecycle,
+                &backend_log_id,
+                &mut no_abort,
+            )? {
+                LoginOutcome::Authorized(conn) => {
+                    suprx_trace("up7: REGISTERED + authorized");
+                    info!("control.login.authorized");
+                    Some(conn)
+                }
+                // Unreachable: `up()` passes a no-op abort that never
+                // fires. Defensive rather than `unwrap`.
+                LoginOutcome::Aborted(_) => {
+                    return Err(RuntimeError::Internal(
+                        "interactive login aborted during boot".into(),
+                    ));
+                }
+            }
+        } else {
+            suprx_trace("park1: boot parked (want_running=false)");
+            info!("runtime.up.parked (config.tailnet.want_running=false)");
+            lifecycle.lock().set_stopped();
+            publish_login_state(&snapshot, &lifecycle, None, false);
+            None
+        };
 
         // Node identity is now authorized. Build the WG data plane with
         // the (possibly regenerated) node key. Order preserved from
@@ -329,21 +380,30 @@ impl Runtime {
         suprx_trace("up9: netstack poll started");
         info!("netstack: poll thread running (no local IP yet)");
 
-        // MapClient on the authorized conn. Resumes `last_seq` from
-        // state_dir so a warm start doesn't redownload the world.
-        let map = MapClient::start(
-            conn,
-            ks.node_pub,
-            ks.disco_pub,
-            config.hostname.clone(),
-            backend_log_id,
-            host_authority.clone(),
-            state_dir.to_path_buf(),
-            local_endpoints,
-            local_endpoint_types,
-        )?;
-        suprx_trace("up10: control session up (map started)");
-        info!("control.map.started");
+        // MapClient on the authorized conn (skipped for a parked boot,
+        // where `conn` is None). Resumes `last_seq` from state_dir so a
+        // warm start doesn't redownload the world.
+        let map = match conn {
+            Some(conn) => {
+                let m = finish_session(
+                    conn,
+                    &ks,
+                    &config,
+                    &host_authority,
+                    &state_dir,
+                    local_endpoints,
+                    local_endpoint_types,
+                    backend_log_id,
+                )?;
+                suprx_trace("up10: control session up (map started)");
+                info!("control.map.started");
+                Some(m)
+            }
+            None => {
+                suprx_trace("park2: parked boot; MapClient not started");
+                None
+            }
+        };
 
         // M16: tailnet-IP holder, published on the first MapResponse (see
         // run_event_loop). Shared with the optional ts-ftp service so its
@@ -392,7 +452,8 @@ impl Runtime {
             magic_ctl,
             _magic_socket: Some(magic_socket),
             stack: Some(stack),
-            map: Some(map),
+            map,
+            want_running,
             lifecycle,
             signal_tx,
             signal_rx: Some(signal_rx),
@@ -460,11 +521,10 @@ impl Runtime {
             .stack
             .as_ref()
             .ok_or_else(|| RuntimeError::Internal("runtime stack already shut down".into()))?;
-        let mut map_opt: Option<MapClient> = Some(
-            self.map
-                .take()
-                .ok_or_else(|| RuntimeError::Internal("runtime map_client already taken".into()))?,
-        );
+        // M19: may legitimately be `None` on a parked boot
+        // (`want_running = false` skipped MapClient::start in `up()`).
+        // The event loop holds `Stopped` until the first `/up`.
+        let mut map_opt: Option<MapClient> = self.map.take();
         let signal_rx = self.signal_rx.take().ok_or_else(|| {
             RuntimeError::Internal("runtime signal_rx already taken".into())
         })?;
@@ -514,6 +574,13 @@ impl Runtime {
         // resets to 0 on a successful event. Backoff is 2^attempt
         // seconds capped at RECONNECT_BACKOFF_CAP.
         let mut reconnect_attempt: u32 = 0;
+        // M19 lifecycle spine: live copy of `want_running` (a `/down`
+        // parks it false, an `/up` resumes it true). Deferred-action
+        // flags for the two blocking mid-loop operations, set in the
+        // signal-drain loop and handled just after it.
+        let mut want_running = self.want_running;
+        let mut logout_requested = false;
+        let mut login_interactive_requested = false;
 
         while !should_stop() {
             // M13.5 Stage 4: drain any pending control signals. Fatal
@@ -541,6 +608,60 @@ impl Runtime {
                         map_opt = None;
                         reconnect_attempt = 0;
                     }
+                    Ok(ControlSignal::SetWantRunning(desired)) => {
+                        if is_fatal {
+                            warn!(
+                                state = ?lifecycle_state,
+                                "control.signal.want_running.ignored.fatal"
+                            );
+                            continue;
+                        }
+                        if desired && !want_running {
+                            // `/up` — resume from Stopped. Clear the park,
+                            // drop any dead session, bootstrap immediately.
+                            info!("control.signal.want_running.up");
+                            suprx_trace("resume: want_running -> up");
+                            want_running = true;
+                            self.want_running = true;
+                            self.lifecycle.lock().clear_stopped();
+                            map_opt = None;
+                            reconnect_attempt = 0;
+                        } else if !desired && want_running {
+                            // `/down` — park. Close the control session and
+                            // quiet the data plane; dropping `map_opt`
+                            // alone would leave WG peers live (recon risk).
+                            info!("control.signal.want_running.down");
+                            suprx_trace("park: want_running -> down");
+                            want_running = false;
+                            self.want_running = false;
+                            map_opt = None;
+                            clear_engine_peers(&self.engine, &mut peer_regions);
+                            self.lifecycle.lock().set_stopped();
+                            publish_login_state(&self.snapshot, &self.lifecycle, None, false);
+                        }
+                    }
+                    Ok(ControlSignal::Logout) => {
+                        if is_fatal {
+                            warn!(
+                                state = ?lifecycle_state,
+                                "control.signal.logout.ignored.fatal"
+                            );
+                            continue;
+                        }
+                        info!("control.signal.logout");
+                        logout_requested = true;
+                    }
+                    Ok(ControlSignal::LoginInteractive) => {
+                        if is_fatal {
+                            warn!(
+                                state = ?lifecycle_state,
+                                "control.signal.login_interactive.ignored.fatal"
+                            );
+                            continue;
+                        }
+                        info!("control.signal.login_interactive");
+                        login_interactive_requested = true;
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         // All ControlHandle clones dropped. Not an
@@ -551,10 +672,47 @@ impl Runtime {
                 }
             }
 
-            // M13 reconnect: if we're sessionless, sleep with backoff +
-            // attempt bootstrap. Done at loop top so both first-fail
-            // and bootstrap-fail paths share the same retry mechanism.
-            if map_opt.is_none() {
+            // M19 parked (`want_running = false`). Hold Stopped and don't
+            // touch the control/data plane; only signal draining (above)
+            // keeps `/up` responsive. A short cooperative sleep paces the
+            // loop (no `next_event` to block on while parked).
+            if !want_running {
+                logout_requested = false;
+                login_interactive_requested = false;
+                self.lifecycle.lock().set_stopped();
+                if cooperative_sleep(Duration::from_secs(2), &mut should_stop) {
+                    break;
+                }
+                continue;
+            }
+
+            // M19 `/logout` — expire the node key at control on a fresh
+            // conn, then park logged-out (NeedsLogin, no auto re-login).
+            if logout_requested {
+                logout_requested = false;
+                perform_logout(
+                    &self.config,
+                    &self.ks,
+                    &self.host_authority,
+                    &self.state_dir,
+                    &self.snapshot,
+                    &self.lifecycle,
+                    &self.engine,
+                    &mut peer_regions,
+                    &mut map_opt,
+                );
+                // Whether logout succeeded (→ NeedsLogin, map_opt None) or
+                // failed (→ prior state kept), re-enter the loop rather
+                // than fall through to next_event on a maybe-None map.
+                continue;
+            }
+
+            // M13 reconnect: sessionless + running + not logged-out + not
+            // already escalating → sleep with backoff + attempt bootstrap.
+            if map_opt.is_none()
+                && !login_interactive_requested
+                && self.lifecycle.lock().state() != OnlineState::NeedsLogin
+            {
                 let delay = reconnect_backoff(reconnect_attempt);
                 info!(
                     delay_secs = delay.as_secs(),
@@ -578,7 +736,7 @@ impl Runtime {
                     &self.state_dir,
                     BootstrapPhase::Reconnect(reconnect_attempt + 1),
                 ) {
-                    Ok(m) => {
+                    Ok(BootstrapOutcome::Session(m)) => {
                         info!(attempt = reconnect_attempt + 1, "control.reconnect.ok");
                         map_opt = Some(m);
                         // reconnect_attempt is reset below in either
@@ -593,6 +751,16 @@ impl Runtime {
                         // between sessions if the user re-issued the
                         // auth-key while we were disconnected.
                         acl_warned = false;
+                    }
+                    Ok(BootstrapOutcome::NeedsInteractiveLogin) => {
+                        // M19: the persisted node key lost authorization
+                        // while we were disconnected (expired/deauthed).
+                        // Escalate to interactive login (closes the M18
+                        // reconnect deferral). Handled just below so the
+                        // signal-driven and reconnect-driven paths share
+                        // one implementation.
+                        info!("control.reconnect.escalate_interactive_login");
+                        login_interactive_requested = true;
                     }
                     Err(e) => {
                         // Same fatal-vs-transient triage as the
@@ -636,6 +804,106 @@ impl Runtime {
                     }
                 }
             }
+
+            // M19 mid-life interactive login — the `/login-interactive`
+            // signal, the post-logout ✕ screen, or a reconnect escalation
+            // above. Runs the stop-aware login loop, then opens the
+            // session via `finish_session` (same tail as first boot).
+            if login_interactive_requested {
+                login_interactive_requested = false;
+                let session_blid = generate_backend_log_id();
+                info!(backend_log_id = %session_blid, "control.backend_log_id.generated");
+                let magic_local = self.magic_ctl.local_addr();
+                let local_eps = build_local_endpoints(&self.config.control_url, magic_local);
+                let local_ep_types: Vec<u8> = vec![1u8; local_eps.len()];
+                let mut abort = || peek_login_abort(&signal_rx, &mut should_stop);
+                match interactive_login(
+                    &self.config,
+                    &mut self.ks,
+                    &self.host_authority,
+                    &self.state_dir,
+                    &self.snapshot,
+                    &self.lifecycle,
+                    &session_blid,
+                    &mut abort,
+                ) {
+                    Ok(LoginOutcome::Authorized(conn)) => {
+                        match finish_session(
+                            conn,
+                            &self.ks,
+                            &self.config,
+                            &self.host_authority,
+                            &self.state_dir,
+                            local_eps,
+                            local_ep_types,
+                            session_blid,
+                        ) {
+                            Ok(m) => {
+                                info!("control.login_interactive.session_up");
+                                map_opt = Some(m);
+                                reconnect_attempt = 0;
+                                sent_netinfo_once = false;
+                                acl_warned = false;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "control.login_interactive.finish_session.failed");
+                            }
+                        }
+                    }
+                    Ok(LoginOutcome::Aborted(LoginAbort::Parked)) => {
+                        // A `/down` arrived mid-login — park (mirror the
+                        // SetWantRunning(false) transition).
+                        info!("control.login_interactive.aborted.parked");
+                        want_running = false;
+                        self.want_running = false;
+                        map_opt = None;
+                        clear_engine_peers(&self.engine, &mut peer_regions);
+                        self.lifecycle.lock().set_stopped();
+                        publish_login_state(&self.snapshot, &self.lifecycle, None, false);
+                    }
+                    Ok(LoginOutcome::Aborted(LoginAbort::Shutdown)) => {
+                        // should_stop fired; the while guard exits next check.
+                        info!("control.login_interactive.aborted.shutdown");
+                    }
+                    Err(e) => {
+                        let class = classify_control_error(&e);
+                        match class {
+                            ErrorClass::AuthFatal => {
+                                warn!(error = %e, "control.login_interactive.auth_fatal");
+                                self.lifecycle
+                                    .lock()
+                                    .mark_fatal(FatalKind::Auth, e.to_string());
+                                publish_fatal_state(&self.snapshot, &self.lifecycle);
+                                return Err(RuntimeError::Control(e));
+                            }
+                            ErrorClass::SecurityFatal => {
+                                warn!(error = %e, "control.login_interactive.security_fatal");
+                                self.lifecycle
+                                    .lock()
+                                    .mark_fatal(FatalKind::Security, e.to_string());
+                                publish_fatal_state(&self.snapshot, &self.lifecycle);
+                                return Err(RuntimeError::Control(e));
+                            }
+                            ErrorClass::Transient => {
+                                warn!(error = %e, "control.login_interactive.failed");
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // M19 sessionless but not parked (e.g. logged out awaiting
+            // `/login-interactive`). Idle without spinning — and crucially
+            // WITHOUT ticking: a tick would recompute the stale tracker
+            // out of NeedsLogin.
+            if map_opt.is_none() {
+                if cooperative_sleep(Duration::from_secs(2), &mut should_stop) {
+                    break;
+                }
+                continue;
+            }
+
             let map = map_opt.as_mut().expect("map_opt populated above");
             let event = match map.next_event(Duration::from_secs(2)) {
                 Ok(e) => e,
@@ -1316,7 +1584,7 @@ fn bootstrap_control_session(
     local_endpoint_types: Vec<u8>,
     state_dir: &Path,
     phase: BootstrapPhase,
-) -> Result<MapClient, ts_control::ControlError> {
+) -> Result<BootstrapOutcome, ts_control::ControlError> {
     info!(?phase, "control.bootstrap.start");
 
     let mut conn = establish_control_conn(config, ks, state_dir)?;
@@ -1339,22 +1607,19 @@ fn bootstrap_control_session(
         None,
     )?;
     suprx_trace("cs7: REGISTERED with control plane!");
-    // A reconnect can't run the interactive (QR) login loop — the engine
-    // and netstack are already built around the current node key, and
-    // there's no screen ownership here. If the node lost authorization
-    // while we were disconnected (expired or deauthorized), surface a
-    // transient error; the user restarts to re-enter interactive login.
+    // M19: a reconnect can't itself run the interactive (QR) login loop
+    // (no screen ownership here), but if the node lost authorization
+    // while we were disconnected (expired or deauthorized) we no longer
+    // strand the user — we signal `NeedsInteractiveLogin` so the event
+    // loop escalates to the stop-aware `interactive_login` in place
+    // (closes the M18 reconnect deferral).
     if outcome.node_key_expired {
-        warn!("control.reconnect.node_key_expired; restart to re-login");
-        return Err(ts_control::ControlError::Transport(
-            "register: node key expired on reconnect (restart to re-login)".into(),
-        ));
+        warn!("control.reconnect.node_key_expired; escalating to interactive login");
+        return Ok(BootstrapOutcome::NeedsInteractiveLogin);
     }
     if let Some(url) = outcome.pending_auth_url {
-        warn!(auth_url = %url, "control.reconnect.needs_login; restart to re-login");
-        return Err(ts_control::ControlError::Transport(
-            "register: node deauthorized on reconnect (restart to re-login)".into(),
-        ));
+        warn!(auth_url = %url, "control.reconnect.needs_login; escalating to interactive login");
+        return Ok(BootstrapOutcome::NeedsInteractiveLogin);
     }
     info!(
         machine_authorized = outcome.machine_authorized,
@@ -1363,7 +1628,48 @@ fn bootstrap_control_session(
 
     // MapClient. Picks up `last_seq` from state_dir so a reconnect
     // resumes the netmap delta instead of redownloading the world.
-    let map = MapClient::start(
+    let map = finish_session(
+        conn,
+        ks,
+        config,
+        host_authority,
+        state_dir,
+        local_endpoints,
+        local_endpoint_types,
+        backend_log_id,
+    )?;
+    info!(?phase, "control.bootstrap.done");
+    Ok(BootstrapOutcome::Session(map))
+}
+
+/// Result of a reconnect-time [`bootstrap_control_session`]. A normal
+/// reconnect yields `Session`; if the persisted node key lost
+/// authorization while we were disconnected (expired or deauthorized) it
+/// yields `NeedsInteractiveLogin` so the event loop can escalate to the
+/// stop-aware [`interactive_login`] in place (closing the M18 reconnect
+/// deferral) rather than looping forever on a dead key.
+enum BootstrapOutcome {
+    Session(MapClient),
+    NeedsInteractiveLogin,
+}
+
+/// Open the `MapClient` on an authorized `conn`. Factored from the
+/// identical `MapClient::start` tails in `Runtime::up`,
+/// `bootstrap_control_session`, and the mid-life interactive-login path
+/// so first boot, reconnect, and re-login all produce `map_opt` the same
+/// way. Resumes `last_seq` from `state_dir`.
+#[allow(clippy::too_many_arguments)]
+fn finish_session(
+    conn: Http2Conn,
+    ks: &KeyStore,
+    config: &Config,
+    host_authority: &str,
+    state_dir: &Path,
+    local_endpoints: Vec<String>,
+    local_endpoint_types: Vec<u8>,
+    backend_log_id: String,
+) -> Result<MapClient, ts_control::ControlError> {
+    MapClient::start(
         conn,
         ks.node_pub,
         ks.disco_pub,
@@ -1373,9 +1679,114 @@ fn bootstrap_control_session(
         state_dir.to_path_buf(),
         local_endpoints,
         local_endpoint_types,
-    )?;
-    info!(?phase, "control.bootstrap.done");
-    Ok(map)
+    )
+}
+
+/// M19 park/logout: drop every WG peer from the engine so the data plane
+/// goes quiet immediately — dropping the `MapClient` alone leaves the
+/// engine's peers live (recon risk). `peer_regions` holds the current
+/// peer set (its keys are the WG public-key bytes); clear it alongside.
+fn clear_engine_peers(engine: &Engine, peer_regions: &mut HashMap<[u8; 32], u16>) {
+    for node_key in peer_regions.keys() {
+        engine.remove_peer(&x25519_dalek::PublicKey::from(*node_key));
+    }
+    let n = peer_regions.len();
+    peer_regions.clear();
+    info!(peers = n, "control.engine.peers.cleared");
+}
+
+/// M19 logout: delete the persisted map-session state so the next login
+/// (a fresh identity) doesn't resume the previous node's netmap delta.
+/// Filenames mirror `ts_control::map` (`last_seq` / `session_handle`); a
+/// missing file is fine (nothing to clear).
+fn delete_session_state(state_dir: &Path) {
+    for name in ["last_seq", "session_handle"] {
+        let path = state_dir.join(name);
+        match vita_fs::remove_file(&path) {
+            Ok(()) => info!(file = name, "control.logout.session_state.deleted"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(file = name, error = %e, "control.logout.session_state.delete_failed"),
+        }
+    }
+}
+
+/// M19 `/logout`: expire the node key at control (a RegisterRequest with
+/// `Expiry = now`) on a FRESH conn, then, on success, park logged-out:
+/// drop the session + WG peers, delete the persisted map-session state,
+/// and publish `NeedsLogin` (no auto re-login — the user explicitly
+/// left). The node key is deliberately left in place; the next login
+/// sends it, control answers expired/AuthURL, and the M18 regenerate
+/// branch runs. On any failure we log and keep the prior state (no local
+/// wipe unless control confirmed the expiry).
+#[allow(clippy::too_many_arguments)]
+fn perform_logout(
+    config: &Config,
+    ks: &KeyStore,
+    host_authority: &str,
+    state_dir: &Path,
+    snapshot: &Arc<RwLock<RuntimeSnapshot>>,
+    lifecycle: &Mutex<LifecycleTracker>,
+    engine: &Engine,
+    peer_regions: &mut HashMap<[u8; 32], u16>,
+    map_opt: &mut Option<MapClient>,
+) {
+    suprx_trace("logout1: establishing fresh conn for logout");
+    let mut conn = match establish_control_conn(config, ks, state_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "control.logout.conn_failed; staying in prior state");
+            suprx_trace("logout: conn failed; staying");
+            return;
+        }
+    };
+    let backend_log_id = generate_backend_log_id();
+    match ts_control::logout(
+        &mut conn,
+        &ks.node_pub,
+        &ks.nl_pub,
+        &backend_log_id,
+        &config.hostname,
+        host_authority,
+    ) {
+        Ok(()) => {
+            info!("control.logout.ok");
+            suprx_trace("logout2: logout OK; entering logged-out state");
+            *map_opt = None;
+            clear_engine_peers(engine, peer_regions);
+            delete_session_state(state_dir);
+            lifecycle.lock().set_needs_login();
+            // NeedsLogin + auth_url None + login_in_progress false =
+            // the "logged out — press ✕ to log in" screen.
+            publish_login_state(snapshot, lifecycle, None, false);
+        }
+        Err(e) => {
+            warn!(error = %e, "control.logout.failed; staying in prior state");
+            suprx_trace("logout2: logout FAILED; staying");
+        }
+    }
+}
+
+/// M19: peek pending control signals during a blocking interactive
+/// login. A `/down` (`SetWantRunning(false)`) or a shutdown
+/// (`should_stop`) aborts the login; other signals are consumed and
+/// ignored (we're already logging in). Returns the abort reason, or
+/// `None` to keep waiting. Used as the `interactive_login` `abort`
+/// closure from the event loop (recon risk: pre-M19 only process death
+/// interrupted an unapproved login).
+fn peek_login_abort<F: FnMut() -> bool>(
+    signal_rx: &Receiver<ControlSignal>,
+    should_stop: &mut F,
+) -> Option<LoginAbort> {
+    if should_stop() {
+        return Some(LoginAbort::Shutdown);
+    }
+    loop {
+        match signal_rx.try_recv() {
+            Ok(ControlSignal::SetWantRunning(false)) => return Some(LoginAbort::Parked),
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Establish the control-plane transport: fetch server key → Noise IK →
@@ -1461,26 +1872,49 @@ fn establish_control_conn(
 /// busy-spin without slowing real approval.
 const LOGIN_REPOLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// M18 interactive control-plane login. Registers on an already-open
-/// Noise+H2 `conn`, looping with `Followup=<AuthURL>` until the node is
-/// authorized. On the empty-`auth_key` path it publishes
+/// M19: result of [`interactive_login`]. `Authorized` carries the open,
+/// authorized conn (the caller opens `MapClient` on it via
+/// `finish_session`); `Aborted` means the `abort` closure fired before
+/// the node authorized, so no session was established.
+enum LoginOutcome {
+    Authorized(Http2Conn),
+    Aborted(LoginAbort),
+}
+
+/// M19: why the stop-aware [`interactive_login`] abandoned a wait.
+/// Returned by the `abort` closure and surfaced on
+/// `LoginOutcome::Aborted` so the event loop can react (park vs. exit).
+#[derive(Debug, Clone, Copy)]
+enum LoginAbort {
+    /// A `/down` (`SetWantRunning(false)`) arrived — park instead.
+    Parked,
+    /// The runtime is shutting down (`should_stop` fired).
+    Shutdown,
+}
+
+/// M18/M19 interactive control-plane login. Registers on a fresh
+/// Noise+H2 `conn` per attempt, looping with `Followup=<AuthURL>` until
+/// the node is authorized. On the empty-`auth_key` path it publishes
 /// `OnlineState::NeedsLogin` + the AuthURL into the snapshot so the
 /// dashboard can render a QR; the user scans + approves on a phone and
 /// the server's long-poll then returns `MachineAuthorized=true`.
 /// `NodeKeyExpired` regenerates the node key and restarts the loop.
 ///
-/// Returns the `backend_log_id` (generated once for this session) so the
-/// caller starts `MapClient` on the same conn/session.
+/// The `backend_log_id` is generated by the caller (M19: unconditionally
+/// in `up()`, freshly per session in the event loop) and passed in so a
+/// parked boot has one too; on success the caller starts `MapClient` on
+/// the returned conn/session via `finish_session`.
 ///
 /// With a non-empty `auth_key` this is effectively one-shot: register()
 /// never yields a pending AuthURL for a supplied key (it returns
 /// `AuthRejected` instead), so no NeedsLogin is ever published and the
 /// loop returns on the first authorized response.
 ///
-/// Note: `Runtime::up` has no cooperative stop handle, so — like the
-/// pre-M18 blocking register — a login that the user never approves is
-/// interrupted only by process termination. The `LOGIN_REPOLL_INTERVAL`
-/// sleep keeps that wait from busy-spinning.
+/// M19: stop-aware. `abort` is checked once per loop pass (2 s cadence);
+/// when it returns `Some`, the login is abandoned and `LoginOutcome::
+/// Aborted` is returned so a `/down` or shutdown can break an otherwise-
+/// blocking QR wait (recon risk: pre-M19 only process death interrupted
+/// it). `Runtime::up` passes a no-op abort — boot behavior unchanged.
 #[allow(clippy::too_many_arguments)]
 fn interactive_login(
     config: &Config,
@@ -1489,7 +1923,9 @@ fn interactive_login(
     state_dir: &Path,
     snapshot: &Arc<RwLock<RuntimeSnapshot>>,
     lifecycle: &Mutex<LifecycleTracker>,
-) -> Result<(Http2Conn, String), ts_control::ControlError> {
+    backend_log_id: &str,
+    abort: &mut dyn FnMut() -> Option<LoginAbort>,
+) -> Result<LoginOutcome, ts_control::ControlError> {
     let auth_key = config.auth_key.trim();
     // A supplied key is an automation override: a real auth/config problem
     // must SURFACE (return Err), not silently retry forever. The empty-key
@@ -1498,14 +1934,26 @@ fn interactive_login(
     // the whole runtime down (which strands their approval; the original
     // bug shipped: `register(...)?` on a dead reused conn killed Runtime::up).
     let key_supplied = !auth_key.is_empty();
-    let backend_log_id = generate_backend_log_id();
-    info!(backend_log_id = %backend_log_id, "control.backend_log_id.generated");
+
+    // M19: signal "login in progress" so the dashboard can show a spinner
+    // before the AuthURL (and its QR) arrives. Cleared on authorize /
+    // abort below.
+    publish_login_state(snapshot, lifecycle, None, true);
 
     let mut followup: Option<String> = None;
     let mut published_needs_login = false;
     let mut attempt: u32 = 0;
 
     loop {
+        // M19: stop-aware — a `/down` or shutdown breaks an unapproved
+        // login. Checked each loop pass (the 2 s repoll sleep below paces
+        // it) so the abort lands within one cycle.
+        if let Some(reason) = abort() {
+            info!(?reason, "control.login.aborted");
+            suprx_trace("login: aborted (down/shutdown)");
+            publish_login_state(snapshot, lifecycle, None, false);
+            return Ok(LoginOutcome::Aborted(reason));
+        }
         attempt += 1;
         // Fresh conn per attempt. The control plane closes the Noise/h2
         // conn after each register response, so the followup re-POST
@@ -1530,7 +1978,7 @@ fn interactive_login(
             auth_key,
             &ks.node_pub,
             &ks.nl_pub,
-            &backend_log_id,
+            backend_log_id,
             &config.hostname,
             host_authority,
             followup.as_deref(),
@@ -1565,14 +2013,15 @@ fn interactive_login(
         if outcome.machine_authorized {
             // Leave the NeedsLogin wait-state so the dashboard flips off
             // the QR screen immediately, before the event loop's first
-            // snapshot publish.
+            // snapshot publish. Always clear the in-progress marker set at
+            // loop start (M19), whether or not we ever went pending.
             if published_needs_login {
                 lifecycle.lock().clear_needs_login();
-                publish_login_state(snapshot, lifecycle, None);
             }
+            publish_login_state(snapshot, lifecycle, None, false);
             suprx_trace(&format!("login: AUTHORIZED on attempt {attempt}"));
             info!(attempt, "control.login.authorized");
-            return Ok((conn, backend_log_id));
+            return Ok(LoginOutcome::Authorized(conn));
         }
 
         match outcome.pending_auth_url {
@@ -1586,7 +2035,7 @@ fn interactive_login(
                     suprx_trace("login: pending; publishing NeedsLogin (scan QR)");
                 }
                 lifecycle.lock().set_needs_login();
-                publish_login_state(snapshot, lifecycle, Some(url.clone()));
+                publish_login_state(snapshot, lifecycle, Some(url.clone()), true);
                 published_needs_login = true;
                 followup = Some(url);
                 std::thread::sleep(LOGIN_REPOLL_INTERVAL);
@@ -1607,18 +2056,22 @@ fn interactive_login(
     }
 }
 
-/// M18: patch the published snapshot's `lifecycle` + `auth_url` without a
-/// full netmap rebuild (there's no netmap yet during login). Mirrors
-/// [`publish_fatal_state`]; holds the write lock for a few microseconds.
+/// M18/M19: patch the published snapshot's `lifecycle` + `auth_url` +
+/// `login_in_progress` without a full netmap rebuild (there's no netmap
+/// yet during login). Mirrors [`publish_fatal_state`]; holds the write
+/// lock for a few microseconds. Also used by the park/logout transitions
+/// to publish `Stopped` / `NeedsLogin` promptly.
 fn publish_login_state(
     out: &Arc<RwLock<RuntimeSnapshot>>,
     lifecycle: &Mutex<LifecycleTracker>,
     auth_url: Option<String>,
+    login_in_progress: bool,
 ) {
     let state = lifecycle.lock().state();
     let mut w = out.write();
     w.lifecycle = state;
     w.auth_url = auth_url;
+    w.login_in_progress = login_in_progress;
     w.updated_at_unix = now_unix();
 }
 
@@ -1748,6 +2201,13 @@ fn publish_snapshot(
         public_endpoint,
         acl,
         our_key_expiry: netmap.our_key_expiry.clone(),
+        // M19 identity card — sourced from persistent NetMap state so the
+        // 3 s full-replace republish can't blank them (unlike partial
+        // publishers). `login_in_progress` is always false in steady
+        // state; only `publish_login_state` sets it true mid-login.
+        tailnet_domain: (!netmap.domain.is_empty()).then(|| netmap.domain.clone()),
+        user_login: netmap.our_login_name().map(str::to_owned),
+        login_in_progress: false,
         peers,
     };
     *out.write() = new_snap;
@@ -2009,6 +2469,67 @@ mod tests {
         let handle = ControlHandle { tx };
         drop(rx);
         assert!(handle.force_reconnect().is_err());
+    }
+
+    #[test]
+    fn control_handle_sends_m19_signals() {
+        // The four M19 endpoints all reach the event loop over the one
+        // ControlSignal channel; the handle can carry each variant.
+        let (tx, rx) = unbounded::<ControlSignal>();
+        let handle = ControlHandle { tx };
+        handle.send(ControlSignal::SetWantRunning(false)).unwrap();
+        handle.send(ControlSignal::Logout).unwrap();
+        handle.send(ControlSignal::LoginInteractive).unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ControlSignal::SetWantRunning(false))
+        ));
+        assert!(matches!(rx.try_recv(), Ok(ControlSignal::Logout)));
+        assert!(matches!(rx.try_recv(), Ok(ControlSignal::LoginInteractive)));
+    }
+
+    #[test]
+    fn peek_login_abort_shutdown_wins() {
+        // should_stop takes priority — a shutdown aborts even with a
+        // full signal queue.
+        let (tx, rx) = unbounded::<ControlSignal>();
+        tx.send(ControlSignal::SetWantRunning(false)).unwrap();
+        let mut stop = || true;
+        assert!(matches!(
+            peek_login_abort(&rx, &mut stop),
+            Some(LoginAbort::Shutdown)
+        ));
+    }
+
+    #[test]
+    fn peek_login_abort_down_parks() {
+        let (tx, rx) = unbounded::<ControlSignal>();
+        tx.send(ControlSignal::SetWantRunning(false)).unwrap();
+        let mut stop = || false;
+        assert!(matches!(
+            peek_login_abort(&rx, &mut stop),
+            Some(LoginAbort::Parked)
+        ));
+    }
+
+    #[test]
+    fn peek_login_abort_ignores_other_signals() {
+        // A login is already in progress — SetWantRunning(true),
+        // LoginInteractive, and ForceReconnect are consumed and ignored,
+        // leaving the wait to continue.
+        let (tx, rx) = unbounded::<ControlSignal>();
+        tx.send(ControlSignal::LoginInteractive).unwrap();
+        tx.send(ControlSignal::SetWantRunning(true)).unwrap();
+        tx.send(ControlSignal::ForceReconnect).unwrap();
+        let mut stop = || false;
+        assert!(peek_login_abort(&rx, &mut stop).is_none());
+    }
+
+    #[test]
+    fn peek_login_abort_empty_queue_keeps_waiting() {
+        let (_tx, rx) = unbounded::<ControlSignal>();
+        let mut stop = || false;
+        assert!(peek_login_abort(&rx, &mut stop).is_none());
     }
 
     #[test]

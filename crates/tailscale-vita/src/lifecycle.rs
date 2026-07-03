@@ -72,6 +72,15 @@ pub enum OnlineState {
     /// UI should prompt the user to investigate (could be a MITM, or
     /// could be a legitimate rotation requiring `server.pub` reset).
     SecurityFailed,
+    /// M19 parked state (`tailscale down` / `want_running = false`): the
+    /// daemon is alive but deliberately disconnected — the control
+    /// session is closed and WG peers are dropped. The login/node key is
+    /// untouched, so `/up` resumes without re-auth. Set/cleared
+    /// out-of-band by the event loop (`set_stopped`/`clear_stopped`);
+    /// `compute_next_state` short-circuits on it so `tick` can't drive
+    /// us back to Connecting/Offline. Non-sticky — only `clear_stopped`
+    /// (an `/up`) leaves it. Serializes as `"Stopped"`.
+    Stopped,
 }
 
 pub struct LifecycleTracker {
@@ -152,6 +161,28 @@ impl LifecycleTracker {
     pub fn clear_needs_login(&mut self) {
         if self.state == OnlineState::NeedsLogin {
             info!("lifecycle.needs_login.cleared");
+            self.state = OnlineState::Connecting;
+        }
+    }
+
+    /// M19: enter the parked `Stopped` state (`tailscale down` /
+    /// `want_running = false`). Driven out-of-band by the event loop;
+    /// like `set_needs_login` it bypasses `compute_next_state`, which now
+    /// short-circuits on `Stopped` so a later `tick` can't recompute us
+    /// back to Connecting/Offline. No-op if already Stopped.
+    pub fn set_stopped(&mut self) {
+        if self.state != OnlineState::Stopped {
+            info!("lifecycle.stopped");
+            self.state = OnlineState::Stopped;
+        }
+    }
+
+    /// M19: leave `Stopped` on `/up` (`want_running = true`), back to
+    /// `Connecting`. The normal bootstrap + map/DERP signals then drive
+    /// us to `Online`. No-op if we were never Stopped.
+    pub fn clear_stopped(&mut self) {
+        if self.state == OnlineState::Stopped {
+            info!("lifecycle.stopped.cleared");
             self.state = OnlineState::Connecting;
         }
     }
@@ -260,6 +291,13 @@ impl LifecycleTracker {
             self.state,
             OnlineState::AuthFailed | OnlineState::SecurityFailed
         ) {
+            return self.state;
+        }
+        // M19: a parked runtime (`want_running = false`) is held in
+        // Stopped out-of-band. Like the fatal states, short-circuit so no
+        // stray map/DERP event recomputes us out — only `clear_stopped`
+        // (an `/up`) leaves it.
+        if matches!(self.state, OnlineState::Stopped) {
             return self.state;
         }
         if self.consecutive_control_reconnects >= OFFLINE_RECONNECT_THRESHOLD
@@ -447,5 +485,42 @@ mod tests {
         lt.record_map_event(t(0));
         lt.tick(t(0), 0, 0);
         assert_eq!(lt.state(), OnlineState::SecurityFailed);
+    }
+
+    #[test]
+    fn stopped_park_and_clear() {
+        let mut lt = LifecycleTracker::new();
+        lt.set_stopped();
+        assert_eq!(lt.state(), OnlineState::Stopped);
+        lt.clear_stopped();
+        assert_eq!(lt.state(), OnlineState::Connecting);
+        // No-op when not Stopped.
+        lt.clear_stopped();
+        assert_eq!(lt.state(), OnlineState::Connecting);
+    }
+
+    #[test]
+    fn stopped_survives_tick_with_live_signals() {
+        // A parked runtime must not be driven back to Online by stray
+        // map/DERP events — `tick` short-circuits on Stopped. Only
+        // `clear_stopped` (an `/up`) leaves it.
+        let mut lt = LifecycleTracker::new();
+        lt.record_map_event(t(0));
+        lt.record_derp_rx(t(0));
+        lt.set_stopped();
+        lt.tick(t(1), 3, 2);
+        assert_eq!(lt.state(), OnlineState::Stopped);
+        // Even an Offline-shaped reconnect burst can't clobber it.
+        for _ in 0..5 {
+            lt.record_control_reconnect();
+        }
+        lt.tick(t(2), 3, 2);
+        assert_eq!(lt.state(), OnlineState::Stopped);
+    }
+
+    #[test]
+    fn stopped_serializes_as_stopped() {
+        let json = serde_json::to_string(&OnlineState::Stopped).unwrap();
+        assert_eq!(json, "\"Stopped\"");
     }
 }

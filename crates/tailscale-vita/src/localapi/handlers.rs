@@ -206,6 +206,88 @@ pub fn reconnect(ctx: &HandlerCtx) -> (u16, Vec<u8>) {
     }
 }
 
+/// `POST /localapi/v0/up` — resume the tailnet (`WantRunning = true`),
+/// driving the runtime out of `Stopped`. Zero-parameter; body ignored.
+pub fn up(ctx: &HandlerCtx) -> (u16, Vec<u8>) {
+    control_action(ctx, crate::runtime::ControlSignal::SetWantRunning(true))
+}
+
+/// `POST /localapi/v0/down` — park the tailnet (`WantRunning = false`):
+/// close the control session + drop WG peers, hold `Stopped`.
+/// Zero-parameter; body ignored.
+pub fn down(ctx: &HandlerCtx) -> (u16, Vec<u8>) {
+    control_action(ctx, crate::runtime::ControlSignal::SetWantRunning(false))
+}
+
+/// `POST /localapi/v0/logout` — expire the node key at control and park
+/// logged-out (`NeedsLogin`, no auto re-login). The node key is
+/// regenerated at the next login. Zero-parameter; body ignored.
+pub fn logout(ctx: &HandlerCtx) -> (u16, Vec<u8>) {
+    control_action(ctx, crate::runtime::ControlSignal::Logout)
+}
+
+/// `POST /localapi/v0/login-interactive` — start an interactive (QR)
+/// login now (post-logout screen or a manual re-authenticate).
+/// Zero-parameter; body ignored.
+pub fn login_interactive(ctx: &HandlerCtx) -> (u16, Vec<u8>) {
+    control_action(ctx, crate::runtime::ControlSignal::LoginInteractive)
+}
+
+/// Shared body for the M19 zero-parameter lifecycle POSTs (`/up`,
+/// `/down`, `/logout`, `/login-interactive`). Mirrors the `reconnect`
+/// template: refuse in fatal lifecycle states with 409, otherwise queue
+/// the signal (202 = accepted, watch /status) or report a dead loop
+/// (503). Body carries no parameters, so nothing to parse.
+fn control_action(
+    ctx: &HandlerCtx,
+    signal: crate::runtime::ControlSignal,
+) -> (u16, Vec<u8>) {
+    let snap = ctx.snapshot.read();
+    let state = snap.lifecycle;
+    let fatal_reason = snap.fatal_reason.clone();
+    drop(snap);
+    if matches!(
+        state,
+        crate::lifecycle::OnlineState::AuthFailed
+            | crate::lifecycle::OnlineState::SecurityFailed
+    ) {
+        #[derive(Serialize)]
+        struct Resp {
+            ok: bool,
+            error: String,
+        }
+        let body = Resp {
+            ok: false,
+            error: format!(
+                "runtime in fatal state ({state:?}); fix config + restart instead{}",
+                fatal_reason
+                    .as_ref()
+                    .map(|r| format!(": {r}"))
+                    .unwrap_or_default()
+            ),
+        };
+        return (
+            409,
+            serde_json::to_vec(&body)
+                .unwrap_or_else(|_| json_error("serialize failed")),
+        );
+    }
+    match ctx.controller.send(signal) {
+        Ok(()) => {
+            #[derive(Serialize)]
+            struct Resp {
+                ok: bool,
+            }
+            (
+                202,
+                serde_json::to_vec(&Resp { ok: true })
+                    .unwrap_or_else(|_| json_error("serialize failed")),
+            )
+        }
+        Err(_) => (503, json_error("control loop has shut down")),
+    }
+}
+
 fn hex_to_bytes(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 {
         return None;
@@ -267,6 +349,9 @@ mod tests {
                 has_tags: true,
             },
             our_key_expiry: Some("2027-01-15T00:00:00Z".into()),
+            tailnet_domain: Some("example.com".into()),
+            user_login: Some("dave@example.com".into()),
+            login_in_progress: false,
             peers: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -420,6 +505,67 @@ mod tests {
         assert_eq!(code, 202);
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn up_returns_202_in_normal_state() {
+        let (ctx, _, _rx) = synthetic_ctx();
+        let (code, body) = up(&ctx);
+        assert_eq!(code, 202);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn down_returns_202_in_normal_state() {
+        let (ctx, _, _rx) = synthetic_ctx();
+        let (code, body) = down(&ctx);
+        assert_eq!(code, 202);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn logout_returns_202_in_normal_state() {
+        let (ctx, _, _rx) = synthetic_ctx();
+        let (code, body) = logout(&ctx);
+        assert_eq!(code, 202);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn login_interactive_returns_202_in_normal_state() {
+        let (ctx, _, _rx) = synthetic_ctx();
+        let (code, body) = login_interactive(&ctx);
+        assert_eq!(code, 202);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn lifecycle_posts_refuse_409_in_fatal_state() {
+        let (ctx, snap, _rx) = synthetic_ctx();
+        snap.write().lifecycle = crate::lifecycle::OnlineState::AuthFailed;
+        snap.write().fatal_reason = Some("bad auth key".into());
+        for (code, body) in [up(&ctx), down(&ctx), logout(&ctx), login_interactive(&ctx)] {
+            assert_eq!(code, 409);
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v["ok"], false);
+            assert!(v["error"].as_str().unwrap().contains("bad auth key"));
+        }
+    }
+
+    #[test]
+    fn lifecycle_posts_return_503_when_loop_dead() {
+        // Dropping rx severs the signal channel; `send` then errors,
+        // proving these handlers use the generic `send` path (503).
+        let (ctx, _, rx) = synthetic_ctx();
+        drop(rx);
+        assert_eq!(up(&ctx).0, 503);
+        assert_eq!(down(&ctx).0, 503);
+        assert_eq!(logout(&ctx).0, 503);
+        assert_eq!(login_interactive(&ctx).0, 503);
     }
 
     #[test]

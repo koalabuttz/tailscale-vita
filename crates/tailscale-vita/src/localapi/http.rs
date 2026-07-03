@@ -197,11 +197,13 @@ fn find_crlfcrlf(b: &[u8]) -> Option<usize> {
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        202 => "Accepted",
         204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
+        409 => "Conflict",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
         503 => "Service Unavailable",

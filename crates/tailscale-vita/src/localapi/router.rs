@@ -56,6 +56,22 @@ pub fn dispatch(
             let (status, body) = handlers::reconnect(ctx);
             write_json_response(stream, status, &body)
         }
+        ("POST", "/localapi/v0/up") => {
+            let (status, body) = handlers::up(ctx);
+            write_json_response(stream, status, &body)
+        }
+        ("POST", "/localapi/v0/down") => {
+            let (status, body) = handlers::down(ctx);
+            write_json_response(stream, status, &body)
+        }
+        ("POST", "/localapi/v0/logout") => {
+            let (status, body) = handlers::logout(ctx);
+            write_json_response(stream, status, &body)
+        }
+        ("POST", "/localapi/v0/login-interactive") => {
+            let (status, body) = handlers::login_interactive(ctx);
+            write_json_response(stream, status, &body)
+        }
         ("GET", _) | ("POST", _) => write_error(stream, 404, "no such endpoint"),
         _ => write_error(stream, 405, "method not allowed"),
     };
