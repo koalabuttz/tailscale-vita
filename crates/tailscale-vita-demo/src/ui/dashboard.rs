@@ -15,7 +15,7 @@ use tailscale_vita::OnlineState;
 
 use super::client::{self, ActionState, Shared, UiAction};
 use super::render::{self, Renderer, VIEWPORT_ROWS};
-use super::viewmodel::{self, DashVm, SettingRow, Tab, Tone};
+use super::viewmodel::{self, DashVm, LoginMode, SettingRow, Tab, Tone};
 use super::{buttons, ffi};
 
 const REPEAT_FIRST: Duration = Duration::from_millis(250);
@@ -167,15 +167,23 @@ pub fn run(exit: &AtomicBool) {
 
         // ── Navigation / actions (overlay/full-screen captures input) ──
         if login_view {
-            // Logged-out parked (no URL, no login running) → ✕ starts a
-            // fresh interactive login. The QR / "starting login" modes are
-            // inert (approval happens on the phone).
             if let Some(s) = &snapshot {
-                if s.auth_url.is_none()
-                    && !s.login_in_progress
-                    && pressed & buttons::CROSS != 0
-                {
-                    send(UiAction::LoginInteractive);
+                match LoginMode::classify(s.auth_url.is_some(), s.login_in_progress) {
+                    // Logged-out parked → ✕ starts a fresh interactive login.
+                    LoginMode::LoggedOut => {
+                        if pressed & buttons::CROSS != 0 {
+                            send(UiAction::LoginInteractive);
+                        }
+                    }
+                    // QR / "starting login" → the phone owns approval, but ○
+                    // gives the user an exit from the full-screen login:
+                    // TailnetDown parks the tailnet (the runtime abort path
+                    // honors it) instead of forcing an app kill. (M19 finding 1)
+                    LoginMode::Starting | LoginMode::Qr => {
+                        if pressed & buttons::CIRCLE != 0 {
+                            send(UiAction::TailnetDown);
+                        }
+                    }
                 }
             }
         } else if matches!(modal, Modal::PeerDetail(_)) {
@@ -183,10 +191,15 @@ pub fn run(exit: &AtomicBool) {
                 modal = Modal::None;
             }
         } else if matches!(modal, Modal::ConfirmLogout) {
-            // ✕ confirms the logout; ○/△ cancel.
+            // ✕ confirms the logout; ○/△ cancel. Close on confirm ONLY when
+            // idle — send() drops the logout while another action is in flight
+            // (e.g. a 7 s reconnect), so keep the modal open rather than let
+            // the user believe they logged out. (M19 finding 3)
             if pressed & buttons::CROSS != 0 {
-                send(UiAction::Logout);
-                modal = Modal::None;
+                if viewmodel::confirm_dismisses(action_idle) {
+                    send(UiAction::Logout);
+                    modal = Modal::None;
+                }
             } else if pressed & (buttons::CIRCLE | buttons::TRIANGLE) != 0 {
                 modal = Modal::None;
             }

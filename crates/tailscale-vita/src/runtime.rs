@@ -11,9 +11,17 @@
 //! - `runtime.netstack()` — for binding TcpListeners.
 //! - `runtime.lifecycle()` — read current `OnlineState`.
 //! - `runtime.run_event_loop(should_stop)` — drives MapClient + DERP
-//!   plumbing + lifecycle. Returns when `should_stop` returns true OR
-//!   the tunnel dies.
+//!   plumbing + lifecycle. Returns `LoopExit::Stopped` when `should_stop`
+//!   fires, or `LoopExit::NeedsRelogin` when the node must be re-keyed
+//!   (reconnect-time NodeKeyExpired/deauth or `/login-interactive`).
 //! - `runtime.shutdown()` — drops in the right order.
+//!
+//! M19: embedding apps should drive the runtime through the free
+//! `run_supervised(config, should_stop, setup)` entry, which loops
+//! `up()` → `run_event_loop` and rebuilds the whole Runtime around a
+//! fresh node key on `NeedsRelogin` (there is no in-place WG/DERP re-key
+//! API — advertising a new pubkey while the data plane holds the old one
+//! silently kills all peer traffic).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
@@ -169,6 +177,23 @@ pub struct RunStats {
     pub final_alive_regions: usize,
 }
 
+/// M19 (Finding 1): how [`Runtime::run_event_loop`] terminated.
+///
+/// `Stopped` here means the supervisor should stop — `should_stop` fired
+/// (process shutdown / run-window deadline) — NOT the parked
+/// `OnlineState::Stopped`. `NeedsRelogin` means the node lost
+/// authorization (reconnect-time NodeKeyExpired/deauth) or a
+/// `/login-interactive` request arrived; the data plane was built around
+/// the boot-time node key with no in-place re-key API, so
+/// [`run_supervised`] must drop the whole Runtime and re-run `up()`.
+#[derive(Debug, Clone, Copy)]
+pub enum LoopExit {
+    /// `should_stop` returned true — normal termination.
+    Stopped(RunStats),
+    /// The runtime must be rebuilt from scratch around a fresh node key.
+    NeedsRelogin(RunStats),
+}
+
 impl Default for OnlineState {
     fn default() -> Self {
         OnlineState::Connecting
@@ -213,7 +238,18 @@ impl Runtime {
     /// Block until the v1 control plane is up: fetch server key, load
     /// keystore, complete Noise+HTTP/2 handshake, register, spin up
     /// engine + DerpTransport + Stack + MapClient.
-    pub fn up(config: Config) -> Result<Self, RuntimeError> {
+    ///
+    /// M19: `should_stop` is peeked during the interactive-login wait so a
+    /// `/down`, `/logout`, or process shutdown can abort an unapproved QR
+    /// login instead of blocking forever (returns a parked / logged-out
+    /// runtime). Embedding apps should prefer [`run_supervised`] over
+    /// calling `up` directly — the supervisor drops + re-runs `up` on a
+    /// mid-life re-login (there is no in-place WG/DERP re-key API, so the
+    /// whole Runtime must be rebuilt around the fresh node key).
+    pub fn up(
+        config: Config,
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> Result<Self, RuntimeError> {
         suprx_trace("up1: Runtime::up entry");
         let state_dir = PathBuf::from(&config.state_dir);
         let host_authority = config.host_authority();
@@ -283,14 +319,18 @@ impl Runtime {
 
         // M14: spawn LocalAPI server if configured. Bind failure is
         // non-fatal — the daemon keeps running without LocalAPI.
+        // M19 (Finding 1e): on a supervised re-up the previous
+        // LocalApiServer was dropped microseconds ago and its accept
+        // thread may still hold the loopback port (its shutdown poll +
+        // OS TIME_WAIT). Retry the bind for a few seconds so the rebind
+        // doesn't lose the race to EADDRINUSE.
         let localapi = match config.localapi_port {
-            Some(port) => crate::localapi::LocalApiServer::spawn(
+            Some(port) => spawn_localapi_with_retry(
                 port,
-                Arc::clone(&snapshot),
-                ControlHandle {
-                    tx: signal_tx.clone(),
-                },
-                magic_ctl.clone(),
+                &snapshot,
+                &signal_tx,
+                &magic_ctl,
+                should_stop,
             ),
             None => {
                 info!("localapi.disabled (config.localapi_port = None)");
@@ -320,10 +360,16 @@ impl Runtime {
         // login (and MapClient::start below) and publish Stopped, but
         // still build the full data plane so a later `/up` resumes via
         // the normal reconnect bootstrap.
-        let want_running = config.tailnet.want_running;
+        // M19: mutable so a `/down` peeked during an unapproved QR login
+        // (below) can flip us to parked and be reflected in `self.want_running`.
+        let mut want_running = config.tailnet.want_running;
         let conn = if want_running {
             suprx_trace("up5: pre interactive_login (fresh conn per attempt)");
-            let mut no_abort = || None::<LoginAbort>;
+            // M19 (Finding 1f): stop-aware abort. `interactive_login` peeks
+            // this each 2 s pass so a `/down` (park), `/logout` (parked
+            // logged-out), or shutdown breaks an otherwise-blocking QR wait
+            // and returns a runtime in the corresponding parked state.
+            let mut abort = || peek_login_abort(&signal_rx, should_stop);
             match interactive_login(
                 &config,
                 &mut ks,
@@ -332,26 +378,48 @@ impl Runtime {
                 &snapshot,
                 &lifecycle,
                 &backend_log_id,
-                &mut no_abort,
+                &mut abort,
             )? {
                 LoginOutcome::Authorized(conn) => {
                     suprx_trace("up7: REGISTERED + authorized");
                     info!("control.login.authorized");
                     Some(conn)
                 }
-                // Unreachable: `up()` passes a no-op abort that never
-                // fires. Defensive rather than `unwrap`.
-                LoginOutcome::Aborted(_) => {
-                    return Err(RuntimeError::Internal(
-                        "interactive login aborted during boot".into(),
-                    ));
+                LoginOutcome::Aborted(LoginAbort::Parked) => {
+                    // `/down` during the unapproved login → park (Stopped).
+                    suprx_trace("up7: login aborted (/down) -> parked");
+                    info!("runtime.up.login_aborted.parked");
+                    want_running = false;
+                    lifecycle.lock().set_stopped();
+                    publish_parked_state(&snapshot, &lifecycle, None, false, false);
+                    None
+                }
+                LoginOutcome::Aborted(LoginAbort::LoggedOut) => {
+                    // `/logout` during the unapproved login → parked
+                    // logged-out locally. The key being approved-away
+                    // mid-login is moot; no control call needed. `want_running`
+                    // stays true so the event loop idles in NeedsLogin
+                    // awaiting a later `/login-interactive`.
+                    suprx_trace("up7: login aborted (/logout) -> logged-out");
+                    info!("runtime.up.login_aborted.logged_out");
+                    lifecycle.lock().set_needs_login();
+                    publish_parked_state(&snapshot, &lifecycle, None, false, true);
+                    None
+                }
+                LoginOutcome::Aborted(LoginAbort::Shutdown) => {
+                    // Process is shutting down — return a parked runtime;
+                    // the event loop's first `should_stop` check exits it.
+                    suprx_trace("up7: login aborted (shutdown)");
+                    info!("runtime.up.login_aborted.shutdown");
+                    lifecycle.lock().set_stopped();
+                    None
                 }
             }
         } else {
             suprx_trace("park1: boot parked (want_running=false)");
             info!("runtime.up.parked (config.tailnet.want_running=false)");
             lifecycle.lock().set_stopped();
-            publish_login_state(&snapshot, &lifecycle, None, false);
+            publish_parked_state(&snapshot, &lifecycle, None, false, false);
             None
         };
 
@@ -510,10 +578,31 @@ impl Runtime {
         self.derp_ctl.alive_regions()
     }
 
+    /// Build a `RunStats` snapshot from the live counters + tracker.
+    /// Used at each event-loop exit point (M19 added several).
+    fn make_run_stats(&self, snapshots: u32, keepalives: u32, control_errors: u32) -> RunStats {
+        RunStats {
+            snapshots,
+            keepalives,
+            control_errors,
+            final_lifecycle: self.lifecycle.lock().state(),
+            final_peer_count: self.engine.peer_count(),
+            final_alive_regions: self.derp_ctl.alive_regions().len(),
+        }
+    }
+
     /// Drive the MapClient + DERP plumbing + lifecycle until
     /// `should_stop` returns true. Each iteration polls one `MapEvent`
     /// with a 2 s timeout.
-    pub fn run_event_loop<F>(&mut self, mut should_stop: F) -> Result<RunStats, RuntimeError>
+    ///
+    /// M19 (Finding 1): returns [`LoopExit::NeedsRelogin`] instead of
+    /// re-keying in place when the node loses authorization
+    /// (reconnect-time NodeKeyExpired/deauth) or a `/login-interactive`
+    /// signal arrives — the WG engine / DERP / magicsock were built once
+    /// around the boot-time node key and have no re-key API, so
+    /// [`run_supervised`] drops the whole Runtime and re-runs `up()`.
+    /// A `should_stop` exit yields [`LoopExit::Stopped`].
+    pub fn run_event_loop<F>(&mut self, mut should_stop: F) -> Result<LoopExit, RuntimeError>
     where
         F: FnMut() -> bool,
     {
@@ -636,8 +725,23 @@ impl Runtime {
                             self.want_running = false;
                             map_opt = None;
                             clear_engine_peers(&self.engine, &mut peer_regions);
+                            // M19 (Finding 2): wipe the persisted map-session
+                            // state so the next `/up` forces a FULL netmap
+                            // download. Resuming as a delta after the engine
+                            // was emptied here would never repopulate peers.
+                            delete_session_state(&self.state_dir);
+                            reconnect_attempt = 0;
                             self.lifecycle.lock().set_stopped();
-                            publish_login_state(&self.snapshot, &self.lifecycle, None, false);
+                            // M19 (Finding 4): publish a fresh, cleared
+                            // snapshot (no stale peers/addrs) so the dashboard
+                            // reflects Stopped honestly.
+                            publish_parked_state(
+                                &self.snapshot,
+                                &self.lifecycle,
+                                None,
+                                false,
+                                false,
+                            );
                         }
                     }
                     Ok(ControlSignal::Logout) => {
@@ -672,22 +776,33 @@ impl Runtime {
                 }
             }
 
-            // M19 parked (`want_running = false`). Hold Stopped and don't
-            // touch the control/data plane; only signal draining (above)
-            // keeps `/up` responsive. A short cooperative sleep paces the
-            // loop (no `next_event` to block on while parked).
-            if !want_running {
-                logout_requested = false;
+            // M19 (Finding 1b): a `/login-interactive` request re-keys the
+            // whole runtime via the supervisor. The WG engine / DERP /
+            // magicsock were built around the boot-time node key with no
+            // in-place re-key API, so exit with `NeedsRelogin` and let
+            // `run_supervised` drop this Runtime and re-run `up()` (which
+            // runs `interactive_login` pre-engine, publishing the QR, and
+            // rebuilds everything around the fresh key). Only meaningful
+            // while running; while parked the handler layer 409-gates it,
+            // so drop it defensively rather than leak the flag into a resume.
+            if login_interactive_requested {
                 login_interactive_requested = false;
-                self.lifecycle.lock().set_stopped();
-                if cooperative_sleep(Duration::from_secs(2), &mut should_stop) {
-                    break;
+                if want_running {
+                    info!("control.login_interactive.relogin");
+                    suprx_trace("relogin: login-interactive -> supervised re-up");
+                    return Ok(LoopExit::NeedsRelogin(self.make_run_stats(
+                        snapshots,
+                        keepalives,
+                        control_errors,
+                    )));
                 }
-                continue;
             }
 
-            // M19 `/logout` — expire the node key at control on a fresh
-            // conn, then park logged-out (NeedsLogin, no auto re-login).
+            // M19 `/logout` (Finding 3a) — honored whether running OR
+            // parked: `perform_logout` opens its own fresh conn. Afterwards
+            // we sit logged-out (NeedsLogin) awaiting `/login-interactive`,
+            // so flip `want_running` on so the parked branch below can't
+            // clobber NeedsLogin back to Stopped.
             if logout_requested {
                 logout_requested = false;
                 perform_logout(
@@ -701,16 +816,34 @@ impl Runtime {
                     &mut peer_regions,
                     &mut map_opt,
                 );
+                want_running = true;
+                self.want_running = true;
+                reconnect_attempt = 0;
                 // Whether logout succeeded (→ NeedsLogin, map_opt None) or
                 // failed (→ prior state kept), re-enter the loop rather
                 // than fall through to next_event on a maybe-None map.
                 continue;
             }
 
-            // M13 reconnect: sessionless + running + not logged-out + not
-            // already escalating → sleep with backoff + attempt bootstrap.
+            // M19 parked (`want_running = false`). Hold Stopped and don't
+            // touch the control/data plane; only signal draining (above)
+            // keeps `/up` responsive. A short cooperative sleep paces the
+            // loop (no `next_event` to block on while parked). Finding 4:
+            // republish a fresh, cleared snapshot each pass so the dashboard
+            // stops flagging the frozen snapshot as stale.
+            if !want_running {
+                login_interactive_requested = false;
+                self.lifecycle.lock().set_stopped();
+                publish_parked_state(&self.snapshot, &self.lifecycle, None, false, false);
+                if cooperative_sleep(Duration::from_secs(2), &mut should_stop) {
+                    break;
+                }
+                continue;
+            }
+
+            // M13 reconnect: sessionless + running + not logged-out → sleep
+            // with backoff + attempt bootstrap.
             if map_opt.is_none()
-                && !login_interactive_requested
                 && self.lifecycle.lock().state() != OnlineState::NeedsLogin
             {
                 let delay = reconnect_backoff(reconnect_attempt);
@@ -753,14 +886,23 @@ impl Runtime {
                         acl_warned = false;
                     }
                     Ok(BootstrapOutcome::NeedsInteractiveLogin) => {
-                        // M19: the persisted node key lost authorization
-                        // while we were disconnected (expired/deauthed).
-                        // Escalate to interactive login (closes the M18
-                        // reconnect deferral). Handled just below so the
-                        // signal-driven and reconnect-driven paths share
-                        // one implementation.
-                        info!("control.reconnect.escalate_interactive_login");
-                        login_interactive_requested = true;
+                        // M19 (Finding 1b): the persisted node key lost
+                        // authorization while we were disconnected
+                        // (expired/deauthed). Re-key via the supervisor —
+                        // exit with `NeedsRelogin` so `run_supervised` drops
+                        // this Runtime and re-runs `up()`, whose
+                        // `interactive_login` publishes the QR and rebuilds
+                        // the data plane around the fresh node key (closes
+                        // the M18 reconnect deferral). The supervisor applies
+                        // a backoff before re-up so a flapping control plane
+                        // can't hammer register (Finding 5).
+                        info!("control.reconnect.relogin");
+                        suprx_trace("relogin: reconnect deauth -> supervised re-up");
+                        return Ok(LoopExit::NeedsRelogin(self.make_run_stats(
+                            snapshots,
+                            keepalives,
+                            control_errors,
+                        )));
                     }
                     Err(e) => {
                         // Same fatal-vs-transient triage as the
@@ -805,99 +947,14 @@ impl Runtime {
                 }
             }
 
-            // M19 mid-life interactive login — the `/login-interactive`
-            // signal, the post-logout ✕ screen, or a reconnect escalation
-            // above. Runs the stop-aware login loop, then opens the
-            // session via `finish_session` (same tail as first boot).
-            if login_interactive_requested {
-                login_interactive_requested = false;
-                let session_blid = generate_backend_log_id();
-                info!(backend_log_id = %session_blid, "control.backend_log_id.generated");
-                let magic_local = self.magic_ctl.local_addr();
-                let local_eps = build_local_endpoints(&self.config.control_url, magic_local);
-                let local_ep_types: Vec<u8> = vec![1u8; local_eps.len()];
-                let mut abort = || peek_login_abort(&signal_rx, &mut should_stop);
-                match interactive_login(
-                    &self.config,
-                    &mut self.ks,
-                    &self.host_authority,
-                    &self.state_dir,
-                    &self.snapshot,
-                    &self.lifecycle,
-                    &session_blid,
-                    &mut abort,
-                ) {
-                    Ok(LoginOutcome::Authorized(conn)) => {
-                        match finish_session(
-                            conn,
-                            &self.ks,
-                            &self.config,
-                            &self.host_authority,
-                            &self.state_dir,
-                            local_eps,
-                            local_ep_types,
-                            session_blid,
-                        ) {
-                            Ok(m) => {
-                                info!("control.login_interactive.session_up");
-                                map_opt = Some(m);
-                                reconnect_attempt = 0;
-                                sent_netinfo_once = false;
-                                acl_warned = false;
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "control.login_interactive.finish_session.failed");
-                            }
-                        }
-                    }
-                    Ok(LoginOutcome::Aborted(LoginAbort::Parked)) => {
-                        // A `/down` arrived mid-login — park (mirror the
-                        // SetWantRunning(false) transition).
-                        info!("control.login_interactive.aborted.parked");
-                        want_running = false;
-                        self.want_running = false;
-                        map_opt = None;
-                        clear_engine_peers(&self.engine, &mut peer_regions);
-                        self.lifecycle.lock().set_stopped();
-                        publish_login_state(&self.snapshot, &self.lifecycle, None, false);
-                    }
-                    Ok(LoginOutcome::Aborted(LoginAbort::Shutdown)) => {
-                        // should_stop fired; the while guard exits next check.
-                        info!("control.login_interactive.aborted.shutdown");
-                    }
-                    Err(e) => {
-                        let class = classify_control_error(&e);
-                        match class {
-                            ErrorClass::AuthFatal => {
-                                warn!(error = %e, "control.login_interactive.auth_fatal");
-                                self.lifecycle
-                                    .lock()
-                                    .mark_fatal(FatalKind::Auth, e.to_string());
-                                publish_fatal_state(&self.snapshot, &self.lifecycle);
-                                return Err(RuntimeError::Control(e));
-                            }
-                            ErrorClass::SecurityFatal => {
-                                warn!(error = %e, "control.login_interactive.security_fatal");
-                                self.lifecycle
-                                    .lock()
-                                    .mark_fatal(FatalKind::Security, e.to_string());
-                                publish_fatal_state(&self.snapshot, &self.lifecycle);
-                                return Err(RuntimeError::Control(e));
-                            }
-                            ErrorClass::Transient => {
-                                warn!(error = %e, "control.login_interactive.failed");
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // M19 sessionless but not parked (e.g. logged out awaiting
+            // M19 sessionless but not parked (logged out awaiting
             // `/login-interactive`). Idle without spinning — and crucially
             // WITHOUT ticking: a tick would recompute the stale tracker
-            // out of NeedsLogin.
+            // out of NeedsLogin. Finding 4: republish a fresh, identity-
+            // cleared snapshot each pass so the logged-out screen doesn't
+            // show a growing STALE warning or the previous user's identity.
             if map_opt.is_none() {
+                publish_parked_state(&self.snapshot, &self.lifecycle, None, false, true);
                 if cooperative_sleep(Duration::from_secs(2), &mut should_stop) {
                     break;
                 }
@@ -1219,14 +1276,11 @@ impl Runtime {
         // Map drops here — terminating the long-poll cleanly.
         drop(map_opt);
 
-        Ok(RunStats {
+        Ok(LoopExit::Stopped(self.make_run_stats(
             snapshots,
             keepalives,
             control_errors,
-            final_lifecycle: self.lifecycle.lock().state(),
-            final_peer_count: self.engine.peer_count(),
-            final_alive_regions: self.derp_ctl.alive_regions().len(),
-        })
+        )))
     }
 
     /// Graceful teardown. Closes DERP conns, drops the netstack
@@ -1253,6 +1307,122 @@ impl Drop for Runtime {
         self.map = None;
         let _ = self.stack.take();
     }
+}
+
+/// M19 (Finding 1): supervised restart loop — the recommended entry for
+/// embedding apps. Runs [`Runtime::up`] → [`Runtime::run_event_loop`] in a
+/// loop. On [`LoopExit::NeedsRelogin`] (reconnect-time NodeKeyExpired/deauth
+/// or a `/login-interactive` request) it drops the ENTIRE Runtime and
+/// re-runs `up()` — which re-keys the WG engine / DERP / magicsock around a
+/// fresh node key in the proven boot order (there is no in-place re-key
+/// API, and advertising a new pubkey at control while the data plane holds
+/// the old one silently kills all peer traffic). On [`LoopExit::Stopped`]
+/// (process shutdown) it returns.
+///
+/// `setup` is invoked with `&Runtime` after each successful `up()` so the
+/// caller can bind its inbound listener + start its accept loop on the
+/// fresh netstack; the returned `Session` guard is dropped before the
+/// Runtime is torn down (its `Drop` should stop the accept loop). A fresh
+/// `Session` is created against the new netstack on each relogin.
+///
+/// Finding 5: consecutive relogin cycles that never reach an authorized
+/// (snapshot-producing) session back off along the `reconnect_backoff`
+/// curve, so a flapping control plane can't hammer register at zero delay.
+pub fn run_supervised<Stop, Setup, Session>(
+    config: Config,
+    mut should_stop: Stop,
+    mut setup: Setup,
+) -> Result<RunStats, RuntimeError>
+where
+    Stop: FnMut() -> bool,
+    Setup: FnMut(&Runtime) -> Session,
+{
+    let mut relogin_streak: u32 = 0;
+    loop {
+        // Finding 5: back off between consecutive un-authorized relogin
+        // cycles (streak == 0 on the first boot ⇒ immediate).
+        if relogin_streak > 0 {
+            let delay = reconnect_backoff(relogin_streak);
+            info!(
+                delay_secs = delay.as_secs(),
+                streak = relogin_streak,
+                "supervisor.relogin.backoff"
+            );
+            if cooperative_sleep(delay, &mut should_stop) {
+                return Ok(RunStats::default());
+            }
+        }
+        if should_stop() {
+            return Ok(RunStats::default());
+        }
+
+        suprx_trace("sup1: supervisor up()");
+        let mut runtime = Runtime::up(config.clone(), &mut should_stop)?;
+        let session = setup(&runtime);
+        let exit = runtime.run_event_loop(&mut should_stop)?;
+        // Drop the caller's listener/accept loop BEFORE tearing the Runtime
+        // (netstack) down, then shut the runtime down explicitly.
+        drop(session);
+        runtime.shutdown();
+
+        match exit {
+            LoopExit::Stopped(stats) => {
+                suprx_trace("sup2: supervisor stopped");
+                return Ok(stats);
+            }
+            LoopExit::NeedsRelogin(stats) => {
+                // A cycle that reached an authorized session (produced
+                // snapshots) resets the streak to its minimum non-zero
+                // value; one that never authorized escalates it so a
+                // flapping control plane backs off harder each round.
+                relogin_streak = if stats.snapshots > 0 {
+                    1
+                } else {
+                    relogin_streak.saturating_add(1)
+                };
+                info!(?stats, streak = relogin_streak, "supervisor.relogin");
+                suprx_trace("sup3: supervisor relogin -> re-up");
+            }
+        }
+    }
+}
+
+/// M19 (Finding 1e): spawn the LocalAPI server, retrying the loopback bind
+/// for a few seconds. On a supervised re-up the previous `LocalApiServer`
+/// was dropped moments ago; its accept thread + the OS may still hold the
+/// port briefly (shutdown poll + TIME_WAIT), so a single attempt can lose
+/// the race to `EADDRINUSE`. Bind failure after all retries is non-fatal —
+/// the daemon runs without LocalAPI.
+fn spawn_localapi_with_retry(
+    port: u16,
+    snapshot: &Arc<RwLock<RuntimeSnapshot>>,
+    signal_tx: &Sender<ControlSignal>,
+    magic_ctl: &MagicSocketCtl,
+    should_stop: &mut dyn FnMut() -> bool,
+) -> Option<crate::localapi::LocalApiServer> {
+    const RETRIES: u32 = 10;
+    for attempt in 0..RETRIES {
+        if let Some(server) = crate::localapi::LocalApiServer::spawn(
+            port,
+            Arc::clone(snapshot),
+            ControlHandle {
+                tx: signal_tx.clone(),
+            },
+            magic_ctl.clone(),
+        ) {
+            return Some(server);
+        }
+        if should_stop() {
+            break;
+        }
+        warn!(
+            port,
+            attempt,
+            "localapi.bind.retry (port busy from a prior runtime?)"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    None
 }
 
 /// Run STUN-based netcheck against every region in the netmap's
@@ -1705,7 +1875,19 @@ fn delete_session_state(state_dir: &Path) {
         match vita_fs::remove_file(&path) {
             Ok(()) => info!(file = name, "control.logout.session_state.deleted"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!(file = name, error = %e, "control.logout.session_state.delete_failed"),
+            Err(e) => {
+                // M19 (Finding 6): a failed delete would silently leak the
+                // old session into the next identity (resumed as a delta,
+                // never repopulating the wiped engine). Overwrite with a
+                // COLD value instead so the next `MapClient::start` begins a
+                // FULL download regardless: an empty `last_seq` file reads
+                // back as seq 0 and an empty `session_handle` as "no session
+                // to resume" in `load_session_state`. Keep the warn.
+                warn!(file = name, error = %e, "control.logout.session_state.delete_failed; forcing cold");
+                if let Err(e2) = vita_fs::write(&path, &[]) {
+                    warn!(file = name, error = %e2, "control.logout.session_state.cold_write_failed");
+                }
+            }
         }
     }
 }
@@ -1756,8 +1938,10 @@ fn perform_logout(
             delete_session_state(state_dir);
             lifecycle.lock().set_needs_login();
             // NeedsLogin + auth_url None + login_in_progress false =
-            // the "logged out — press ✕ to log in" screen.
-            publish_login_state(snapshot, lifecycle, None, false);
+            // the "logged out — press ✕ to log in" screen. Finding 4:
+            // clear peers/addrs AND the previous user's identity so the
+            // logged-out screen doesn't show stale who-am-I.
+            publish_parked_state(snapshot, lifecycle, None, false, true);
         }
         Err(e) => {
             warn!(error = %e, "control.logout.failed; staying in prior state");
@@ -1767,13 +1951,14 @@ fn perform_logout(
 }
 
 /// M19: peek pending control signals during a blocking interactive
-/// login. A `/down` (`SetWantRunning(false)`) or a shutdown
+/// login (the QR wait inside `Runtime::up`). A `/down`
+/// (`SetWantRunning(false)`), a `/logout`, or a shutdown
 /// (`should_stop`) aborts the login; other signals are consumed and
 /// ignored (we're already logging in). Returns the abort reason, or
 /// `None` to keep waiting. Used as the `interactive_login` `abort`
-/// closure from the event loop (recon risk: pre-M19 only process death
-/// interrupted an unapproved login).
-fn peek_login_abort<F: FnMut() -> bool>(
+/// closure (recon risk: pre-M19 only process death interrupted an
+/// unapproved login).
+fn peek_login_abort<F: FnMut() -> bool + ?Sized>(
     signal_rx: &Receiver<ControlSignal>,
     should_stop: &mut F,
 ) -> Option<LoginAbort> {
@@ -1783,6 +1968,7 @@ fn peek_login_abort<F: FnMut() -> bool>(
     loop {
         match signal_rx.try_recv() {
             Ok(ControlSignal::SetWantRunning(false)) => return Some(LoginAbort::Parked),
+            Ok(ControlSignal::Logout) => return Some(LoginAbort::LoggedOut),
             Ok(_) => continue,
             Err(_) => return None,
         }
@@ -1886,8 +2072,11 @@ enum LoginOutcome {
 /// `LoginOutcome::Aborted` so the event loop can react (park vs. exit).
 #[derive(Debug, Clone, Copy)]
 enum LoginAbort {
-    /// A `/down` (`SetWantRunning(false)`) arrived — park instead.
+    /// A `/down` (`SetWantRunning(false)`) arrived — park (Stopped) instead.
     Parked,
+    /// A `/logout` arrived — park logged-out (NeedsLogin) locally. The key
+    /// being approved-away mid-login is moot, so no control call is needed.
+    LoggedOut,
     /// The runtime is shutting down (`should_stop` fired).
     Shutdown,
 }
@@ -2072,6 +2261,40 @@ fn publish_login_state(
     w.lifecycle = state;
     w.auth_url = auth_url;
     w.login_in_progress = login_in_progress;
+    w.updated_at_unix = now_unix();
+}
+
+/// M19 (Finding 4): publish a fresh, honest snapshot for the parked
+/// (`Stopped`) or logged-out (`NeedsLogin`) states. The WG engine has been
+/// wiped in these transitions, so the last-Online `peers` / `peer_count` /
+/// `our_addrs` / direct-path fields are stale — clear them. `logged_out`
+/// additionally clears the identity fields (`user_login` / `tailnet_domain`
+/// / `our_key_expiry`) since the session that populated them is gone.
+/// Always bumps `updated_at_unix` so the dashboard's ever-growing STALE
+/// warning doesn't fire while parked (the event loop calls this on each
+/// 2 s parked/logged-out pass as well as on the transitions).
+fn publish_parked_state(
+    out: &Arc<RwLock<RuntimeSnapshot>>,
+    lifecycle: &Mutex<LifecycleTracker>,
+    auth_url: Option<String>,
+    login_in_progress: bool,
+    logged_out: bool,
+) {
+    let state = lifecycle.lock().state();
+    let mut w = out.write();
+    w.lifecycle = state;
+    w.auth_url = auth_url;
+    w.login_in_progress = login_in_progress;
+    w.peers.clear();
+    w.peer_count = 0;
+    w.our_addrs.clear();
+    w.public_endpoint = None;
+    w.alive_derp_regions.clear();
+    if logged_out {
+        w.user_login = None;
+        w.tailnet_domain = None;
+        w.our_key_expiry = None;
+    }
     w.updated_at_unix = now_unix();
 }
 
@@ -2513,6 +2736,19 @@ mod tests {
     }
 
     #[test]
+    fn peek_login_abort_logout_logs_out() {
+        // M19 (Finding 1f): a /logout during an unapproved QR login aborts
+        // to parked-logged-out locally (no control call).
+        let (tx, rx) = unbounded::<ControlSignal>();
+        tx.send(ControlSignal::Logout).unwrap();
+        let mut stop = || false;
+        assert!(matches!(
+            peek_login_abort(&rx, &mut stop),
+            Some(LoginAbort::LoggedOut)
+        ));
+    }
+
+    #[test]
     fn peek_login_abort_ignores_other_signals() {
         // A login is already in progress — SetWantRunning(true),
         // LoginInteractive, and ForceReconnect are consumed and ignored,
@@ -2523,6 +2759,83 @@ mod tests {
         tx.send(ControlSignal::ForceReconnect).unwrap();
         let mut stop = || false;
         assert!(peek_login_abort(&rx, &mut stop).is_none());
+    }
+
+    #[test]
+    fn loop_exit_variants_carry_stats() {
+        // M19 (Finding 1): the event loop's two distinguishable outcomes.
+        let stats = RunStats {
+            snapshots: 7,
+            ..RunStats::default()
+        };
+        assert!(matches!(LoopExit::Stopped(stats), LoopExit::Stopped(s) if s.snapshots == 7));
+        assert!(matches!(
+            LoopExit::NeedsRelogin(stats),
+            LoopExit::NeedsRelogin(s) if s.snapshots == 7
+        ));
+    }
+
+    #[test]
+    fn publish_parked_state_clears_and_freshens() {
+        use crate::snapshot::{AllowedIpView, PeerView, RuntimeSnapshot};
+        let mut snap =
+            RuntimeSnapshot::empty("vita".into(), "0.0.0.0:41641".parse().unwrap());
+        snap.updated_at_unix = 0;
+        snap.peer_count = 3;
+        snap.public_endpoint = Some("66.31.113.175:41641".parse().unwrap());
+        snap.alive_derp_regions = vec![12];
+        snap.our_addrs = vec![AllowedIpView {
+            addr: "100.64.0.1".parse().unwrap(),
+            prefix: 32,
+        }];
+        snap.peers.insert(
+            "ab".repeat(32),
+            PeerView {
+                node_key_hex: "ab".repeat(32),
+                node_id: 1,
+                name: "phone".into(),
+                online: true,
+                tailscale_ip: None,
+                allowed_ips: vec![],
+                home_derp: 0,
+                endpoints: vec![],
+                direct_path_alive: false,
+                direct_path_endpoint: None,
+                direct_path_rtt_ms: None,
+                last_seen: None,
+                key_expiry: None,
+            },
+        );
+        snap.user_login = Some("dave@example.com".into());
+        snap.tailnet_domain = Some("example.com".into());
+        snap.our_key_expiry = Some("2027-01-15T00:00:00Z".into());
+        let out = Arc::new(RwLock::new(snap));
+        let lifecycle = Mutex::new(LifecycleTracker::new());
+        lifecycle.lock().set_stopped();
+
+        // Parked (not logged out): peers/addrs cleared + freshened, but the
+        // identity card is preserved (still our node, just paused).
+        publish_parked_state(&out, &lifecycle, None, false, false);
+        {
+            let r = out.read();
+            assert_eq!(r.lifecycle, OnlineState::Stopped);
+            assert_eq!(r.peer_count, 0);
+            assert!(r.peers.is_empty());
+            assert!(r.our_addrs.is_empty());
+            assert!(r.public_endpoint.is_none());
+            assert!(r.alive_derp_regions.is_empty());
+            assert!(r.updated_at_unix > 0);
+            assert_eq!(r.user_login.as_deref(), Some("dave@example.com"));
+        }
+
+        // Logged out: additionally clears the previous user's identity.
+        publish_parked_state(&out, &lifecycle, None, false, true);
+        {
+            let r = out.read();
+            assert_eq!(r.user_login, None);
+            assert_eq!(r.tailnet_domain, None);
+            assert_eq!(r.our_key_expiry, None);
+        }
     }
 
     #[test]

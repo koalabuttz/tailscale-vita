@@ -28,6 +28,14 @@ const HOSTINFO_OS: &str = "linux";
 const HOSTINFO_OS_VERSION: &str = "vita-3.74";
 const REGISTER_VERSION: u32 = crate::CAPVER as u32;
 
+/// Logout's `Expiry`: a fixed, unambiguously-past RFC3339 instant equal to
+/// Unix time 123 (`1970-01-01T00:02:03Z`). Deliberately NOT the Vita wall
+/// clock — the RTC is frequently wrong (dead battery, local-time-as-UTC); a
+/// fast clock would yield a *future* Expiry that control refuses to expire,
+/// turning logout into a silent no-op. A constant past instant is
+/// clock-skew-proof, matching upstream's `time.Unix(123, 0)`.
+const LOGOUT_EXPIRY: &str = "1970-01-01T00:02:03Z";
+
 #[derive(Debug, Clone)]
 pub struct RegistrationOutcome {
     pub machine_authorized: bool,
@@ -97,10 +105,11 @@ pub fn register(
 }
 
 /// Log out: expire the current node key at control. This is a
-/// `RegisterRequest` with `Expiry` = now and `NodeKey` = the **current**
-/// node key (no separate RPC) — "if expiry is in the past and node_key is
-/// the current node key for this node, the node key is expired immediately"
-/// (upstream). The node then shows *expired* in the admin console; it is
+/// `RegisterRequest` with `Expiry` = a fixed, unambiguously-past instant
+/// (`LOGOUT_EXPIRY`, Unix 123) and `NodeKey` = the **current** node key (no
+/// separate RPC) — "if expiry is in the past and node_key is the current
+/// node key for this node, the node key is expired immediately" (upstream).
+/// The node then shows *expired* in the admin console; it is
 /// deleted only if it were ephemeral, which M19 turned off. No `Auth`, no
 /// `Followup`. Success = the server returned no `Error`; a
 /// `NodeKeyExpired=true` reply **is** the confirmation, not a failure.
@@ -124,8 +133,9 @@ pub fn logout(
         backend_log_id,
         hostname,
         None,
-        // Expiry=now on the current node key = the logout signal.
-        Some(now_rfc3339()?),
+        // Fixed, unambiguously-past Expiry (not the skew-prone wall clock)
+        // on the current node key = the logout signal. See LOGOUT_EXPIRY.
+        Some(LOGOUT_EXPIRY.to_string()),
     )?;
 
     let body = serde_json::to_vec(&req)?;
@@ -299,6 +309,13 @@ fn interpret_logout_response(parsed: RegisterResponseWire) -> Result<(), Control
             parsed.error
         )));
     }
+    if !parsed.node_key_expired {
+        // Error-free reply but the key was NOT reported expired: control did
+        // not honour our Expiry (the whole point of logout). We still return
+        // Ok (there is no server Error to fail on), but flag it so an
+        // otherwise-silent no-op logout is visible in the log.
+        warn!("control.logout.not_expired (no server Error but NodeKeyExpired=false)");
+    }
     info!(
         node_key_expired = parsed.node_key_expired,
         "control.logout.ok"
@@ -322,8 +339,8 @@ struct RegisterRequestWire {
     hostinfo: HostinfoWire,
     #[serde(rename = "Timestamp")]
     timestamp: String,
-    /// RFC3339, present only on logout (`Expiry=now` expires the current
-    /// node key). Register omits it (`None`), so the wire body is unchanged.
+    /// RFC3339, present only on logout (a fixed past `Expiry` expires the
+    /// current node key). Register omits it (`None`), so the body is unchanged.
     #[serde(rename = "Expiry", skip_serializing_if = "Option::is_none")]
     expiry: Option<String>,
     #[serde(rename = "Ephemeral", skip_serializing_if = "std::ops::Not::not")]
@@ -549,8 +566,10 @@ mod tests {
 
     #[test]
     fn logout_body_shape() {
-        // Logout builds the register body with Auth=None, Followup=None and
-        // Expiry=now on the current node key.
+        // Logout builds the register body with Auth=None, Followup=None and a
+        // fixed, unambiguously-past Expiry (LOGOUT_EXPIRY, Unix 123) on the
+        // current node key — a constant, not the wall clock, so a skewed Vita
+        // RTC cannot make logout a silent no-op.
         let node_pub = NodePublic([0x11u8; 32]);
         let nl_pub = NLPublic([0x33u8; 32]);
         let req = build_request(
@@ -560,21 +579,20 @@ mod tests {
             "test-blog-id",
             "vita",
             None,
-            Some(now_rfc3339().unwrap()),
+            Some(LOGOUT_EXPIRY.to_string()),
         )
         .unwrap();
         let v: serde_json::Value = serde_json::to_value(&req).unwrap();
 
-        // Expiry present and RFC3339-parseable.
+        // Expiry present, pinned to the fixed past constant, and RFC3339 == Unix 123.
         let expiry = v["Expiry"].as_str().expect("Expiry must be present");
-        assert!(
-            time::OffsetDateTime::parse(
-                expiry,
-                &time::format_description::well_known::Rfc3339
-            )
-            .is_ok(),
-            "Expiry must be RFC3339-parseable, got {expiry:?}"
-        );
+        assert_eq!(expiry, "1970-01-01T00:02:03Z");
+        let parsed = time::OffsetDateTime::parse(
+            expiry,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("Expiry must be RFC3339-parseable");
+        assert_eq!(parsed.unix_timestamp(), 123, "Expiry must be Unix 123");
         // No Auth, no Followup on a logout.
         assert!(v.get("Auth").is_none(), "logout must not send Auth");
         assert!(v.get("Followup").is_none(), "logout must not send Followup");

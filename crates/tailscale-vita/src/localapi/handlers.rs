@@ -190,6 +190,24 @@ pub fn reconnect(ctx: &HandlerCtx) -> (u16, Vec<u8>) {
                 .unwrap_or_else(|_| json_error("serialize failed")),
         );
     }
+    // M19 (Finding 3b): reconnect makes no sense while parked (Stopped) —
+    // there is no session to kick. Refuse with 409; the user should
+    // toggle the tailnet on first.
+    if matches!(state, crate::lifecycle::OnlineState::Stopped) {
+        #[derive(Serialize)]
+        struct Resp {
+            ok: bool,
+            error: String,
+        }
+        return (
+            409,
+            serde_json::to_vec(&Resp {
+                ok: false,
+                error: "tailnet is stopped - toggle it on first".into(),
+            })
+            .unwrap_or_else(|_| json_error("serialize failed")),
+        );
+    }
     match ctx.controller.force_reconnect() {
         Ok(()) => {
             #[derive(Serialize)]
@@ -270,6 +288,28 @@ fn control_action(
             409,
             serde_json::to_vec(&body)
                 .unwrap_or_else(|_| json_error("serialize failed")),
+        );
+    }
+    // M19 (Finding 3b): `/login-interactive` makes no sense while the
+    // tailnet is parked (Stopped) — the event loop would drop it, and the
+    // eboot would print a bogus success footer. Refuse with 409 so the UI
+    // tells the user to toggle the tailnet on first. `/up`, `/down`, and
+    // `/logout` stay allowed while Stopped.
+    if matches!(state, crate::lifecycle::OnlineState::Stopped)
+        && matches!(signal, crate::runtime::ControlSignal::LoginInteractive)
+    {
+        #[derive(Serialize)]
+        struct Resp {
+            ok: bool,
+            error: String,
+        }
+        return (
+            409,
+            serde_json::to_vec(&Resp {
+                ok: false,
+                error: "tailnet is stopped - toggle it on first".into(),
+            })
+            .unwrap_or_else(|_| json_error("serialize failed")),
         );
     }
     match ctx.controller.send(signal) {
@@ -566,6 +606,43 @@ mod tests {
         assert_eq!(down(&ctx).0, 503);
         assert_eq!(logout(&ctx).0, 503);
         assert_eq!(login_interactive(&ctx).0, 503);
+    }
+
+    #[test]
+    fn login_interactive_refuses_409_when_stopped() {
+        // M19 (Finding 3b): /login-interactive makes no sense while parked.
+        let (ctx, snap, _rx) = synthetic_ctx();
+        snap.write().lifecycle = crate::lifecycle::OnlineState::Stopped;
+        let (code, body) = login_interactive(&ctx);
+        assert_eq!(code, 409);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], false);
+        assert!(v["error"]
+            .as_str()
+            .unwrap()
+            .contains("stopped"));
+    }
+
+    #[test]
+    fn reconnect_refuses_409_when_stopped() {
+        // M19 (Finding 3b): reconnect has no session to kick while parked.
+        let (ctx, snap, _rx) = synthetic_ctx();
+        snap.write().lifecycle = crate::lifecycle::OnlineState::Stopped;
+        let (code, body) = reconnect(&ctx);
+        assert_eq!(code, 409);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ok"], false);
+    }
+
+    #[test]
+    fn up_down_logout_allowed_when_stopped() {
+        // /up (resume), /down (no-op), and /logout stay allowed while
+        // parked — only /login-interactive + /reconnect are gated.
+        let (ctx, snap, _rx) = synthetic_ctx();
+        snap.write().lifecycle = crate::lifecycle::OnlineState::Stopped;
+        assert_eq!(up(&ctx).0, 202);
+        assert_eq!(down(&ctx).0, 202);
+        assert_eq!(logout(&ctx).0, 202);
     }
 
     #[test]

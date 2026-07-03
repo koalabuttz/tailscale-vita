@@ -297,10 +297,13 @@ fn do_logout() -> (String, bool) {
 }
 
 fn do_login_interactive() -> (String, bool) {
+    // Neutral accepted-copy: on an already-authorized node the login
+    // completes instantly and no QR appears, so don't promise one. If a QR
+    // IS needed the NeedsLogin full-screen view takes over. (M19 finding 4)
     post_lifecycle(
         "/localapi/v0/login-interactive",
         "login",
-        "login started — scan the QR",
+        "re-authenticating...",
     )
 }
 

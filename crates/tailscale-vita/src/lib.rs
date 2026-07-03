@@ -8,14 +8,16 @@
 //! Bring-up:
 //!
 //! ```ignore
-//! use tailscale_vita::{Config, Runtime};
+//! use tailscale_vita::{run_supervised, Config};
 //! use std::path::Path;
 //!
 //! let cfg = Config::load_or_template(Path::new("ux0:/data/tailscale-vita/config.toml"))?;
-//! let mut rt = Runtime::up(cfg)?;
-//! let listener = netstack::TcpListener::bind(rt.netstack(), 8080, 4)?;
-//! // ...accept loop in one thread, rt.run_event_loop in another...
-//! rt.shutdown();
+//! // The supervisor owns the up() -> run_event_loop loop and rebuilds the
+//! // whole Runtime on a mid-life re-login. `setup` binds a listener on the
+//! // fresh netstack each incarnation and returns a guard dropped on relogin.
+//! run_supervised(cfg, || should_stop(), |rt| {
+//!     netstack::TcpListener::bind(rt.netstack(), 8080, 4).map(AcceptGuard::spawn)
+//! })?;
 //! ```
 
 mod config;
@@ -33,5 +35,7 @@ pub use dual_transport::DualTransport;
 pub use error::{ConfigError, RuntimeError};
 pub use lifecycle::{FatalKind, LifecycleTracker, OnlineState};
 pub use localapi::LocalApiServer;
-pub use runtime::{wg_selftest_line, ControlHandle, ControlSignal, RunStats, Runtime};
+pub use runtime::{
+    run_supervised, wg_selftest_line, ControlHandle, ControlSignal, LoopExit, RunStats, Runtime,
+};
 pub use snapshot::{AclSummary, AllowedIpView, PeerView, RuntimeSnapshot};

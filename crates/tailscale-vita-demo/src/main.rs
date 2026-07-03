@@ -19,12 +19,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use vita_chan::{bounded, RecvTimeoutError};
 use vita_log::{error, info, warn};
 use vita_log::LogError;
 
-use netstack::TcpListener;
-use tailscale_vita::{Config, ConfigError, Runtime};
+use netstack::{Stack, TcpListener};
+use tailscale_vita::{run_supervised, Config, ConfigError};
 
 mod handler;
 mod ui;
@@ -130,95 +129,113 @@ fn run() -> Result<(), DemoError> {
         return Ok(());
     }
 
-    // M18: an empty auth_key is no longer an abort — Runtime::up logs in
-    // interactively (QR on screen; scan + approve on a phone) and
-    // long-polls until authorized before continuing.
+    // M18: an empty auth_key is no longer an abort — the interactive login
+    // (QR on screen; scan + approve on a phone) runs inside Runtime::up.
 
-    // 2. Bring up the runtime.
+    // 2. Supervised runtime on a worker thread. `run_supervised` owns the
+    //    up() -> run_event_loop loop and drops+rebuilds the whole Runtime on
+    //    a mid-life re-login (M19 Finding 1). The `setup` closure binds a
+    //    fresh inbound-HTTP listener + accept loop on each incarnation's
+    //    netstack (via `AcceptSession`), so a relogin rebinds cleanly. The
+    //    run_window deadline drives `should_stop`.
     let pool_size = config.listener_pool_size;
     let demo_port = config.demo_port;
-    let run_window = config.run_window_secs;
-    let mut runtime = Runtime::up(config)?;
-    info!("demo.runtime.up");
+    let deadline = config
+        .run_window_secs
+        .map(|s| Instant::now() + Duration::from_secs(s));
 
-    // 3. Bind the TCP listener on the tailnet IP. Smoltcp binds with
-    //    `IpListenEndpoint { addr: None }` so we accept on whatever
-    //    local IP gets plumbed via stack.set_local_addrs (happens
-    //    inside the runtime's event loop on first MapResponse).
-    let listener = TcpListener::bind(runtime.netstack(), demo_port, pool_size)?;
-    info!(port = demo_port, pool = pool_size, "demo.listen");
-
-    // 4. Worker thread for the runtime event loop.
-    let (stop_tx, stop_rx) = bounded::<()>(1);
+    let ui_exit = Arc::new(AtomicBool::new(false));
     let runtime_handle = thread::Builder::new()
         .name("ts-runtime".into())
-        .stack_size(256 * 1024)
-        .spawn(move || {
-            let stats = runtime.run_event_loop(|| match stop_rx.recv_timeout(Duration::from_millis(0)) {
-                Ok(()) => true,
-                Err(RecvTimeoutError::Timeout) => false,
-                Err(RecvTimeoutError::Disconnected) => true,
-            });
-            match stats {
-                Ok(s) => info!(?s, "demo.runtime.exit"),
-                Err(e) => error!(error = %e, "demo.runtime.exit.error"),
-            }
-            runtime.shutdown();
-        })?;
-
-    // 5. Accept loop on a worker thread (M17-A S4: the main thread now
-    //    belongs to the dashboard renderer). When the accept loop ends
-    //    (run_window deadline or listener error) it signals both the
-    //    runtime worker and the UI, then cleans up the listener.
-    let ui_exit = Arc::new(AtomicBool::new(false));
-    let accept_handle = thread::Builder::new()
-        .name("demo-accept".into())
         .stack_size(256 * 1024)
         .spawn({
             let ui_exit = Arc::clone(&ui_exit);
             move || {
-                let deadline = run_window.map(|s| Instant::now() + Duration::from_secs(s));
-                let mut accept_count = 0u32;
-                loop {
-                    if let Some(d) = deadline {
-                        if Instant::now() >= d {
-                            break;
-                        }
-                    }
-                    match listener.accept_timeout(ACCEPT_POLL) {
-                        Ok((stream, peer)) => {
-                            accept_count += 1;
-                            info!(%peer, count = accept_count, "demo.accept");
-                            handler::serve(stream, peer);
-                        }
-                        Err(e)
-                            if matches!(
-                                e.kind(),
-                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                            ) =>
-                        {
-                            // No connection in this window; loop.
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "demo.accept.error");
-                            break;
-                        }
-                    }
+                let stats = run_supervised(
+                    config,
+                    || deadline.map(|d| Instant::now() >= d).unwrap_or(false),
+                    |runtime| AcceptSession::spawn(runtime.netstack(), demo_port, pool_size),
+                );
+                match stats {
+                    Ok(s) => info!(?s, "demo.runtime.exit"),
+                    Err(e) => error!(error = %e, "demo.runtime.exit.error"),
                 }
-                // Stop the runtime worker; drop the listener (removes
-                // its pool sockets from netstack); release the UI.
-                let _ = stop_tx.send(());
-                drop(listener);
+                // Release the dashboard once the supervisor returns.
                 ui_exit.store(true, Ordering::Release);
-                info!(accept_count, "demo.accept.done");
             }
         })?;
 
-    // 6. Dashboard on the main thread until the accept loop ends.
+    // 3. Dashboard on the main thread until the supervisor exits.
     ui::run_dashboard(&ui_exit);
 
-    let _ = accept_handle.join();
     let _ = runtime_handle.join();
     info!("M10 demo done");
     Ok(())
+}
+
+/// Owns the demo's inbound-HTTP accept loop for one `Runtime` incarnation.
+/// `run_supervised` calls [`AcceptSession::spawn`] after each `up()` (fresh
+/// netstack) and drops the returned guard before tearing that Runtime down;
+/// `Drop` stops the accept thread so the next incarnation rebinds cleanly.
+struct AcceptSession {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl AcceptSession {
+    fn spawn(stack: &Stack, port: u16, pool: usize) -> AcceptSession {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = match TcpListener::bind(stack, port, pool) {
+            Ok(listener) => {
+                info!(port, pool, "demo.listen");
+                let stop_c = Arc::clone(&stop);
+                thread::Builder::new()
+                    .name("demo-accept".into())
+                    .stack_size(256 * 1024)
+                    .spawn(move || accept_loop(listener, stop_c))
+                    .ok()
+            }
+            Err(e) => {
+                warn!(error = %e, port, "demo.listen.bind_failed");
+                None
+            }
+        };
+        AcceptSession { stop, handle }
+    }
+}
+
+impl Drop for AcceptSession {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn accept_loop(listener: TcpListener, stop: Arc<AtomicBool>) {
+    let mut accept_count = 0u32;
+    while !stop.load(Ordering::Acquire) {
+        match listener.accept_timeout(ACCEPT_POLL) {
+            Ok((stream, peer)) => {
+                accept_count += 1;
+                info!(%peer, count = accept_count, "demo.accept");
+                handler::serve(stream, peer);
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                // No connection in this window; loop.
+            }
+            Err(e) => {
+                warn!(error = %e, "demo.accept.error");
+                break;
+            }
+        }
+    }
+    drop(listener);
+    info!(accept_count, "demo.accept.done");
 }

@@ -26,13 +26,13 @@ use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use vita_chan::{bounded, TryRecvError};
 use vita_log::{error, info, warn};
 
-use netstack::TcpListener;
-use tailscale_vita::{Config, ConfigError, Runtime};
+use netstack::{Stack, TcpListener};
+use tailscale_vita::{Config, ConfigError};
 use vita_log::LogError;
 
 mod handler;
@@ -361,61 +361,88 @@ fn run_runtime() {
     );
 
     // M18: an empty auth_key is no longer an abort — it means
-    // interactive (QR) login. Runtime::up publishes NeedsLogin + the
-    // AuthURL into the snapshot and long-polls until the user approves.
+    // interactive (QR) login inside Runtime::up (NeedsLogin + AuthURL).
 
     let port = cfg.demo_port;
     let pool = cfg.listener_pool_size;
 
-    trace("rr5: pre-Runtime::up");
-    let mut runtime = match Runtime::up(cfg) {
-        Ok(r) => { trace("rr6: Runtime::up Ok"); r }
-        Err(e) => {
-            trace("rr6: Runtime::up FAILED");
-            error!(error = %e, "suprx: runtime.up failed");
-            return;
+    // M19 (Finding 1): supervised runtime. `run_supervised` owns the
+    // up() -> run_event_loop loop on THIS bootstrap thread (the heavy up()
+    // bring-up needs the 4 MB bootstrap stack) and rebuilds the whole
+    // Runtime on a mid-life re-login. The `setup` closure binds a fresh
+    // inbound listener + accept loop on each incarnation's netstack (via
+    // `AcceptSession`); its guard is dropped before teardown so a relogin
+    // rebinds cleanly. SHUTDOWN (flipped by `ts_vita_rt_stop`) drives
+    // `should_stop`.
+    trace("rr5: pre-run_supervised");
+    let stats = tailscale_vita::run_supervised(
+        cfg,
+        || SHUTDOWN.load(Ordering::Relaxed),
+        |runtime| AcceptSession::spawn(runtime.netstack(), port, pool),
+    );
+    match stats {
+        Ok(s) => {
+            trace("rr6: run_supervised Ok");
+            info!(?s, "suprx.runtime.exit");
         }
-    };
-    info!("suprx.runtime.up");
-
-    let listener = match TcpListener::bind(runtime.netstack(), port, pool) {
-        Ok(l) => l,
         Err(e) => {
-            error!(error = %e, "suprx: listener bind failed");
-            runtime.shutdown();
-            return;
+            trace("rr6: run_supervised FAILED");
+            error!(error = %e, "suprx.runtime.exit.error");
         }
-    };
-    info!(port, pool, "suprx.listen");
+    }
+    trace("rr-end: run_supervised returned");
+}
 
-    // Worker thread for run_event_loop — same two-thread shape as the
-    // demo. The worker owns `runtime` (so it can call `shutdown()` on
-    // exit); the bootstrap thread runs the accept loop.
-    let (stop_tx, stop_rx) = bounded::<()>(1);
-    let worker = vita_thread::Builder::new()
-        .name("ts-vita-rt-event")
-        .stack_size(256 * 1024)
-        .spawn(move || {
-            let outcome = std::panic::catch_unwind(AssertUnwindSafe(move || {
-                let stats = runtime.run_event_loop(|| match stop_rx.try_recv() {
-                    Ok(()) | Err(TryRecvError::Disconnected) => true,
-                    Err(TryRecvError::Empty) => false,
-                });
-                match stats {
-                    Ok(s) => info!(?s, "suprx.runtime.exit"),
-                    Err(e) => error!(error = %e, "suprx.runtime.exit.error"),
-                }
-                runtime.shutdown();
-            }));
-            if outcome.is_err() {
-                error!("suprx: event-loop worker panicked");
+/// Owns the SUPRX's inbound-HTTP accept loop for one `Runtime`
+/// incarnation. `run_supervised` calls [`AcceptSession::spawn`] after each
+/// `up()` (fresh netstack) and drops the guard before teardown; `Drop`
+/// stops + joins the accept thread so the next incarnation rebinds cleanly.
+struct AcceptSession {
+    stop: Arc<AtomicBool>,
+    handle: Option<vita_thread::JoinHandle>,
+}
+
+impl AcceptSession {
+    fn spawn(stack: &Stack, port: u16, pool: usize) -> AcceptSession {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = match TcpListener::bind(stack, port, pool) {
+            Ok(listener) => {
+                info!(port, pool, "suprx.listen");
+                let stop_c = Arc::clone(&stop);
+                vita_thread::Builder::new()
+                    .name("ts-vita-rt-accept")
+                    .stack_size(256 * 1024)
+                    .spawn(move || {
+                        // Contain a handler panic to this accept thread
+                        // (the old accept loop ran under bootstrap_main's
+                        // catch_unwind; preserve that protection).
+                        let _ = std::panic::catch_unwind(AssertUnwindSafe(move || {
+                            accept_loop(listener, stop_c)
+                        }));
+                    })
+                    .ok()
             }
-        })
-        .expect("spawn ts-vita-rt-event worker");
+            Err(e) => {
+                error!(error = %e, port, "suprx: listener bind failed");
+                None
+            }
+        };
+        AcceptSession { stop, handle }
+    }
+}
 
-    // Accept loop, exits when ts_vita_rt_stop flips SHUTDOWN.
+impl Drop for AcceptSession {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn accept_loop(listener: TcpListener, stop: Arc<AtomicBool>) {
     let mut accept_count: u32 = 0;
-    while !SHUTDOWN.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) {
         match listener.accept_timeout(ACCEPT_POLL) {
             Ok((stream, peer)) => {
                 accept_count += 1;
@@ -433,9 +460,6 @@ fn run_runtime() {
             }
         }
     }
-
-    let _ = stop_tx.send(());
-    let _ = worker.join();
     drop(listener);
-    info!(accept_count, "suprx.runtime.shutdown");
+    info!(accept_count, "suprx.accept.done");
 }

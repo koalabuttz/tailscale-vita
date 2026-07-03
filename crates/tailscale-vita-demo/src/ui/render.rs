@@ -8,7 +8,7 @@ use vita_log::{info, warn};
 
 use super::ffi;
 use super::qr;
-use super::viewmodel::{DashVm, Tab, Tone};
+use super::viewmodel::{self, DashVm, Tab, Tone};
 
 const fn rgba(r: u8, g: u8, b: u8, a: u8) -> u32 {
     (r as u32) | ((g as u32) << 8) | ((b as u32) << 16) | ((a as u32) << 24)
@@ -172,10 +172,19 @@ impl Renderer {
             1.15,
             &vm.header.lifecycle,
         );
-        self.text(MARGIN, 74, tone_color(vm.header.sub_tone), 0.85, &vm.header.sub);
+        let sub_scale = 0.85;
+        self.text(MARGIN, 74, tone_color(vm.header.sub_tone), sub_scale, &vm.header.sub);
         // M19 identity card ("login · domain", else DERP/uptime): right-
-        // aligned on the sub line.
-        self.text_right((SCREEN_W as i32) - MARGIN, 74, DIM, 0.85, &vm.header.right);
+        // aligned on the sub baseline, but only where it clears the (possibly
+        // 62-char UNTAGGED) warning — the warning is the security-relevant
+        // string and must never be overdrawn. Elide the identity to the
+        // leftover budget with a trailing "..."; drop it if nothing fits.
+        let inner_w = (SCREEN_W as i32) - 2 * MARGIN;
+        let budget =
+            viewmodel::header_identity_budget(inner_w, self.text_w(sub_scale, &vm.header.sub));
+        if let Some(id) = self.elide_to_width(&vm.header.right, sub_scale, budget) {
+            self.text_right((SCREEN_W as i32) - MARGIN, 74, DIM, sub_scale, &id);
+        }
 
         // Tab bar.
         let cw = tab_cell_w();
@@ -254,6 +263,28 @@ impl Renderer {
                 &format!("... {} more (scroll)", vm.rows.len() - end),
             );
         }
+    }
+
+    /// Fit `s` into `max_w` pixels at `scale`: the string unchanged if it
+    /// already fits, a char-truncated `"prefix..."` if a shortened form fits,
+    /// or `None` when even that won't (the caller drops the string). Never
+    /// widens past `max_w`, so it can share a baseline without overlapping.
+    fn elide_to_width(&self, s: &str, scale: f32, max_w: i32) -> Option<String> {
+        if max_w <= 0 || self.font.is_null() || s.is_empty() {
+            return None;
+        }
+        if self.text_w(scale, s) <= max_w {
+            return Some(s.to_string());
+        }
+        // Drop trailing chars until "prefix..." fits; give up if nothing does.
+        let mut chars: Vec<char> = s.chars().collect();
+        while chars.pop().is_some() && !chars.is_empty() {
+            let candidate: String = chars.iter().collect::<String>() + "...";
+            if self.text_w(scale, &candidate) <= max_w {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     /// Greedily wrap `s` (space-separated tokens) to fit `max_w` pixels
@@ -431,6 +462,8 @@ impl Renderer {
             // In NeedsLogin but the SUPRX hasn't published an AuthURL yet.
             None => {
                 self.text_center(280, WARN, 1.0, "starting login...");
+                // M19: an exit from the full-screen login (see finding 1).
+                self.text_center(320, DIM, 0.8, "O: cancel login (stops tailnet)");
             }
             Some(url) => {
                 // The QR is the hands-free path (Tailscale / OIDC scan);
@@ -452,8 +485,15 @@ impl Renderer {
                     self.text_center(y, TEXT, 0.8, &line);
                     y += 24;
                 }
-                let wy = (y + 8).min((SCREEN_H as i32) - 16);
+                // Reserve the bottom line for the cancel hint (finding 1).
+                let wy = (y + 8).min((SCREEN_H as i32) - 44);
                 self.text_center(wy, WARN, 0.9, "waiting for approval...");
+                self.text_center(
+                    (SCREEN_H as i32) - 16,
+                    DIM,
+                    0.75,
+                    "O: cancel login (stops tailnet)",
+                );
             }
         }
         self.end();

@@ -117,6 +117,39 @@ impl SettingRow {
     }
 }
 
+/// Which of the three NeedsLogin full-screen modes is showing, derived from
+/// the snapshot's (`auth_url`, `login_in_progress`). Drives both the render
+/// copy and the input handling: the logged-out mode accepts ✕ to start a
+/// fresh login; the QR + spinner modes accept ○ to cancel — parking the
+/// tailnet so the user isn't trapped in the full-screen login. (M19 finding 1.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginMode {
+    /// Post-logout parked screen — ✕ starts a fresh interactive login.
+    LoggedOut,
+    /// Registration underway, no AuthURL yet — spinner; ○ cancels.
+    Starting,
+    /// AuthURL published — QR + URL text; ○ cancels.
+    Qr,
+}
+
+impl LoginMode {
+    pub fn classify(auth_url_present: bool, login_in_progress: bool) -> LoginMode {
+        if auth_url_present {
+            LoginMode::Qr
+        } else if login_in_progress {
+            LoginMode::Starting
+        } else {
+            LoginMode::LoggedOut
+        }
+    }
+    /// The QR + spinner modes show an "○: cancel login (stops tailnet)" hint
+    /// and accept ○ to park the tailnet; the logged-out mode does not (its ✕
+    /// starts a login, and there's nothing in flight to cancel).
+    pub fn shows_cancel_hint(self) -> bool {
+        matches!(self, LoginMode::Starting | LoginMode::Qr)
+    }
+}
+
 pub struct HeaderVm {
     /// e.g. "vita  100.127.67.48"
     pub title: String,
@@ -444,6 +477,28 @@ fn lifecycle_display(l: OnlineState) -> (String, Tone) {
     (format!("{l:?}"), tone)
 }
 
+/// Minimum pixel gap kept between the left-aligned sub/warning line and the
+/// right-aligned identity string that share the header baseline.
+pub const HEADER_SIDE_GAP: i32 = 16;
+
+/// Header layout guard (M19 finding 2): the identity string is right-aligned
+/// on the same baseline as the (possibly 62-char UNTAGGED) sub warning.
+/// Returns the pixel budget left for the identity after the sub line + a gap,
+/// clamped to 0. The renderer draws the identity only if it fits this budget
+/// — eliding or dropping it otherwise — so the security-relevant warning is
+/// never overdrawn. `inner_w` is the drawable width between the side margins.
+pub fn header_identity_budget(inner_w: i32, sub_w: i32) -> i32 {
+    (inner_w - sub_w - HEADER_SIDE_GAP).max(0)
+}
+
+/// Whether a confirm-modal press should dismiss the modal (M19 finding 3).
+/// The destructive action is only enqueued when no other action is in flight
+/// (`action_idle`); if it wasn't enqueued the modal must stay open so the
+/// confirm isn't silently consumed while the logout is dropped.
+pub fn confirm_dismisses(action_idle: bool) -> bool {
+    action_idle
+}
+
 /// Clamp the peer-list scroll window so `selected` stays visible.
 /// Returns the half-open row range to draw.
 pub fn scroll_window(len: usize, selected: usize, viewport: usize) -> (usize, usize) {
@@ -683,6 +738,45 @@ mod tests {
         assert!(labels.contains(&"build"));
         let pub_row = rows.iter().find(|(l, _, _)| l == "public").unwrap();
         assert_eq!(pub_row.1, "1.2.3.4:41641");
+    }
+
+    #[test]
+    fn login_mode_selects_cancel_hint() {
+        // auth_url present → QR mode, cancellable.
+        let qr = LoginMode::classify(true, false);
+        assert_eq!(qr, LoginMode::Qr);
+        assert!(qr.shows_cancel_hint());
+        // in-progress, no URL yet → spinner, cancellable.
+        let starting = LoginMode::classify(false, true);
+        assert_eq!(starting, LoginMode::Starting);
+        assert!(starting.shows_cancel_hint());
+        // auth_url wins even if the in-progress flag lingers.
+        assert_eq!(LoginMode::classify(true, true), LoginMode::Qr);
+        // parked (logged out) → ✕ starts a login, no cancel affordance.
+        let out = LoginMode::classify(false, false);
+        assert_eq!(out, LoginMode::LoggedOut);
+        assert!(!out.shows_cancel_hint());
+    }
+
+    #[test]
+    fn header_identity_budget_guards_overlap() {
+        let inner = 896; // SCREEN_W 960 - 2*MARGIN(32)
+        // Short sub → plenty of room for the identity.
+        assert_eq!(header_identity_budget(inner, 200), 896 - 200 - HEADER_SIDE_GAP);
+        // A wide (untagged-warning) sub leaves a shrunken budget…
+        assert_eq!(header_identity_budget(inner, 820), 60);
+        // …and once it fills the row the identity is dropped (budget 0).
+        assert_eq!(header_identity_budget(inner, 890), 0);
+        assert_eq!(header_identity_budget(inner, 1200), 0);
+    }
+
+    #[test]
+    fn confirm_dismisses_only_when_idle() {
+        // Idle → the logout is enqueued, so the modal closes.
+        assert!(confirm_dismisses(true));
+        // Busy (e.g. a 7 s reconnect in flight) → send() drops the logout;
+        // the modal must stay open so the confirm isn't silently consumed.
+        assert!(!confirm_dismisses(false));
     }
 
     #[test]
