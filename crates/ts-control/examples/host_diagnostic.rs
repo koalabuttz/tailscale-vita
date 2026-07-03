@@ -213,6 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &backend_log_id,
         &hostname,
         &authority,
+        None, // M18: no interactive followup in the host diagnostic
     )?;
 
     // 8. Open the streaming map.

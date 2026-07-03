@@ -83,6 +83,23 @@ impl KeyStore {
         );
         Ok(ks)
     }
+
+    /// Mint a fresh NodeKey, persist it (overwriting `<dir>/node.priv`),
+    /// and update the cached pub/priv in place. Used by the M18
+    /// interactive-login loop when the control plane reports
+    /// `NodeKeyExpired=true`: the old node identity is dead server-side,
+    /// so we re-key and re-register. Machine / disco / NL keys are
+    /// untouched (only the WG/node identity rotates).
+    pub fn regenerate_node_key(&mut self, dir: &Path) -> Result<(), ControlError> {
+        let bytes = generate_and_persist(&dir.join(NODE_FILE))?;
+        self.node_priv = NodePrivate(bytes);
+        self.node_pub = NodePublic(derive_pub(&bytes));
+        info!(
+            node_pub = %self.node_pub.to_nodekey_string(),
+            "control.keystore.node_key.regenerated"
+        );
+        Ok(())
+    }
 }
 
 /// Read 32 bytes from `dir/file`. On NotFound or wrong length,
