@@ -114,12 +114,22 @@ The demo runs until you exit via the PS button (or `run_window_secs`
 elapses in normal mode). Watch for:
 
 - LiveArea launch screen flashes briefly.
-- **The M17-A dashboard** (docs/PLAN-M17A.md): status header (hostname,
-  tailnet IP, lifecycle, DERP home, uptime, ACL tags), a scrollable
-  peer list (online dot, tailnet IP, `direct N ms` / `relay` path
-  cell), and a footer with poll staleness. D-pad scrolls; X sends a
-  disco ping to the selected peer. Cold start shows
-  "waiting for runtime (SUPRX)..." until the first LocalAPI poll lands.
+- **The dashboard** (docs/PLAN-M17A.md, docs/PLAN-M17BC.md): a tabbed
+  UI over the runtime's LocalAPI.
+  - **Peers** — status header (hostname, tailnet IP, lifecycle, DERP
+    home, uptime) + a scrollable peer list (online dot, tailnet IP,
+    `direct N ms` / `relay` path cell). D-pad or left stick selects;
+    **X** disco-pings the selected peer; **O** opens a peer-detail
+    overlay (endpoints, allowed-IPs, DERP, key-expiry).
+  - **Settings** — ACL posture (green tags / red UNTAGGED badge) + self
+    key-expiry warning; toggle `ts-ftp` enabled/read-only (rewrites
+    config.toml — relaunch to apply) and **Reconnect** to the control
+    plane.
+  - **Debug** — runtime internals (fatal reason, DERP regions, magic
+    UDP bind, public endpoint, self key-expiry, build).
+  - **L/R shoulders, D-pad Left/Right, or a tab tap** switch tabs;
+    the front touchscreen taps tabs + peer rows. Cold start shows
+    "waiting for runtime (SUPRX)..." until the first LocalAPI poll lands.
 
 ## 6. Pull the log
 
