@@ -389,7 +389,7 @@ impl Renderer {
             LOGIN_SUB_Y,
             DIM,
             0.85,
-            "Scan this QR with the Tailscale app / your phone",
+            "Point your phone camera at this QR, then approve the node",
         );
         match auth_url {
             // In NeedsLogin but the SUPRX hasn't published an AuthURL yet.

@@ -287,11 +287,13 @@ impl Runtime {
         // hard AuthRejected inside register()). NodeKeyExpired
         // regenerates the node key and restarts the loop. This blocks
         // until the node is authorized (or a fatal control error).
-        suprx_trace("up5: pre establish_control_conn (server-key/Noise/h2)");
-        let mut conn = establish_control_conn(&config, &ks, &state_dir)?;
-        suprx_trace("up6: control conn up; registering (login)");
-        let backend_log_id = interactive_login(
-            &mut conn,
+        // Interactive login owns conn creation now: the control plane
+        // closes the Noise/h2 conn after each register response, so the
+        // followup re-poll cannot reuse it — a fresh conn is established
+        // per attempt inside the loop (which also survives transient
+        // control errors instead of aborting the whole runtime).
+        suprx_trace("up5: pre interactive_login (fresh conn per attempt)");
+        let (conn, backend_log_id) = interactive_login(
             &config,
             &mut ks,
             &host_authority,
@@ -1481,24 +1483,50 @@ const LOGIN_REPOLL_INTERVAL: Duration = Duration::from_secs(2);
 /// sleep keeps that wait from busy-spinning.
 #[allow(clippy::too_many_arguments)]
 fn interactive_login(
-    conn: &mut Http2Conn,
     config: &Config,
     ks: &mut KeyStore,
     host_authority: &str,
     state_dir: &Path,
     snapshot: &Arc<RwLock<RuntimeSnapshot>>,
     lifecycle: &Mutex<LifecycleTracker>,
-) -> Result<String, ts_control::ControlError> {
+) -> Result<(Http2Conn, String), ts_control::ControlError> {
     let auth_key = config.auth_key.trim();
+    // A supplied key is an automation override: a real auth/config problem
+    // must SURFACE (return Err), not silently retry forever. The empty-key
+    // interactive path instead RETRIES transient control errors — the user
+    // may still be walking to their phone, and the wait-loop must not tear
+    // the whole runtime down (which strands their approval; the original
+    // bug shipped: `register(...)?` on a dead reused conn killed Runtime::up).
+    let key_supplied = !auth_key.is_empty();
     let backend_log_id = generate_backend_log_id();
     info!(backend_log_id = %backend_log_id, "control.backend_log_id.generated");
 
     let mut followup: Option<String> = None;
     let mut published_needs_login = false;
+    let mut attempt: u32 = 0;
 
     loop {
-        let outcome = ts_control::register(
-            conn,
+        attempt += 1;
+        // Fresh conn per attempt. The control plane closes the Noise/h2
+        // conn after each register response, so the followup re-POST
+        // cannot reuse the previous one (the reference Rust port likewise
+        // reconnects per poll). server-key is cached, so this is cheap
+        // after the first handshake.
+        let mut conn = match establish_control_conn(config, ks, state_dir) {
+            Ok(c) => c,
+            Err(e) => {
+                if key_supplied {
+                    return Err(e);
+                }
+                suprx_trace(&format!("login: conn attempt {attempt} failed; retry"));
+                warn!(error = %e, attempt, "control.login.conn_failed; retrying");
+                std::thread::sleep(LOGIN_REPOLL_INTERVAL);
+                continue;
+            }
+        };
+
+        let outcome = match ts_control::register(
+            &mut conn,
             auth_key,
             &ks.node_pub,
             &ks.nl_pub,
@@ -1506,7 +1534,20 @@ fn interactive_login(
             &config.hostname,
             host_authority,
             followup.as_deref(),
-        )?;
+        ) {
+            Ok(o) => o,
+            // A supplied key that the server refuses is genuinely fatal.
+            Err(e @ ts_control::ControlError::AuthRejected { .. }) => return Err(e),
+            Err(e) => {
+                if key_supplied {
+                    return Err(e);
+                }
+                suprx_trace(&format!("login: register attempt {attempt} err; retry"));
+                warn!(error = %e, attempt, "control.login.register_err; retrying");
+                std::thread::sleep(LOGIN_REPOLL_INTERVAL);
+                continue;
+            }
+        };
 
         // NodeKeyExpired: the persisted node identity is dead
         // server-side. Mint a fresh key and restart the login from
@@ -1515,6 +1556,7 @@ fn interactive_login(
         // both flags still accepts the just-granted authorization.
         if outcome.node_key_expired && !outcome.machine_authorized {
             warn!("control.login.node_key_expired; regenerating node key + restarting login");
+            suprx_trace("login: node_key_expired; regenerating node key");
             ks.regenerate_node_key(state_dir)?;
             followup = None;
             continue;
@@ -1528,16 +1570,21 @@ fn interactive_login(
                 lifecycle.lock().clear_needs_login();
                 publish_login_state(snapshot, lifecycle, None);
             }
-            info!("control.login.authorized");
-            return Ok(backend_log_id);
+            suprx_trace(&format!("login: AUTHORIZED on attempt {attempt}"));
+            info!(attempt, "control.login.authorized");
+            return Ok((conn, backend_log_id));
         }
 
         match outcome.pending_auth_url {
             Some(url) => {
                 info!(
                     auth_url = %url,
+                    attempt,
                     "control.login.pending; publishing NeedsLogin (scan to log in)"
                 );
+                if !published_needs_login {
+                    suprx_trace("login: pending; publishing NeedsLogin (scan QR)");
+                }
                 lifecycle.lock().set_needs_login();
                 publish_login_state(snapshot, lifecycle, Some(url.clone()));
                 published_needs_login = true;
@@ -1545,11 +1592,16 @@ fn interactive_login(
                 std::thread::sleep(LOGIN_REPOLL_INTERVAL);
             }
             None => {
-                // register() only returns Ok without a pending AuthURL
-                // when authorized (handled above). Defensive.
-                return Err(ts_control::ControlError::Transport(
-                    "register: not authorized and no AuthURL".into(),
-                ));
+                // Unauthorized, no AuthURL, not expired. For a supplied key
+                // this is a genuine failure; for the interactive path just
+                // keep polling (a fresh conn next round).
+                if key_supplied {
+                    return Err(ts_control::ControlError::Transport(
+                        "register: not authorized and no AuthURL".into(),
+                    ));
+                }
+                suprx_trace(&format!("login: unauth+no-url attempt {attempt}; retry"));
+                std::thread::sleep(LOGIN_REPOLL_INTERVAL);
             }
         }
     }
