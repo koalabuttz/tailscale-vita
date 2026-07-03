@@ -807,7 +807,7 @@ impl Runtime {
                 logout_requested = false;
                 perform_logout(
                     &self.config,
-                    &self.ks,
+                    &mut self.ks,
                     &self.host_authority,
                     &self.state_dir,
                     &self.snapshot,
@@ -1357,7 +1357,20 @@ where
         }
 
         suprx_trace("sup1: supervisor up()");
-        let mut runtime = Runtime::up(config.clone(), &mut should_stop)?;
+        // A relogin cycle (streak > 0) exists because the user asked to log
+        // in (`/login-interactive`) or the session was deauthed — either
+        // way, "wanting to run" is implied. The Config struct was loaded
+        // once at process start, so `config.tailnet.want_running` can be
+        // stale (hardware 2026-07-03: a poisoned `false` made every ✕-press
+        // re-up boot PARKED, skip interactive_login, and resume through the
+        // non-interactive register — no QR ever appeared). Override it for
+        // relogin incarnations so `up()` actually runs the login.
+        let mut cycle_config = config.clone();
+        if relogin_streak > 0 && !cycle_config.tailnet.want_running {
+            suprx_trace("sup4: relogin forces want_running=true");
+            cycle_config.tailnet.want_running = true;
+        }
+        let mut runtime = Runtime::up(cycle_config, &mut should_stop)?;
         let session = setup(&runtime);
         let exit = runtime.run_event_loop(&mut should_stop)?;
         // Drop the caller's listener/accept loop BEFORE tearing the Runtime
@@ -1893,17 +1906,23 @@ fn delete_session_state(state_dir: &Path) {
 }
 
 /// M19 `/logout`: expire the node key at control (a RegisterRequest with
-/// `Expiry = now`) on a FRESH conn, then, on success, park logged-out:
-/// drop the session + WG peers, delete the persisted map-session state,
-/// and publish `NeedsLogin` (no auto re-login — the user explicitly
-/// left). The node key is deliberately left in place; the next login
-/// sends it, control answers expired/AuthURL, and the M18 regenerate
-/// branch runs. On any failure we log and keep the prior state (no local
-/// wipe unless control confirmed the expiry).
+/// `Expiry` = fixed past) on a FRESH conn, then, on success, park
+/// logged-out: drop the session + WG peers, delete the persisted
+/// map-session state, ROTATE THE NODE KEY LOCALLY, and publish
+/// `NeedsLogin` (no auto re-login — the user explicitly left).
+///
+/// The local rotation is the real logout guarantee: hardware testing
+/// (2026-07-03) showed real control replying error-free WITHOUT expiring
+/// the key — the old key kept registering non-interactively, so "press ✕
+/// to log in" sailed straight back Online with no QR. With the key rotated
+/// here, the next login presents a fresh node key and control demands the
+/// interactive AuthURL/QR (proven by the M18 QR test: fresh node key +
+/// known machine key ⇒ QR). On any failure we log and keep the prior
+/// state (no local wipe, no rotation — logout honestly failed).
 #[allow(clippy::too_many_arguments)]
 fn perform_logout(
     config: &Config,
-    ks: &KeyStore,
+    ks: &mut KeyStore,
     host_authority: &str,
     state_dir: &Path,
     snapshot: &Arc<RwLock<RuntimeSnapshot>>,
@@ -1930,12 +1949,28 @@ fn perform_logout(
         &config.hostname,
         host_authority,
     ) {
-        Ok(()) => {
-            info!("control.logout.ok");
-            suprx_trace("logout2: logout OK; entering logged-out state");
+        Ok(expired) => {
+            info!(control_expired = expired, "control.logout.ok");
+            if expired {
+                suprx_trace("logout2: logout OK (control expired=true)");
+            } else {
+                // Clean reply, but control kept the key valid. The local
+                // rotation below is what makes logout stick regardless.
+                suprx_trace("logout2: logout OK (control expired=FALSE)");
+            }
             *map_opt = None;
             clear_engine_peers(engine, peer_regions);
             delete_session_state(state_dir);
+            // Rotate the node key NOW so the old (possibly still-valid)
+            // identity no longer exists on this device and the next login
+            // must go interactive (QR).
+            match ks.regenerate_node_key(state_dir) {
+                Ok(()) => suprx_trace("logout3: node key rotated locally"),
+                Err(e) => {
+                    warn!(error = %e, "control.logout.rotate_failed");
+                    suprx_trace("logout3: node key rotation FAILED");
+                }
+            }
             lifecycle.lock().set_needs_login();
             // NeedsLogin + auth_url None + login_in_progress false =
             // the "logged out — press ✕ to log in" screen. Finding 4:

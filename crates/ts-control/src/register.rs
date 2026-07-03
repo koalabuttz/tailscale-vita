@@ -114,9 +114,13 @@ pub fn register(
 /// `Followup`. Success = the server returned no `Error`; a
 /// `NodeKeyExpired=true` reply **is** the confirmation, not a failure.
 ///
-/// The KeyStore is deliberately left untouched: the node key is regenerated
-/// at the *next* login, never here (control must still be able to match the
-/// current key to expire it).
+/// The KeyStore is deliberately left untouched here: control must be able
+/// to match the *current* key to expire it. Returns whether control
+/// actually reported the key expired (`NodeKeyExpired=true`). Real-world
+/// control has been observed to reply error-free WITHOUT expiring
+/// (2026-07-03 hardware test: the old key kept registering fine afterwards),
+/// so callers must not treat a bare `Ok` as "logged out" — rotate the node
+/// key locally to make logout real from the device's perspective.
 pub fn logout(
     conn: &mut Http2Conn,
     node_pub: &NodePublic,
@@ -124,7 +128,7 @@ pub fn logout(
     backend_log_id: &str,
     hostname: &str,
     host_authority: &str,
-) -> Result<(), ControlError> {
+) -> Result<bool, ControlError> {
     let req = build_request(
         // No Auth and no Followup on a logout.
         None,
@@ -300,8 +304,11 @@ fn interpret_register_response(
 /// Interpret a logout (`Expiry=now`) response. Split out of `logout()` so it
 /// is unit-testable without a live Noise/HTTP2 tunnel. Success = no server
 /// `Error`; `NodeKeyExpired=true` **is** success — the key we just asked to
-/// expire is now expired, which is the whole point.
-fn interpret_logout_response(parsed: RegisterResponseWire) -> Result<(), ControlError> {
+/// expire is now expired, which is the whole point. The returned bool is
+/// that flag: `false` means control answered cleanly but did NOT confirm the
+/// expiry (observed against real control 2026-07-03) — the caller should
+/// rotate the node key locally rather than trust the key is dead.
+fn interpret_logout_response(parsed: RegisterResponseWire) -> Result<bool, ControlError> {
     if !parsed.error.is_empty() {
         warn!(server_error = %parsed.error, "control.logout.fail.server");
         return Err(ControlError::Transport(format!(
@@ -320,7 +327,7 @@ fn interpret_logout_response(parsed: RegisterResponseWire) -> Result<(), Control
         node_key_expired = parsed.node_key_expired,
         "control.logout.ok"
     );
-    Ok(())
+    Ok(parsed.node_key_expired)
 }
 
 #[derive(Serialize)]
@@ -604,15 +611,21 @@ mod tests {
 
     #[test]
     fn logout_response_interpretation() {
-        // NodeKeyExpired=true is the expected success confirmation.
+        // NodeKeyExpired=true is the expected success confirmation, and the
+        // flag is surfaced so the caller knows control confirmed the expiry.
         let expired = RegisterResponseWire {
             node_key_expired: true,
             ..Default::default()
         };
-        assert!(interpret_logout_response(expired).is_ok());
+        assert_eq!(interpret_logout_response(expired).unwrap(), true);
 
-        // An empty/benign response is also success.
-        assert!(interpret_logout_response(RegisterResponseWire::default()).is_ok());
+        // An empty/benign response is still Ok, but reports expired=false —
+        // observed against real control 2026-07-03 (clean reply, key NOT
+        // expired). Callers rotate the node key locally on this path.
+        assert_eq!(
+            interpret_logout_response(RegisterResponseWire::default()).unwrap(),
+            false
+        );
 
         // A server Error is a failure.
         let errored = RegisterResponseWire {
