@@ -26,3 +26,22 @@ pub(crate) fn reply_multiline<W: Write>(
     write!(w, "{code} {tail}\r\n")?;
     w.flush()
 }
+
+/// RFC 959 quoted pathname for `257` replies (PWD/MKD): wrap in double quotes
+/// and double any embedded `"` so clients parse the path unambiguously.
+pub(crate) fn dir_reply(dir: &str) -> String {
+    format!("\"{}\"", dir.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dir_reply_quotes_and_doubles() {
+        assert_eq!(dir_reply("/"), "\"/\"");
+        assert_eq!(dir_reply("/a/b"), "\"/a/b\"");
+        // Embedded quotes are doubled per RFC 959.
+        assert_eq!(dir_reply("/od\"d"), "\"/od\"\"d\"");
+    }
+}

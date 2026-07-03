@@ -13,6 +13,9 @@ pub(crate) enum Command {
     Cwd(String),
     Cdup,
     Pasv,
+    /// Extended passive mode. Optional arg is a net-protocol number
+    /// (`1`/`2`) or `ALL` (lock the client into EPSV).
+    Epsv(Option<String>),
     List(Option<String>),
     Nlst(Option<String>),
     Retr(String),
@@ -50,6 +53,7 @@ pub(crate) fn parse(line: &str) -> Command {
         "CWD" => Command::Cwd(s(arg)),
         "CDUP" => Command::Cdup,
         "PASV" => Command::Pasv,
+        "EPSV" => Command::Epsv(opt(arg)),
         "LIST" => Command::List(opt(arg)),
         "NLST" => Command::Nlst(opt(arg)),
         "RETR" => Command::Retr(s(arg)),
@@ -96,6 +100,14 @@ mod tests {
         assert_eq!(parse("pwd"), Command::Pwd);
         assert_eq!(parse("XPWD"), Command::Pwd);
         assert_eq!(parse("QUIT"), Command::Quit);
+    }
+
+    #[test]
+    fn epsv_with_and_without_arg() {
+        assert_eq!(parse("EPSV"), Command::Epsv(None));
+        assert_eq!(parse("epsv"), Command::Epsv(None));
+        assert_eq!(parse("EPSV 1"), Command::Epsv(Some("1".into())));
+        assert_eq!(parse("EPSV ALL"), Command::Epsv(Some("ALL".into())));
     }
 
     #[test]

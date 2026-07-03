@@ -11,7 +11,7 @@ use netstack::TcpListener;
 use vita_log::{debug, warn};
 
 use crate::command::{self, Command};
-use crate::reply::{reply, reply_multiline};
+use crate::reply::{dir_reply, reply, reply_multiline};
 use crate::vfs::{self, Vfs};
 use crate::{data, listing, Ctx, CTRL_IDLE_TIMEOUT, DATA_ACCEPT_TIMEOUT, DATA_RW_TIMEOUT};
 
@@ -124,7 +124,13 @@ impl Session {
                 return Ok(Flow::Continue);
             }
             Feat => {
-                reply_multiline(r.get_mut(), 211, "Features", &["PASV", "SIZE", "UTF8"], "End")?;
+                reply_multiline(
+                    r.get_mut(),
+                    211,
+                    "Features",
+                    &["EPSV", "PASV", "SIZE", "UTF8"],
+                    "End",
+                )?;
                 return Ok(Flow::Continue);
             }
             Noop => {
@@ -142,12 +148,13 @@ impl Session {
         match cmd {
             Type(_) => reply(r.get_mut(), 200, "type set to I")?, // always binary
             Pwd => {
-                let m = format!("\"{}\" is current directory", self.cwd);
+                let m = format!("{} is current directory", dir_reply(&self.cwd));
                 reply(r.get_mut(), 257, &m)?;
             }
             Cwd(arg) => self.do_cwd(arg, r)?,
             Cdup => self.do_cwd("..", r)?,
             Pasv => self.do_pasv(r, ctx)?,
+            Epsv(arg) => self.do_epsv(arg.as_deref(), r, ctx)?,
             List(arg) => self.do_list(arg.as_deref(), false, r)?,
             Nlst(arg) => self.do_list(arg.as_deref(), true, r)?,
             Retr(arg) => self.do_retr(arg, r)?,
@@ -199,6 +206,30 @@ impl Session {
         }
     }
 
+    fn do_epsv(&mut self, arg: Option<&str>, r: &mut Ctrl, ctx: &Ctx) -> io::Result<()> {
+        // `EPSV ALL` only locks the client into extended passive mode; there
+        // is no data connection to open, so just acknowledge it. We don't
+        // enforce the lock (all our data commands work in either mode).
+        if arg.is_some_and(|a| a.eq_ignore_ascii_case("ALL")) {
+            return reply(r.get_mut(), 200, "EPSV ALL ok");
+        }
+        // Unlike PASV, the `229` reply carries no host — only the port — so
+        // EPSV needs no tailnet IP and works regardless of the address the
+        // client reached us on. Drop any previous pending listener first.
+        self.pasv = None;
+        match data::bind_passive(&ctx.stack, &mut self.next_port, self.pasv_lo, self.pasv_hi) {
+            Ok((listener, port)) => {
+                let text = data::format_229(port);
+                self.pasv = Some((listener, port));
+                reply(r.get_mut(), 229, &text)
+            }
+            Err(e) => {
+                warn!(error = %e, "ts-ftp.epsv.bind_failed");
+                reply(r.get_mut(), 425, "can't open data port")
+            }
+        }
+    }
+
     fn do_list(&mut self, arg: Option<&str>, names_only: bool, r: &mut Ctrl) -> io::Result<()> {
         // Resolve the target dir: ignore `ls`-style flag args (e.g. "-la").
         let vpath = match arg {
@@ -208,10 +239,16 @@ impl Session {
             },
             _ => self.cwd.clone(),
         };
-        let real = self.vfs.to_real(&vpath);
-        let entries = match vita_fs::read_dir(Path::new(&real)) {
-            Ok(e) => e,
-            Err(_) => return reply(r.get_mut(), 550, "no such directory"),
+        // The virtual root `/` is the device-list level: list the known mount
+        // points (VitaShell convention) rather than the jail root's contents.
+        let entries = if vfs::is_root(&vpath) {
+            vfs::device_entries()
+        } else {
+            let real = self.vfs.to_real(&vpath);
+            match vita_fs::read_dir(Path::new(&real)) {
+                Ok(e) => e,
+                Err(_) => return reply(r.get_mut(), 550, "no such directory"),
+            }
         };
         let body = if names_only {
             listing::format_nlst(&entries)
@@ -316,7 +353,7 @@ impl Session {
         };
         let real = self.vfs.to_real(&vpath);
         match vita_fs::create_dir_all(Path::new(&real)) {
-            Ok(()) => reply(r.get_mut(), 257, &format!("\"{vpath}\" created")),
+            Ok(()) => reply(r.get_mut(), 257, &format!("{} created", dir_reply(&vpath))),
             Err(e) => {
                 warn!(error = %e, "ts-ftp.mkd");
                 reply(r.get_mut(), 550, "mkdir failed")
@@ -357,8 +394,11 @@ impl Session {
         }
     }
 
-    /// Open the pending PASV data connection, write `bytes`, close it (the
-    /// close drains/flushes), and report `226`/`426`. `425` if no PASV.
+    /// Open the pending PASV/EPSV data connection and hand it to
+    /// [`pump_data`], which writes `bytes`, closes the socket, then reports
+    /// `226`/`426`. `425` if no PASV/EPSV preceded this. Shared verbatim by
+    /// LIST/NLST (listing bytes) and RETR (file bytes) — the file pump and
+    /// the listing pump are the *same* code path.
     fn send_data(&mut self, bytes: &[u8], r: &mut Ctrl) -> io::Result<()> {
         let (listener, _) = match self.pasv.take() {
             Some(x) => x,
@@ -368,17 +408,44 @@ impl Session {
         match listener.accept_timeout(DATA_ACCEPT_TIMEOUT) {
             Ok((mut data, _)) => {
                 let _ = data.set_write_timeout(Some(DATA_RW_TIMEOUT));
-                let sent = data.write_all(bytes);
-                drop(data); // FIN + 2s TX-drain flushes the bytes
-                match sent {
-                    Ok(()) => reply(r.get_mut(), 226, "transfer complete"),
-                    Err(e) => {
-                        warn!(error = %e, "ts-ftp.data.write");
-                        reply(r.get_mut(), 426, "transfer failed")
-                    }
-                }
+                pump_data(data, r.get_mut(), bytes)
             }
             Err(_) => reply(r.get_mut(), 425, "data connection failed"),
+        }
+    }
+}
+
+/// The data connection the transfer pump drives. It only needs to write the
+/// payload and then an explicit `close` that flushes/drains before the
+/// control `226`. For the real netstack stream `close` drops the socket —
+/// its `Drop` sends the FIN and waits (bounded) for the TX buffer to drain.
+/// The trait exists so the write-then-close-then-`226` *ordering* is
+/// host-testable with a mock (no live netstack required).
+trait DataStream: Write {
+    fn close(self) -> io::Result<()>
+    where
+        Self: Sized;
+}
+
+impl DataStream for TcpStream {
+    fn close(self) -> io::Result<()> {
+        drop(self); // FIN + bounded TX-drain, see netstack TcpStream::drop
+        Ok(())
+    }
+}
+
+/// Write `bytes` to the data connection, close it (drain), then report the
+/// outcome on the control stream. The close happens **before** the `226`, so
+/// the client never sees a `226` with the data socket still open. On a write
+/// failure the socket is still closed and `426` is sent.
+fn pump_data<D: DataStream, C: Write>(mut data: D, ctrl: &mut C, bytes: &[u8]) -> io::Result<()> {
+    let sent = data.write_all(bytes);
+    let _ = data.close(); // close/drain the data socket first
+    match sent {
+        Ok(()) => reply(ctrl, 226, "transfer complete"),
+        Err(e) => {
+            warn!(error = %e, "ts-ftp.data.write");
+            reply(ctrl, 426, "transfer failed")
         }
     }
 }
@@ -396,5 +463,91 @@ fn read_to_end(s: &mut TcpStream, out: &mut Vec<u8>) -> io::Result<()> {
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type Log = Rc<RefCell<Vec<String>>>;
+
+    /// Mock data connection: records `write`/`close` into a shared log so the
+    /// pump's ordering (bytes → close → reply) is observable.
+    struct MockData {
+        log: Log,
+        fail: bool,
+    }
+    impl Write for MockData {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.fail {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "boom"));
+            }
+            self.log.borrow_mut().push(format!("write {}", buf.len()));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl DataStream for MockData {
+        fn close(self) -> io::Result<()> {
+            self.log.borrow_mut().push("close".into());
+            Ok(())
+        }
+    }
+
+    /// Mock control stream: records each fully-formed reply into the same log
+    /// (`reply` flushes exactly once per line, so we snapshot on flush).
+    struct MockCtrl {
+        log: Log,
+        buf: Vec<u8>,
+    }
+    impl Write for MockCtrl {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buf.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            let s = String::from_utf8_lossy(&self.buf).trim_end().to_string();
+            self.log.borrow_mut().push(format!("reply {s}"));
+            self.buf.clear();
+            Ok(())
+        }
+    }
+
+    // Issue #1: RETR (and LIST/NLST — same pump) must write the payload,
+    // close the data socket, and only THEN send 226. Never a bare 226 with
+    // the socket still open, never zero bytes.
+    #[test]
+    fn pump_writes_bytes_then_closes_then_226() {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let data = MockData { log: log.clone(), fail: false };
+        let mut ctrl = MockCtrl { log: log.clone(), buf: Vec::new() };
+        let payload = vec![0u8; 286]; // the field-report SIZE
+        pump_data(data, &mut ctrl, &payload).unwrap();
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                "write 286".to_string(),
+                "close".to_string(),
+                "reply 226 transfer complete".to_string(),
+            ]
+        );
+    }
+
+    // On a write failure the socket is still closed before the 426.
+    #[test]
+    fn pump_closes_socket_and_reports_426_on_write_error() {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let data = MockData { log: log.clone(), fail: true };
+        let mut ctrl = MockCtrl { log: log.clone(), buf: Vec::new() };
+        pump_data(data, &mut ctrl, b"whatever").unwrap();
+        assert_eq!(
+            *log.borrow(),
+            vec!["close".to_string(), "reply 426 transfer failed".to_string()]
+        );
     }
 }

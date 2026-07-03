@@ -43,6 +43,14 @@ pub(crate) fn format_227(ip: Ipv4Addr, port: u16) -> String {
     )
 }
 
+/// Format the `229` reply body for `EPSV`: `Entering Extended Passive Mode
+/// (|||PORT|)` — port only, no host. Because it omits the address, it works
+/// regardless of which address the client reached us on, sidestepping the
+/// PASV host-IP problem entirely for EPSV-capable clients.
+pub(crate) fn format_229(port: u16) -> String {
+    format!("Entering Extended Passive Mode (|||{port}|)")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,10 +58,24 @@ mod tests {
     #[test]
     fn pasv_227_encoding() {
         let ip = Ipv4Addr::new(100, 64, 0, 7);
-        // 30000 = 0x7530 -> 117, 48
+        // 30000 = 0x7530 -> 117, 48. The host bytes are the *tailnet* IP
+        // (our node's address, the one the control connection arrived on),
+        // never a LAN IP.
         assert_eq!(
             format_227(ip, 30000),
             "Entering Passive Mode (100,64,0,7,117,48)."
+        );
+    }
+
+    #[test]
+    fn epsv_229_encoding() {
+        assert_eq!(
+            format_229(30000),
+            "Entering Extended Passive Mode (|||30000|)"
+        );
+        assert_eq!(
+            format_229(21),
+            "Entering Extended Passive Mode (|||21|)"
         );
     }
 }
