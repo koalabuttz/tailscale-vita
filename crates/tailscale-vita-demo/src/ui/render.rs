@@ -30,10 +30,14 @@ pub const SCREEN_W: f32 = 960.0;
 pub const SCREEN_H: f32 = 544.0;
 const MARGIN: i32 = 32;
 const HEADER_H: f32 = 128.0;
-const ROW_H: i32 = 34;
-const LIST_TOP: i32 = 168;
+const ROW_H: i32 = 32;
+const LIST_TOP: i32 = 162;
 const FOOTER_TOP: f32 = 484.0;
-pub const VIEWPORT_ROWS: usize = ((FOOTER_TOP as i32 - LIST_TOP - 8) / ROW_H) as usize;
+/// Space reserved below the last peer row for the "... N more" indicator
+/// so it never collides with the footer separator.
+const MORE_RESERVE: i32 = 28;
+pub const VIEWPORT_ROWS: usize =
+    ((FOOTER_TOP as i32 - LIST_TOP - MORE_RESERVE) / ROW_H) as usize;
 
 // Tab bar geometry (inside the header card). Three equal cells.
 pub const TAB_Y: f32 = 92.0;
@@ -218,14 +222,46 @@ impl Renderer {
             self.text(MARGIN + 560, baseline, tone_color(row.path_tone), 0.95, &row.path);
         }
         if end < vm.rows.len() {
+            // Sits in the reserved gap between the last row and the
+            // footer rule (see MORE_RESERVE) — no overlap.
             self.text(
                 MARGIN + 26,
                 LIST_TOP + (VIEWPORT_ROWS as i32) * ROW_H + 18,
                 DIM,
-                0.8,
-                &format!("... {} more", vm.rows.len() - end),
+                0.78,
+                &format!("... {} more (scroll)", vm.rows.len() - end),
             );
         }
+    }
+
+    /// Greedily wrap `s` (space-separated tokens) to fit `max_w` pixels
+    /// at `scale`. A single over-wide token stays on its own line.
+    fn wrap(&self, s: &str, scale: f32, max_w: i32) -> Vec<String> {
+        if s.is_empty() {
+            return Vec::new();
+        }
+        if self.font.is_null() || self.text_w(scale, s) <= max_w {
+            return vec![s.to_string()];
+        }
+        let mut lines = Vec::new();
+        let mut cur = String::new();
+        for tok in s.split(' ') {
+            let candidate = if cur.is_empty() {
+                tok.to_string()
+            } else {
+                format!("{cur} {tok}")
+            };
+            if cur.is_empty() || self.text_w(scale, &candidate) <= max_w {
+                cur = candidate;
+            } else {
+                lines.push(std::mem::take(&mut cur));
+                cur = tok.to_string();
+            }
+        }
+        if !cur.is_empty() {
+            lines.push(cur);
+        }
+        lines
     }
 
     /// Settings tab body: ACL + key-expiry panel, then the toggle rows.
@@ -269,15 +305,39 @@ impl Renderer {
         }
     }
 
-    /// Modal peer-detail overlay over the current tab.
+    /// Modal peer-detail overlay over the current tab. Long values (the
+    /// endpoints / allowed-IPs lists) wrap within the panel instead of
+    /// running off-screen; if the content exceeds the panel it truncates
+    /// with a trailing "...".
     pub fn detail_overlay(&self, title: &str, lines: &[(String, String)]) {
         self.rect(60.0, 70.0, SCREEN_W - 120.0, SCREEN_H - 140.0, OVERLAY);
         self.rect(60.0, 70.0, SCREEN_W - 120.0, 3.0, TAB_ON);
         self.text(88, 118, TITLE, 1.2, title);
-        for (i, (label, value)) in lines.iter().enumerate() {
-            let y = 158 + (i as i32) * 30;
+
+        let value_x = 300;
+        let panel_right_inner = (60.0 + (SCREEN_W - 120.0) - 24.0) as i32;
+        let max_w = panel_right_inner - value_x;
+        let line_h = 28;
+        let bottom = 70 + (SCREEN_H as i32 - 140) - 44; // leave room for close hint
+        let mut y = 158;
+        for (label, value) in lines {
+            if y > bottom {
+                self.text(88, y, DIM, 0.85, "...");
+                break;
+            }
             self.text(88, y, DIM, 0.85, label);
-            self.text(300, y, TEXT, 0.85, value);
+            let wrapped = self.wrap(value, 0.85, max_w);
+            if wrapped.is_empty() {
+                y += line_h;
+            } else {
+                for chunk in wrapped {
+                    if y > bottom {
+                        break;
+                    }
+                    self.text(value_x, y, TEXT, 0.85, &chunk);
+                    y += line_h;
+                }
+            }
         }
         self.text(88, (SCREEN_H as i32) - 84, DIM, 0.8, "O / triangle: close");
     }

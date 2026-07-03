@@ -11,6 +11,13 @@ pub const DOWN: u32 = 0x0000_0040;
 pub const LEFT: u32 = 0x0000_0080;
 pub const LTRIGGER: u32 = 0x0000_0100;
 pub const RTRIGGER: u32 = 0x0000_0200;
+pub const L1: u32 = 0x0000_0400;
+pub const R1: u32 = 0x0000_0800;
+
+/// Any shoulder/D-pad chord that cycles to the PREVIOUS tab.
+pub const TAB_PREV: u32 = LTRIGGER | L1 | LEFT;
+/// Any shoulder/D-pad chord that cycles to the NEXT tab.
+pub const TAB_NEXT: u32 = RTRIGGER | R1 | RIGHT;
 pub const TRIANGLE: u32 = 0x0000_1000;
 pub const CIRCLE: u32 = 0x0000_2000;
 pub const CROSS: u32 = 0x0000_4000;

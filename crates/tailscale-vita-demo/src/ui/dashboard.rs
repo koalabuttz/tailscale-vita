@@ -153,11 +153,12 @@ pub fn run(exit: &AtomicBool) {
                 detail_key = None;
             }
         } else {
-            // Tab switch: L/R shoulders, or a tap on the tab bar.
-            if pressed & buttons::LTRIGGER != 0 {
+            // Tab switch: L/R shoulders (LTRIGGER or L1 — varies by unit),
+            // D-pad Left/Right, or a tap on the tab bar.
+            if pressed & buttons::TAB_PREV != 0 {
                 tab = tab.prev();
             }
-            if pressed & buttons::RTRIGGER != 0 {
+            if pressed & buttons::TAB_NEXT != 0 {
                 tab = tab.next();
             }
             if let Some((tx, ty)) = tap {
