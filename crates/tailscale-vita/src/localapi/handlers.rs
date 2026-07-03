@@ -256,6 +256,7 @@ mod tests {
             }],
             lifecycle: crate::lifecycle::OnlineState::Online,
             fatal_reason: None,
+            auth_url: None,
             peer_count: 1,
             derp_home_region: 12,
             alive_derp_regions: vec![12],

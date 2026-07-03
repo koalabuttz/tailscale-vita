@@ -55,6 +55,13 @@ pub enum OnlineState {
     /// 5+ consecutive control or DERP reconnects. We've lost the
     /// path repeatedly.
     Offline,
+    /// M18 interactive-login wait state: the control plane returned an
+    /// `AuthURL` (the empty-`auth_key` path) and the node isn't
+    /// authorized yet. The dashboard renders the URL as a QR to scan +
+    /// approve on a phone. NOT sticky (unlike `AuthFailed`) — once the
+    /// user approves and map/DERP signals flow, we transition normally
+    /// through `Connecting` → `Online`. Serializes as `"NeedsLogin"`.
+    NeedsLogin,
     /// Auth-fatal terminal state (M13.5): the control plane rejected
     /// our identity (bad / expired / revoked auth-key) and there's no
     /// point retrying. UI should prompt the user to fix `auth_key` in
@@ -125,6 +132,28 @@ impl LifecycleTracker {
         info!(?new, %reason, "lifecycle.fatal");
         self.state = new;
         self.fatal_reason = Some(reason);
+    }
+
+    /// M18: enter the interactive-login wait state. Driven directly by
+    /// `Runtime::up`'s register wait-loop (before the event loop runs),
+    /// so it bypasses `compute_next_state`. Non-sticky: a later `tick`
+    /// with real map/DERP signals recomputes normally. No-op if already
+    /// in `NeedsLogin`.
+    pub fn set_needs_login(&mut self) {
+        if self.state != OnlineState::NeedsLogin {
+            info!("lifecycle.needs_login");
+            self.state = OnlineState::NeedsLogin;
+        }
+    }
+
+    /// M18: leave `NeedsLogin` once the node authorizes, back to
+    /// `Connecting`. The normal map/DERP signals then drive us to
+    /// `Online`. No-op if we were never in `NeedsLogin`.
+    pub fn clear_needs_login(&mut self) {
+        if self.state == OnlineState::NeedsLogin {
+            info!("lifecycle.needs_login.cleared");
+            self.state = OnlineState::Connecting;
+        }
     }
 
     /// Record a control-plane event (any MapResponse, including KeepAlive).
@@ -383,6 +412,31 @@ mod tests {
         lt.record_derp_rx(t(0));
         lt.tick(t(0), 0, 1);
         assert_eq!(lt.state(), OnlineState::AuthFailed);
+    }
+
+    #[test]
+    fn needs_login_is_not_sticky() {
+        // NeedsLogin is a retryable wait-state: once map + DERP signals
+        // arrive, the tracker must be free to advance to Online (unlike
+        // the sticky AuthFailed/SecurityFailed states).
+        let mut lt = LifecycleTracker::new();
+        lt.set_needs_login();
+        assert_eq!(lt.state(), OnlineState::NeedsLogin);
+        lt.record_map_event(t(0));
+        lt.record_derp_rx(t(0));
+        lt.tick(t(0), 1, 1);
+        assert_eq!(lt.state(), OnlineState::Online);
+    }
+
+    #[test]
+    fn clear_needs_login_returns_to_connecting() {
+        let mut lt = LifecycleTracker::new();
+        lt.set_needs_login();
+        lt.clear_needs_login();
+        assert_eq!(lt.state(), OnlineState::Connecting);
+        // No-op when not in NeedsLogin.
+        lt.clear_needs_login();
+        assert_eq!(lt.state(), OnlineState::Connecting);
     }
 
     #[test]

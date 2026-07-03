@@ -41,6 +41,13 @@ pub struct RuntimeSnapshot {
     pub lifecycle: OnlineState,
     /// Human-readable explanation when `lifecycle` is fatal.
     pub fatal_reason: Option<String>,
+    /// M18: the control-plane `AuthURL` to display (as a QR + text) when
+    /// `lifecycle == NeedsLogin`. The user scans it on a phone and
+    /// approves the node; `Runtime::up`'s wait-loop then long-polls
+    /// until authorized and clears this. `None` outside interactive
+    /// login.
+    #[serde(default)]
+    pub auth_url: Option<String>,
     /// Peer count for quick sanity-check reads.
     pub peer_count: usize,
     /// Our chosen DERP home region (legacy field, see netmap.rs).
@@ -145,6 +152,7 @@ impl RuntimeSnapshot {
             our_addrs: Vec::new(),
             lifecycle: OnlineState::Connecting,
             fatal_reason: None,
+            auth_url: None,
             peer_count: 0,
             derp_home_region: 0,
             alive_derp_regions: Vec::new(),

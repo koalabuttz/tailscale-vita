@@ -2,10 +2,12 @@
 //! HTTP/2 conn, WG engine, DERP transport, netstack, and `MapClient`,
 //! and exposes a small public API for embedding apps:
 //!
-//! - `Runtime::up(config)` — blocks: fetch_server_key → KeyStore →
-//!   Noise+h2 → register → engine + DerpTransport + Stack + MapClient.
-//!   Returns once register has succeeded; the first MapResponse arrives
-//!   inside `run_event_loop`.
+//! - `Runtime::up(config)` — blocks: KeyStore → magicsock bind →
+//!   snapshot + LocalAPI (spawned early so the dashboard can render the
+//!   M18 interactive-login QR) → Noise+h2 → interactive register/login
+//!   loop → engine + DerpTransport + Stack + MapClient. Returns once the
+//!   node is authorized; the first MapResponse arrives inside
+//!   `run_event_loop`.
 //! - `runtime.netstack()` — for binding TcpListeners.
 //! - `runtime.lifecycle()` — read current `OnlineState`.
 //! - `runtime.run_event_loop(should_stop)` — drives MapClient + DERP
@@ -204,21 +206,18 @@ impl Runtime {
         );
 
         // KeyStore first — persistent machine/node/disco keys. Both the
-        // initial bootstrap below and any M13 reconnect reuse this.
-        let ks = KeyStore::load_or_generate(&state_dir)?;
+        // initial login below and any M13 reconnect reuse this. `mut`
+        // because the M18 interactive-login loop regenerates the node
+        // key if the control plane reports NodeKeyExpired.
+        let mut ks = KeyStore::load_or_generate(&state_dir)?;
         suprx_trace("up2: keystore loaded");
 
-        // 8. DerpTransport + MagicSocket (M12) + Engine + Stack.
-        // Same 32 priv bytes serve WG identity AND DERP NaCl-box ECDH
-        // (verified in spike-05). The disco priv key is separate.
-        let our_secret = x25519_dalek::StaticSecret::from(ks.node_priv.0);
-        let (derp_transport, derp_ctl) =
-            DerpTransport::new(ks.node_priv.0, ks.node_pub.0, config.max_derp_conns);
-
-        // Bind the Disco / direct-path UDP socket. Try the canonical
-        // 41641 first; if it's taken (or sceNet rejects), fall back
-        // to an ephemeral port. The actual bound port goes into our
-        // MapRequest.Endpoints advertisement so peers know where to ping.
+        // Bind the Disco / direct-path UDP socket early (M18). Try the
+        // canonical 41641 first; if it's taken (or sceNet rejects), fall
+        // back to an ephemeral port. magicsock must be live BEFORE the
+        // control session because both LocalAPI (active Disco pings) and
+        // the interactive-login snapshot are spun up ahead of login. The
+        // bound port goes into our MapRequest.Endpoints advertisement.
         let (non_disco_tx, non_disco_rx) = unbounded();
         let disco_priv = DiscoPrivateKey::from_bytes(ks.disco_priv.0);
         let our_node_pub_disco = NodePublicKey::from(ks.node_pub.0);
@@ -228,15 +227,15 @@ impl Runtime {
             non_disco_tx,
         )?;
         let magic_local = magic_ctl.local_addr();
-        suprx_trace("up4: magicsock bound");
+        suprx_trace("up3: magicsock bound");
         info!(%magic_local, "magicsock.bound");
 
         // Local endpoint candidates for MapRequest.Endpoints. Discover
         // our LAN IP via the connect-trick (kernel routing decision —
         // no packet actually sent).
-        suprx_trace("up5: pre build_local_endpoints (connect-trick)");
+        suprx_trace("up4: pre build_local_endpoints (connect-trick)");
         let local_endpoints = build_local_endpoints(&config.control_url, magic_local);
-        suprx_trace("up5b: local endpoints built");
+        suprx_trace("up4b: local endpoints built");
         // M14E: parallel `tailcfg.EndpointType` codes. Every endpoint
         // we build via the connect-trick is a LAN IP (Vita's WiFi
         // address), so type 1 = `EndpointLocal`. Real Tailscale
@@ -249,42 +248,19 @@ impl Runtime {
             "magicsock.endpoints.advertise"
         );
 
-        let engine = Arc::new(Engine::new(EngineConfig {
-            our_static_secret: our_secret,
-            mtu: 1280,
-            peers: vec![],
-        })?);
-        let dual = DualTransport::new(magic_ctl.clone(), non_disco_rx, derp_transport);
-        let hint: Arc<dyn wg_engine::DirectPathHint> = Arc::new(magic_ctl.clone());
-        let engine_running = engine.start_with_hint(dual, Some(hint))?;
-        suprx_trace("up6: wg engine pump started");
-        info!("wg-engine: pump running with DualTransport(Magic+Derp)");
-
-        let stack = Stack::start(StackConfig::new(), engine_running)?;
-        suprx_trace("up7: netstack poll started");
-        info!("netstack: poll thread running (no local IP yet)");
-
-        // 9. First control-plane session: Noise IK + H2 + register +
-        // MapClient. M13: factored into a helper so reconnect can call
-        // it again on long-poll failures.
-        suprx_trace("up8: pre bootstrap_control_session (server-key/Noise/h2/register)");
-        let map = bootstrap_control_session(
-            &config,
-            &ks,
-            &host_authority,
-            local_endpoints,
-            local_endpoint_types,
-            &state_dir,
-            BootstrapPhase::Initial,
-        )?;
-        suprx_trace("up9: control session up (registered + map started)");
-        info!("control.map.started");
-
+        // M18: control-signal channel + published snapshot + LocalAPI
+        // server, all created BEFORE the control session. An empty
+        // auth_key means we log in interactively (scan a QR), which can
+        // block for minutes; LocalAPI + the snapshot must already be
+        // serving so the dashboard can render the NeedsLogin screen with
+        // the AuthURL. The lifecycle tracker is likewise created early so
+        // the login loop can drive it into NeedsLogin.
         let (signal_tx, signal_rx) = unbounded();
         let snapshot = Arc::new(RwLock::new(RuntimeSnapshot::empty(
             config.hostname.clone(),
             magic_local,
         )));
+        let lifecycle = Mutex::new(LifecycleTracker::new());
 
         // M14: spawn LocalAPI server if configured. Bind failure is
         // non-fatal — the daemon keeps running without LocalAPI.
@@ -302,6 +278,70 @@ impl Runtime {
                 None
             }
         };
+
+        // M18: interactive control-plane login. Establish the Noise+H2
+        // tunnel, then register — looping with Followup=<AuthURL> until
+        // the node is authorized. An empty auth_key triggers the QR path
+        // (NeedsLogin + auth_url published into the snapshot); a
+        // non-empty key takes the one-shot path (a returned AuthURL is a
+        // hard AuthRejected inside register()). NodeKeyExpired
+        // regenerates the node key and restarts the loop. This blocks
+        // until the node is authorized (or a fatal control error).
+        suprx_trace("up5: pre establish_control_conn (server-key/Noise/h2)");
+        let mut conn = establish_control_conn(&config, &ks, &state_dir)?;
+        suprx_trace("up6: control conn up; registering (login)");
+        let backend_log_id = interactive_login(
+            &mut conn,
+            &config,
+            &mut ks,
+            &host_authority,
+            &state_dir,
+            &snapshot,
+            &lifecycle,
+        )?;
+        suprx_trace("up7: REGISTERED + authorized");
+        info!("control.login.authorized");
+
+        // Node identity is now authorized. Build the WG data plane with
+        // the (possibly regenerated) node key. Order preserved from
+        // pre-M18: DerpTransport → Engine → DualTransport → Stack →
+        // MapClient. Same 32 priv bytes serve WG identity AND DERP
+        // NaCl-box ECDH (verified in spike-05); the disco priv is
+        // separate.
+        let our_secret = x25519_dalek::StaticSecret::from(ks.node_priv.0);
+        let (derp_transport, derp_ctl) =
+            DerpTransport::new(ks.node_priv.0, ks.node_pub.0, config.max_derp_conns);
+
+        let engine = Arc::new(Engine::new(EngineConfig {
+            our_static_secret: our_secret,
+            mtu: 1280,
+            peers: vec![],
+        })?);
+        let dual = DualTransport::new(magic_ctl.clone(), non_disco_rx, derp_transport);
+        let hint: Arc<dyn wg_engine::DirectPathHint> = Arc::new(magic_ctl.clone());
+        let engine_running = engine.start_with_hint(dual, Some(hint))?;
+        suprx_trace("up8: wg engine pump started");
+        info!("wg-engine: pump running with DualTransport(Magic+Derp)");
+
+        let stack = Stack::start(StackConfig::new(), engine_running)?;
+        suprx_trace("up9: netstack poll started");
+        info!("netstack: poll thread running (no local IP yet)");
+
+        // MapClient on the authorized conn. Resumes `last_seq` from
+        // state_dir so a warm start doesn't redownload the world.
+        let map = MapClient::start(
+            conn,
+            ks.node_pub,
+            ks.disco_pub,
+            config.hostname.clone(),
+            backend_log_id,
+            host_authority.clone(),
+            state_dir.to_path_buf(),
+            local_endpoints,
+            local_endpoint_types,
+        )?;
+        suprx_trace("up10: control session up (map started)");
+        info!("control.map.started");
 
         // M16: tailnet-IP holder, published on the first MapResponse (see
         // run_event_loop). Shared with the optional ts-ftp service so its
@@ -351,7 +391,7 @@ impl Runtime {
             _magic_socket: Some(magic_socket),
             stack: Some(stack),
             map: Some(map),
-            lifecycle: Mutex::new(LifecycleTracker::new()),
+            lifecycle,
             signal_tx,
             signal_rx: Some(signal_rx),
             snapshot,
@@ -1241,15 +1281,18 @@ fn cooperative_sleep<F: FnMut() -> bool>(delay: Duration, should_stop: &mut F) -
     false
 }
 
-/// Which call-site is invoking `bootstrap_control_session`. Used only
-/// for log distinctness — the work performed is identical.
+/// Which reconnect attempt is invoking `bootstrap_control_session`.
+/// Used only for log distinctness — the work performed is identical.
+/// (The first-time bootstrap from `Runtime::up` no longer goes through
+/// this helper; M18 split its Noise/H2 setup into `establish_control_conn`
+/// so the interactive-login loop can drive register directly.)
 #[derive(Clone, Copy, Debug)]
 enum BootstrapPhase {
-    /// First-time bootstrap from `Runtime::up`. Logs at INFO.
-    Initial,
-    /// Reconnect attempt N after a control-plane error. Logs include
-    /// the attempt number for grep-ability.
-    Reconnect(u32),
+    /// Reconnect attempt N after a control-plane error. The number is
+    /// surfaced only through Debug logging (M18 removed the `Initial`
+    /// variant — interactive login owns first-boot now), so allow the
+    /// field to read as "unused" to dead-code analysis.
+    Reconnect(#[allow(dead_code)] u32),
 }
 
 /// Fetch server key → Noise IK → HTTP/2 → register → open MapClient.
@@ -1273,6 +1316,77 @@ fn bootstrap_control_session(
     phase: BootstrapPhase,
 ) -> Result<MapClient, ts_control::ControlError> {
     info!(?phase, "control.bootstrap.start");
+
+    let mut conn = establish_control_conn(config, ks, state_dir)?;
+
+    // Register. Reconnect uses the persisted (already-authorized) node
+    // key, so this is one-shot: Followup=None. Ephemeral=true is baked
+    // into ts_control::register so repeating is safe — the server either
+    // confirms the existing ephemeral node or attaches us to a fresh row.
+    let auth_key = config.auth_key.trim();
+    let backend_log_id = generate_backend_log_id();
+    info!(backend_log_id = %backend_log_id, "control.backend_log_id.generated");
+    let outcome = ts_control::register(
+        &mut conn,
+        auth_key,
+        &ks.node_pub,
+        &ks.nl_pub,
+        &backend_log_id,
+        &config.hostname,
+        host_authority,
+        None,
+    )?;
+    suprx_trace("cs7: REGISTERED with control plane!");
+    // A reconnect can't run the interactive (QR) login loop — the engine
+    // and netstack are already built around the current node key, and
+    // there's no screen ownership here. If the node lost authorization
+    // while we were disconnected (expired or deauthorized), surface a
+    // transient error; the user restarts to re-enter interactive login.
+    if outcome.node_key_expired {
+        warn!("control.reconnect.node_key_expired; restart to re-login");
+        return Err(ts_control::ControlError::Transport(
+            "register: node key expired on reconnect (restart to re-login)".into(),
+        ));
+    }
+    if let Some(url) = outcome.pending_auth_url {
+        warn!(auth_url = %url, "control.reconnect.needs_login; restart to re-login");
+        return Err(ts_control::ControlError::Transport(
+            "register: node deauthorized on reconnect (restart to re-login)".into(),
+        ));
+    }
+    info!(
+        machine_authorized = outcome.machine_authorized,
+        "control.register.ok"
+    );
+
+    // MapClient. Picks up `last_seq` from state_dir so a reconnect
+    // resumes the netmap delta instead of redownloading the world.
+    let map = MapClient::start(
+        conn,
+        ks.node_pub,
+        ks.disco_pub,
+        config.hostname.clone(),
+        backend_log_id,
+        host_authority.to_string(),
+        state_dir.to_path_buf(),
+        local_endpoints,
+        local_endpoint_types,
+    )?;
+    info!(?phase, "control.bootstrap.done");
+    Ok(map)
+}
+
+/// Establish the control-plane transport: fetch server key → Noise IK →
+/// HTTP/2 over the Noise tunnel. Returns the open `Http2Conn`; the
+/// caller drives register + MapClient. Split out of
+/// `bootstrap_control_session` (M18) so the interactive-login loop can
+/// re-POST `/machine/register` on the *same* conn while waiting for the
+/// user to approve.
+fn establish_control_conn(
+    config: &Config,
+    ks: &KeyStore,
+    state_dir: &Path,
+) -> Result<Http2Conn, ts_control::ControlError> {
     suprx_trace("cs1: pre fetch_server_key (first HTTPS/TLS)");
 
     // 1. Fetch server's Noise pubkey via cache (M13.5 Stage 2). Cache
@@ -1333,47 +1447,127 @@ fn bootstrap_control_session(
     // 3. HTTP/2 over the Noise tunnel.
     let async_stream = AsyncNoiseStream::spawn(noise_stream);
     info!("opening HTTP/2 over Noise");
-    let mut conn = Http2Conn::open(async_stream)?;
+    let conn = Http2Conn::open(async_stream)?;
     suprx_trace("cs6: h2 handshake complete (tokio block_on worked!)");
     info!("control.http2.handshake.complete");
+    Ok(conn)
+}
 
-    // 4. Register. Ephemeral=true is baked into ts_control::register so
-    // repeating this is safe — server either confirms the existing
-    // ephemeral node or attaches our identity to a fresh row.
+/// Safety re-poll cadence for the M18 interactive-login loop. The server
+/// long-polls on `Followup` (blocking until the user approves), so this
+/// short sleep is only a backstop against an early return — it stops a
+/// busy-spin without slowing real approval.
+const LOGIN_REPOLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// M18 interactive control-plane login. Registers on an already-open
+/// Noise+H2 `conn`, looping with `Followup=<AuthURL>` until the node is
+/// authorized. On the empty-`auth_key` path it publishes
+/// `OnlineState::NeedsLogin` + the AuthURL into the snapshot so the
+/// dashboard can render a QR; the user scans + approves on a phone and
+/// the server's long-poll then returns `MachineAuthorized=true`.
+/// `NodeKeyExpired` regenerates the node key and restarts the loop.
+///
+/// Returns the `backend_log_id` (generated once for this session) so the
+/// caller starts `MapClient` on the same conn/session.
+///
+/// With a non-empty `auth_key` this is effectively one-shot: register()
+/// never yields a pending AuthURL for a supplied key (it returns
+/// `AuthRejected` instead), so no NeedsLogin is ever published and the
+/// loop returns on the first authorized response.
+///
+/// Note: `Runtime::up` has no cooperative stop handle, so — like the
+/// pre-M18 blocking register — a login that the user never approves is
+/// interrupted only by process termination. The `LOGIN_REPOLL_INTERVAL`
+/// sleep keeps that wait from busy-spinning.
+#[allow(clippy::too_many_arguments)]
+fn interactive_login(
+    conn: &mut Http2Conn,
+    config: &Config,
+    ks: &mut KeyStore,
+    host_authority: &str,
+    state_dir: &Path,
+    snapshot: &Arc<RwLock<RuntimeSnapshot>>,
+    lifecycle: &Mutex<LifecycleTracker>,
+) -> Result<String, ts_control::ControlError> {
     let auth_key = config.auth_key.trim();
     let backend_log_id = generate_backend_log_id();
     info!(backend_log_id = %backend_log_id, "control.backend_log_id.generated");
-    let outcome = ts_control::register(
-        &mut conn,
-        auth_key,
-        &ks.node_pub,
-        &ks.nl_pub,
-        &backend_log_id,
-        &config.hostname,
-        host_authority,
-    )?;
-    suprx_trace("cs7: REGISTERED with control plane!");
-    info!(
-        machine_authorized = outcome.machine_authorized,
-        node_key_expired = outcome.node_key_expired,
-        "control.register.ok"
-    );
 
-    // 5. MapClient. Picks up `last_seq` from state_dir so a reconnect
-    // resumes the netmap delta instead of redownloading the world.
-    let map = MapClient::start(
-        conn,
-        ks.node_pub,
-        ks.disco_pub,
-        config.hostname.clone(),
-        backend_log_id,
-        host_authority.to_string(),
-        state_dir.to_path_buf(),
-        local_endpoints,
-        local_endpoint_types,
-    )?;
-    info!(?phase, "control.bootstrap.done");
-    Ok(map)
+    let mut followup: Option<String> = None;
+    let mut published_needs_login = false;
+
+    loop {
+        let outcome = ts_control::register(
+            conn,
+            auth_key,
+            &ks.node_pub,
+            &ks.nl_pub,
+            &backend_log_id,
+            &config.hostname,
+            host_authority,
+            followup.as_deref(),
+        )?;
+
+        // NodeKeyExpired: the persisted node identity is dead
+        // server-side. Mint a fresh key and restart the login from
+        // scratch (drop any Followup — it referenced the old key's URL).
+        // Guard on !machine_authorized so a response that somehow carries
+        // both flags still accepts the just-granted authorization.
+        if outcome.node_key_expired && !outcome.machine_authorized {
+            warn!("control.login.node_key_expired; regenerating node key + restarting login");
+            ks.regenerate_node_key(state_dir)?;
+            followup = None;
+            continue;
+        }
+
+        if outcome.machine_authorized {
+            // Leave the NeedsLogin wait-state so the dashboard flips off
+            // the QR screen immediately, before the event loop's first
+            // snapshot publish.
+            if published_needs_login {
+                lifecycle.lock().clear_needs_login();
+                publish_login_state(snapshot, lifecycle, None);
+            }
+            info!("control.login.authorized");
+            return Ok(backend_log_id);
+        }
+
+        match outcome.pending_auth_url {
+            Some(url) => {
+                info!(
+                    auth_url = %url,
+                    "control.login.pending; publishing NeedsLogin (scan to log in)"
+                );
+                lifecycle.lock().set_needs_login();
+                publish_login_state(snapshot, lifecycle, Some(url.clone()));
+                published_needs_login = true;
+                followup = Some(url);
+                std::thread::sleep(LOGIN_REPOLL_INTERVAL);
+            }
+            None => {
+                // register() only returns Ok without a pending AuthURL
+                // when authorized (handled above). Defensive.
+                return Err(ts_control::ControlError::Transport(
+                    "register: not authorized and no AuthURL".into(),
+                ));
+            }
+        }
+    }
+}
+
+/// M18: patch the published snapshot's `lifecycle` + `auth_url` without a
+/// full netmap rebuild (there's no netmap yet during login). Mirrors
+/// [`publish_fatal_state`]; holds the write lock for a few microseconds.
+fn publish_login_state(
+    out: &Arc<RwLock<RuntimeSnapshot>>,
+    lifecycle: &Mutex<LifecycleTracker>,
+    auth_url: Option<String>,
+) {
+    let state = lifecycle.lock().state();
+    let mut w = out.write();
+    w.lifecycle = state;
+    w.auth_url = auth_url;
+    w.updated_at_unix = now_unix();
 }
 
 /// Maintain a `node_pub → DERP region` map from each MapResponse
@@ -1491,6 +1685,10 @@ fn publish_snapshot(
         our_addrs,
         lifecycle,
         fatal_reason,
+        // M18: cleared once we're past interactive login (steady state).
+        // The login wait-loop sets it via `publish_login_state`; here
+        // the netmap is live so there's nothing to log in for.
+        auth_url: None,
         peer_count: netmap.peers.len(),
         derp_home_region,
         alive_derp_regions,

@@ -19,8 +19,12 @@ pub struct Config {
     /// Headscale, or "https://controlplane.tailscale.com" for prod.
     pub control_url: String,
 
-    /// Headscale auth key. Bare hex on Headscale 0.26; `tskey-auth-...`
-    /// on Tailscale prod. Passed verbatim — don't strip prefixes.
+    /// Auth key. **Empty (the default) = interactive QR login** (M18):
+    /// register with the `Auth` struct omitted, show the returned AuthURL
+    /// as an on-screen QR, and wait for the user to approve on a phone.
+    /// A non-empty value is an automation override for hands-free
+    /// registration — bare hex on Headscale 0.26; `tskey-auth-...` on
+    /// Tailscale prod. Passed verbatim — don't strip prefixes.
     pub auth_key: String,
 
     /// Hostname this Vita advertises in `Hostinfo`.
@@ -140,7 +144,14 @@ const TEMPLATE: &str = r#"# tailscale-vita demo config
 
 control_url = "http://HEADSCALE_HOST_IP:8080"
 
-# Bare hex on Headscale 0.26. Generate via:
+# Leave empty to log in interactively (M18): on first run the Vita
+# shows a QR code + URL on screen — scan it with your phone and approve
+# the node on Tailscale/Headscale. The authorized node key is then
+# persisted, so later boots go straight to Online with no QR.
+#
+# Optional automation override: paste a pre-auth key to register
+# hands-free. Bare hex on Headscale 0.26 / `tskey-auth-...` on Tailscale.
+# Generate via:
 #   docker exec tailscale-vita-headscale headscale preauthkeys create \
 #     --user 1 -e 720h --reusable
 auth_key    = ""

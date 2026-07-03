@@ -360,10 +360,9 @@ fn run_runtime() {
         "suprx.config.loaded"
     );
 
-    if cfg.auth_key.trim().is_empty() {
-        error!("suprx: auth_key empty; aborting before headscale 401");
-        return;
-    }
+    // M18: an empty auth_key is no longer an abort — it means
+    // interactive (QR) login. Runtime::up publishes NeedsLogin + the
+    // AuthURL into the snapshot and long-polls until the user approves.
 
     let port = cfg.demo_port;
     let pool = cfg.listener_pool_size;

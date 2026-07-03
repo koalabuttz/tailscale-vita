@@ -130,14 +130,9 @@ fn run() -> Result<(), DemoError> {
         return Ok(());
     }
 
-    if config.auth_key.is_empty() {
-        warn!(
-            "config.auth_key is empty; aborting before we hit the Headscale 401. \
-             Generate via `headscale preauthkeys create --user 1 -e 720h --reusable` \
-             and paste into config.toml."
-        );
-        return Ok(());
-    }
+    // M18: an empty auth_key is no longer an abort — Runtime::up logs in
+    // interactively (QR on screen; scan + approve on a phone) and
+    // long-polls until authorized before continuing.
 
     // 2. Bring up the runtime.
     let pool_size = config.listener_pool_size;
