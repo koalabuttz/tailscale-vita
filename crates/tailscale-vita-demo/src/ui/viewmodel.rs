@@ -451,14 +451,21 @@ pub fn fmt_duration_secs(secs: u64) -> String {
 }
 
 /// M19 identity string for the header's right slot: `login · domain`, or
-/// just `login` when the tailnet domain hasn't landed yet. `None` when we
-/// have no login name (tagged node, or before the profile arrives) — the
-/// caller falls back to the DERP/uptime status string.
+/// just `login` when the tailnet domain hasn't landed yet or adds nothing.
+/// `None` when we have no login name (tagged node, or before the profile
+/// arrives) — the caller falls back to the DERP/uptime status string.
+///
+/// A personal Tailscale account reports the tailnet domain equal to the
+/// login (both are the account email), which rendered as the same address
+/// twice — and the second copy got truncated by the header width guard, so
+/// it read like something was cut off (hardware 2026-07-03). Show the domain
+/// only when it's distinct from the login; a real tailnet name
+/// (`corp.com`, `tailXXXX.ts.net`) is still surfaced.
 fn identity_line(snap: &RuntimeSnapshot) -> Option<String> {
-    let login = snap.user_login.as_deref().filter(|s| !s.is_empty())?;
-    match snap.tailnet_domain.as_deref().filter(|d| !d.is_empty()) {
-        Some(domain) => Some(format!("{login} · {domain}")),
-        None => Some(login.to_string()),
+    let login = snap.user_login.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+    match snap.tailnet_domain.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        Some(domain) if !domain.eq_ignore_ascii_case(login) => Some(format!("{login} · {domain}")),
+        _ => Some(login.to_string()),
     }
 }
 
@@ -687,7 +694,7 @@ mod tests {
         // No identity yet → DERP/uptime fallback (unchanged behavior).
         let vm = build(&snap_with(vec![]), 1_000_002);
         assert!(vm.header.right.ends_with("up 2h14m"), "{}", vm.header.right);
-        // login + domain → "login · domain".
+        // login + distinct domain → "login · domain".
         let mut s = snap_with(vec![]);
         s.user_login = Some("dave@example.com".into());
         s.tailnet_domain = Some("example.com".into());
@@ -696,6 +703,12 @@ mod tests {
         let mut s = snap_with(vec![]);
         s.user_login = Some("dave@example.com".into());
         assert_eq!(build(&s, 1_000_002).header.right, "dave@example.com");
+        // Personal account: domain == login (both the email) → collapse to
+        // just the login, no redundant/truncated second copy.
+        let mut s = snap_with(vec![]);
+        s.user_login = Some("dgodlewski9@gmail.com".into());
+        s.tailnet_domain = Some("dgodlewski9@gmail.com".into());
+        assert_eq!(build(&s, 1_000_002).header.right, "dgodlewski9@gmail.com");
     }
 
     #[test]
