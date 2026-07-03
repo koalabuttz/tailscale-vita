@@ -92,6 +92,34 @@ pub struct Config {
     /// [`crate::egress_probe::EgressProbeConfig`] + docs/EGRESS-PROBE.md.
     #[serde(default)]
     pub egress_probe: crate::egress_probe::EgressProbeConfig,
+
+    /// `[tailnet]` — lifecycle state (M19). `want_running = false` boots
+    /// the runtime parked in `OnlineState::Stopped` (equivalent to
+    /// `tailscale down`); the eboot's Tailnet toggle flips it via LocalAPI
+    /// `/up`//`/down` and persists it here for the next boot. Default on.
+    #[serde(default)]
+    pub tailnet: TailnetConfig,
+}
+
+/// `[tailnet]` section — the persisted `WantRunning` bit (M19).
+#[derive(Clone, Debug, Deserialize)]
+pub struct TailnetConfig {
+    /// Whether the tailnet data plane runs. `false` parks the runtime in
+    /// `OnlineState::Stopped` at boot. **Default true is load-bearing** —
+    /// a bare `#[serde(default)]` on a bool deserializes to `false`, which
+    /// would boot every upgrading user (whose config predates `[tailnet]`)
+    /// into Stopped. The field- and section-level defaults both resolve to
+    /// `true` so a missing key OR a missing `[tailnet]` section ⇒ running.
+    #[serde(default = "default_true")]
+    pub want_running: bool,
+}
+
+impl Default for TailnetConfig {
+    fn default() -> Self {
+        Self {
+            want_running: default_true(),
+        }
+    }
 }
 
 impl Config {
@@ -183,6 +211,13 @@ capver              = 138
 # run. Default false (M10 demo behavior).
 # suprx_host_only   = false
 
+# Tailnet lifecycle (M19). want_running = false boots the runtime parked
+# (Stopped, like `tailscale down`); the dashboard's Tailnet toggle flips
+# this via LocalAPI and persists it here for the next boot. Default true —
+# a missing key or missing [tailnet] section is treated as running.
+[tailnet]
+want_running = true
+
 # FTP server on the tailnet IP — reach the Vita's files from any network
 # with a standard FTP client. Off by default: it exposes the filesystem,
 # gated only by your tailnet ACL. Plaintext is fine — WireGuard encrypts
@@ -231,6 +266,9 @@ fn default_capver() -> u32 {
 fn default_localapi_port() -> Option<u16> {
     Some(crate::localapi::DEFAULT_PORT)
 }
+fn default_true() -> bool {
+    true
+}
 
 #[cfg(test)]
 mod tests {
@@ -248,6 +286,9 @@ mod tests {
         assert_eq!(cfg.capver, 138);
         assert_eq!(cfg.run_window_secs, None);
         assert!(!cfg.suprx_host_only);
+        // [tailnet] want_running = true in the template, and the default
+        // resolves to true even if the section were absent.
+        assert!(cfg.tailnet.want_running);
     }
 
     #[test]
@@ -267,6 +308,7 @@ mod tests {
             localapi_port: Some(crate::localapi::DEFAULT_PORT),
             ftp: ts_ftp::FtpConfig::default(),
             egress_probe: Default::default(),
+            tailnet: TailnetConfig::default(),
         };
         assert_eq!(cfg.host_authority(), "192.0.2.1:8080");
     }
@@ -288,6 +330,7 @@ mod tests {
             localapi_port: Some(crate::localapi::DEFAULT_PORT),
             ftp: ts_ftp::FtpConfig::default(),
             egress_probe: Default::default(),
+            tailnet: TailnetConfig::default(),
         };
         assert_eq!(cfg.host_authority(), "controlplane.tailscale.com");
     }
@@ -303,5 +346,8 @@ mod tests {
         assert_eq!(cfg.demo_port, 8080);
         assert_eq!(cfg.max_derp_conns, 8);
         assert_eq!(cfg.capver, ts_control::CAPVER as u32);
+        // Load-bearing: a config predating [tailnet] must default to
+        // running, NOT the bool-default `false` (which would boot Stopped).
+        assert!(cfg.tailnet.want_running);
     }
 }
