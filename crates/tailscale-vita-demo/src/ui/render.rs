@@ -52,9 +52,10 @@ pub fn tab_cell_w() -> f32 {
     (SCREEN_W - 2.0 * MARGIN as f32) / TAB_COUNT as f32
 }
 
-// Settings rows.
+// Settings rows. SET_ROW_H shrank to 36 (M19) so all six rows fit above
+// FOOTER_TOP: 232 + 6·36 = 448 < 484.
 const SET_TOP: i32 = 232;
-const SET_ROW_H: i32 = 44;
+const SET_ROW_H: i32 = 36;
 
 // M18 interactive-login (NeedsLogin) full-screen view geometry.
 const LOGIN_TITLE_Y: i32 = 36;
@@ -172,6 +173,9 @@ impl Renderer {
             &vm.header.lifecycle,
         );
         self.text(MARGIN, 74, tone_color(vm.header.sub_tone), 0.85, &vm.header.sub);
+        // M19 identity card ("login · domain", else DERP/uptime): right-
+        // aligned on the sub line.
+        self.text_right((SCREEN_W as i32) - MARGIN, 74, DIM, 0.85, &vm.header.right);
 
         // Tab bar.
         let cw = tab_cell_w();
@@ -360,6 +364,21 @@ impl Renderer {
         self.text(88, (SCREEN_H as i32) - 84, DIM, 0.8, "O / triangle: close");
     }
 
+    /// M19 modal confirm overlay (logout): the same panel chrome as
+    /// `detail_overlay`, but centered prose `body` lines + a confirm/cancel
+    /// `hint` instead of label/value rows.
+    pub fn confirm_overlay(&self, title: &str, body: &[&str], hint: &str) {
+        self.rect(60.0, 70.0, SCREEN_W - 120.0, SCREEN_H - 140.0, OVERLAY);
+        self.rect(60.0, 70.0, SCREEN_W - 120.0, 3.0, TAB_ON);
+        self.text(88, 118, TITLE, 1.2, title);
+        let mut y = 184;
+        for line in body {
+            self.text(88, y, TEXT, 0.9, line);
+            y += 30;
+        }
+        self.text(88, (SCREEN_H as i32) - 84, WARN, 0.85, hint);
+    }
+
     /// Footer: action-result line + staleness + legend.
     pub fn footer(&self, action: Option<(&str, Tone)>, staleness: (&str, Tone), legend: &str) {
         self.rect(0.0, FOOTER_TOP, SCREEN_W, 2.0, RULE);
@@ -378,12 +397,29 @@ impl Renderer {
         self.end();
     }
 
-    /// M18 full-screen interactive-login view (drawn when the snapshot's
-    /// lifecycle is `NeedsLogin`): the control-plane AuthURL as a big
-    /// centered QR plus the URL as wrapped text. `auth_url` is `None`
-    /// while registration is still starting (no URL published yet).
-    pub fn login_frame(&self, auth_url: Option<&str>) {
+    /// M18/M19 full-screen interactive-login view (drawn when the
+    /// snapshot's lifecycle is `NeedsLogin`). Three modes:
+    /// - `Some(url)` → the control-plane AuthURL as a big centered QR plus
+    ///   the URL as wrapped text.
+    /// - `None` + `login_in_progress` → "starting login..." (registration
+    ///   underway, no URL published yet).
+    /// - `None` + not in progress → M19 logged-out parked screen (after a
+    ///   logout): an invite to press ✕ to start a fresh login.
+    pub fn login_frame(&self, auth_url: Option<&str>, login_in_progress: bool) {
         self.begin();
+        if auth_url.is_none() && !login_in_progress {
+            // Logged-out parked (post-logout): no QR yet, no login running.
+            self.text_center(220, TITLE, 1.2, "Logged out");
+            self.text_center(
+                270,
+                DIM,
+                0.9,
+                "This device's key was expired at control.",
+            );
+            self.text_center(324, WARN, 1.0, "Press X to log in");
+            self.end();
+            return;
+        }
         self.text_center(LOGIN_TITLE_Y, TITLE, 1.2, "Log in to your tailnet");
         self.text_center(
             LOGIN_SUB_Y,

@@ -67,6 +67,15 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// The one overlay (if any) currently owning input. Exactly one can be
+/// open at a time; while open it captures ✕/○/△ so the tab underneath
+/// doesn't also react. `PeerDetail` holds the peer's node-key hex.
+enum Modal {
+    None,
+    PeerDetail(String),
+    ConfirmLogout,
+}
+
 pub fn run(exit: &AtomicBool) {
     let renderer = Renderer::init();
     let shared: Arc<Mutex<Shared>> = Shared::new();
@@ -83,7 +92,7 @@ pub fn run(exit: &AtomicBool) {
     let mut selected_key: Option<(String, String)> = None;
     let mut settings_selected: usize = 0;
     let mut debug_scroll: usize = 0;
-    let mut detail_key: Option<String> = None;
+    let mut modal = Modal::None;
 
     let mut prev_buttons: u32 = 0;
     let mut prev_touch = false;
@@ -149,10 +158,37 @@ pub fn run(exit: &AtomicBool) {
             }
         };
 
-        // ── Navigation / actions (overlay captures input when open) ──
-        if detail_key.is_some() {
+        // M19: a full-screen lifecycle view (the NeedsLogin QR / spinner /
+        // logged-out screen) is up whenever lifecycle == NeedsLogin. While
+        // it's up the tabbed-dashboard input is gated entirely so a ✕ can't
+        // invisibly fire a Settings row underneath.
+        let login_view =
+            matches!(&snapshot, Some(s) if s.lifecycle == OnlineState::NeedsLogin);
+
+        // ── Navigation / actions (overlay/full-screen captures input) ──
+        if login_view {
+            // Logged-out parked (no URL, no login running) → ✕ starts a
+            // fresh interactive login. The QR / "starting login" modes are
+            // inert (approval happens on the phone).
+            if let Some(s) = &snapshot {
+                if s.auth_url.is_none()
+                    && !s.login_in_progress
+                    && pressed & buttons::CROSS != 0
+                {
+                    send(UiAction::LoginInteractive);
+                }
+            }
+        } else if matches!(modal, Modal::PeerDetail(_)) {
             if pressed & (buttons::CIRCLE | buttons::TRIANGLE | buttons::CROSS) != 0 {
-                detail_key = None;
+                modal = Modal::None;
+            }
+        } else if matches!(modal, Modal::ConfirmLogout) {
+            // ✕ confirms the logout; ○/△ cancel.
+            if pressed & buttons::CROSS != 0 {
+                send(UiAction::Logout);
+                modal = Modal::None;
+            } else if pressed & (buttons::CIRCLE | buttons::TRIANGLE) != 0 {
+                modal = Modal::None;
             }
         } else {
             // Tab switch: L/R shoulders (LTRIGGER or L1 — varies by unit),
@@ -200,7 +236,7 @@ pub fn run(exit: &AtomicBool) {
                                 }
                             }
                             if pressed & buttons::CIRCLE != 0 {
-                                detail_key = Some(row.node_key.clone());
+                                modal = Modal::PeerDetail(row.node_key.clone());
                             }
                         }
                     }
@@ -219,9 +255,22 @@ pub fn run(exit: &AtomicBool) {
                             SettingRow::FtpReadOnly => {
                                 send(UiAction::ToggleFtp { key: "read_only" })
                             }
-                            SettingRow::Reconnect | SettingRow::Relogin => {
-                                send(UiAction::Reconnect)
+                            SettingRow::TailnetToggle => {
+                                // Flip by current lifecycle: Stopped → up.
+                                let stopped = matches!(
+                                    &snapshot,
+                                    Some(s) if s.lifecycle == OnlineState::Stopped
+                                );
+                                send(if stopped {
+                                    UiAction::TailnetUp
+                                } else {
+                                    UiAction::TailnetDown
+                                });
                             }
+                            SettingRow::Reconnect => send(UiAction::Reconnect),
+                            SettingRow::Reauthenticate => send(UiAction::LoginInteractive),
+                            // Confirm overlay first (fat-finger guard).
+                            SettingRow::Logout => modal = Modal::ConfirmLogout,
                         }
                     }
                 }
@@ -241,9 +290,10 @@ pub fn run(exit: &AtomicBool) {
         // M18: while the runtime is in NeedsLogin the eboot can't register
         // — it renders the AuthURL the SUPRX published into the snapshot as
         // a full-screen QR-login view instead of the tabbed dashboard.
-        if matches!(&snapshot, Some(s) if s.lifecycle == OnlineState::NeedsLogin) {
+        if login_view {
             let auth_url = snapshot.as_ref().and_then(|s| s.auth_url.as_deref());
-            renderer.login_frame(auth_url);
+            let in_progress = snapshot.as_ref().map(|s| s.login_in_progress).unwrap_or(false);
+            renderer.login_frame(auth_url, in_progress);
         } else if let (Some(vm), Some(snap)) = (&vm, &snapshot) {
             renderer.begin();
             renderer.header(vm, tab);
@@ -261,7 +311,7 @@ pub fn run(exit: &AtomicBool) {
                     let kx = viewmodel::key_expiry_line(snap, now_u);
                     let rows: Vec<(String, String, Tone)> = SettingRow::ALL
                         .iter()
-                        .map(|r| r.render(ftp_en, ftp_ro))
+                        .map(|r| r.render(ftp_en, ftp_ro, snap.lifecycle))
                         .collect();
                     renderer.settings_body(
                         (&acl.0, acl.1),
@@ -287,9 +337,10 @@ pub fn run(exit: &AtomicBool) {
                 (&vm.staleness, vm.staleness_tone),
                 legend,
             );
-            // Peer-detail overlay (any tab).
-            if let Some(key) = &detail_key {
-                match viewmodel::peer_detail_lines(snap, key, now_u) {
+            // Overlay (any tab): peer-detail or the logout confirm.
+            let mut clear_modal = false;
+            match &modal {
+                Modal::PeerDetail(key) => match viewmodel::peer_detail_lines(snap, key, now_u) {
                     Some(lines) => {
                         let title = lines
                             .iter()
@@ -298,8 +349,19 @@ pub fn run(exit: &AtomicBool) {
                             .unwrap_or_else(|| "peer".into());
                         renderer.detail_overlay(&title, &lines);
                     }
-                    None => detail_key = None, // peer vanished
+                    None => clear_modal = true, // peer vanished
+                },
+                Modal::ConfirmLogout => {
+                    renderer.confirm_overlay(
+                        "Log out?",
+                        &["This expires the device's key at control."],
+                        "X confirm   O cancel",
+                    );
                 }
+                Modal::None => {}
+            }
+            if clear_modal {
+                modal = Modal::None;
             }
             renderer.end();
         } else {

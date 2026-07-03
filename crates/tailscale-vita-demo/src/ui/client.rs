@@ -79,6 +79,12 @@ pub enum UiAction {
     Reconnect,
     /// Toggle a `[ftp]` bool (`"enabled"` or `"read_only"`).
     ToggleFtp { key: &'static str },
+    /// M19 lifecycle actions (zero-parameter LocalAPI POSTs). `TailnetUp`/
+    /// `TailnetDown` also persist `[tailnet] want_running` for next boot.
+    TailnetUp,
+    TailnetDown,
+    Logout,
+    LoginInteractive,
 }
 
 impl UiAction {
@@ -87,6 +93,10 @@ impl UiAction {
             UiAction::Ping { peer_name, .. } => format!("pinging {peer_name}..."),
             UiAction::Reconnect => "reconnecting...".into(),
             UiAction::ToggleFtp { key } => format!("saving ftp.{key}..."),
+            UiAction::TailnetUp => "starting tailnet...".into(),
+            UiAction::TailnetDown => "stopping tailnet...".into(),
+            UiAction::Logout => "logging out...".into(),
+            UiAction::LoginInteractive => "starting login...".into(),
         }
     }
 }
@@ -164,6 +174,22 @@ fn run_action(shared: &Arc<Mutex<Shared>>, action: UiAction) {
             info!(key, "ui.action.toggle_ftp");
             do_toggle_ftp(shared, key)
         }
+        UiAction::TailnetUp => {
+            info!("ui.action.tailnet_up");
+            do_tailnet_up()
+        }
+        UiAction::TailnetDown => {
+            info!("ui.action.tailnet_down");
+            do_tailnet_down()
+        }
+        UiAction::Logout => {
+            info!("ui.action.logout");
+            do_logout()
+        }
+        UiAction::LoginInteractive => {
+            info!("ui.action.login_interactive");
+            do_login_interactive()
+        }
     };
     info!(result = %line, ok, "ui.action.result");
     let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
@@ -229,6 +255,53 @@ fn do_reconnect() -> (String, bool) {
         }
         Err(e) => (format!("reconnect: {e}"), false),
     }
+}
+
+/// POST a zero-parameter M19 lifecycle endpoint (`/up`, `/down`,
+/// `/logout`, `/login-interactive`) and map the reply to a footer line —
+/// same 202/409/error shape as [`do_reconnect`]. 202 = accepted (watch
+/// /status); a JSON `error` = refused; anything else = the raw status.
+fn post_lifecycle(path: &str, noun: &str, accepted: &str) -> (String, bool) {
+    match http_req("POST", path, ACTION_READ_TIMEOUT) {
+        Ok((status, body)) => {
+            let parsed: Option<ReconnectResp> = serde_json::from_slice(&body).ok();
+            match (status, parsed) {
+                (202, _) => (accepted.to_string(), true),
+                (_, Some(ReconnectResp { error: Some(e), .. })) => {
+                    (format!("{noun} refused: {e}"), false)
+                }
+                (s, _) => (format!("{noun}: HTTP {s}"), false),
+            }
+        }
+        Err(e) => (format!("{noun}: {e}"), false),
+    }
+}
+
+fn do_tailnet_up() -> (String, bool) {
+    // Persist want_running for next boot (best-effort), then resume live.
+    let _ = config_edit::apply_set(CONFIG_PATH, "tailnet", "want_running", true);
+    post_lifecycle("/localapi/v0/up", "tailnet up", "tailnet up — reconnecting")
+}
+
+fn do_tailnet_down() -> (String, bool) {
+    let _ = config_edit::apply_set(CONFIG_PATH, "tailnet", "want_running", false);
+    post_lifecycle("/localapi/v0/down", "tailnet down", "tailnet stopped")
+}
+
+fn do_logout() -> (String, bool) {
+    post_lifecycle(
+        "/localapi/v0/logout",
+        "logout",
+        "logged out — control key expired",
+    )
+}
+
+fn do_login_interactive() -> (String, bool) {
+    post_lifecycle(
+        "/localapi/v0/login-interactive",
+        "login",
+        "login started — scan the QR",
+    )
 }
 
 fn do_toggle_ftp(shared: &Arc<Mutex<Shared>>, key: &'static str) -> (String, bool) {

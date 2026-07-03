@@ -48,34 +48,42 @@ impl Tab {
     }
 }
 
-/// A row in the Settings tab. `Reconnect`/`Relogin` are live actions;
-/// the two ftp rows are config toggles (rewrite config.toml, relaunch to
-/// apply). `Relogin` (M18) re-runs the control session to re-enter the
-/// interactive-login flow after a `NodeKeyExpired` — it shares the
-/// `/reconnect` trigger for now.
+/// A row in the Settings tab. The two ftp rows are config toggles
+/// (rewrite config.toml, relaunch to apply). `TailnetToggle` (M19) flips
+/// the live `want_running` state (`/up`/`/down`, also persisted); its
+/// value cell shows `on`/`off` from the lifecycle. `Reconnect` rebuilds
+/// the control session; `Reauthenticate` (M19) starts a fresh interactive
+/// login (`/login-interactive`); `Logout` expires the node's key at
+/// control (guarded by a confirm overlay).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingRow {
     FtpEnabled,
     FtpReadOnly,
+    TailnetToggle,
     Reconnect,
-    Relogin,
+    Reauthenticate,
+    Logout,
 }
 
 impl SettingRow {
-    pub const ALL: [SettingRow; 4] = [
+    pub const ALL: [SettingRow; 6] = [
         SettingRow::FtpEnabled,
         SettingRow::FtpReadOnly,
+        SettingRow::TailnetToggle,
         SettingRow::Reconnect,
-        SettingRow::Relogin,
+        SettingRow::Reauthenticate,
+        SettingRow::Logout,
     ];
 
     /// Display label + right-hand value string for the current state.
     /// `ftp_enabled`/`ftp_read_only` are the live config.toml values
-    /// (`None` = couldn't read the file).
+    /// (`None` = couldn't read the file); `lifecycle` drives the tailnet
+    /// on/off value cell (`Stopped` ⇒ off).
     pub fn render(
         self,
         ftp_enabled: Option<bool>,
         ftp_read_only: Option<bool>,
+        lifecycle: OnlineState,
     ) -> (String, String, Tone) {
         let on_off = |b: Option<bool>| match b {
             Some(true) => ("ON".to_string(), Tone::Good),
@@ -91,12 +99,20 @@ impl SettingRow {
                 let (v, t) = on_off(ftp_read_only);
                 ("ts-ftp read-only".into(), v, t)
             }
+            SettingRow::TailnetToggle => {
+                if lifecycle == OnlineState::Stopped {
+                    ("Tailnet".into(), "off".into(), Tone::Dim)
+                } else {
+                    ("Tailnet".into(), "on".into(), Tone::Good)
+                }
+            }
             SettingRow::Reconnect => {
                 ("Reconnect to control".into(), "press X".into(), Tone::Normal)
             }
-            SettingRow::Relogin => {
-                ("Re-login (expired key)".into(), "press X".into(), Tone::Warn)
+            SettingRow::Reauthenticate => {
+                ("Re-authenticate".into(), "press X".into(), Tone::Warn)
             }
+            SettingRow::Logout => ("Log out".into(), "press X".into(), Tone::Bad),
         }
     }
 }
@@ -143,17 +159,23 @@ pub fn build(snap: &RuntimeSnapshot, now_unix: u64) -> DashVm {
         .unwrap_or_else(|| "—".into());
     let (lifecycle, lifecycle_tone) = lifecycle_display(snap.lifecycle);
 
-    let mut right = String::new();
-    if snap.derp_home_region != 0 {
-        right.push_str(&format!("DERP {}", snap.derp_home_region));
-    }
-    if !right.is_empty() {
-        right.push_str(" · ");
-    }
-    right.push_str(&format!(
-        "up {}",
-        fmt_duration_secs(now_unix.saturating_sub(snap.started_at_unix))
-    ));
+    // M19 identity card: prefer "login · domain" in the header's right
+    // slot once the netmap resolves our login name; otherwise fall back to
+    // the DERP/uptime status string (still visible verbatim in Debug).
+    let right = identity_line(snap).unwrap_or_else(|| {
+        let mut r = String::new();
+        if snap.derp_home_region != 0 {
+            r.push_str(&format!("DERP {}", snap.derp_home_region));
+        }
+        if !r.is_empty() {
+            r.push_str(" · ");
+        }
+        r.push_str(&format!(
+            "up {}",
+            fmt_duration_secs(now_unix.saturating_sub(snap.started_at_unix))
+        ));
+        r
+    });
 
     let (sub, sub_tone) = if snap.acl.has_tags {
         let mut s = format!("tags: {}", snap.acl.tags.join(" "));
@@ -395,6 +417,18 @@ pub fn fmt_duration_secs(secs: u64) -> String {
     }
 }
 
+/// M19 identity string for the header's right slot: `login · domain`, or
+/// just `login` when the tailnet domain hasn't landed yet. `None` when we
+/// have no login name (tagged node, or before the profile arrives) — the
+/// caller falls back to the DERP/uptime status string.
+fn identity_line(snap: &RuntimeSnapshot) -> Option<String> {
+    let login = snap.user_login.as_deref().filter(|s| !s.is_empty())?;
+    match snap.tailnet_domain.as_deref().filter(|d| !d.is_empty()) {
+        Some(domain) => Some(format!("{login} · {domain}")),
+        None => Some(login.to_string()),
+    }
+}
+
 fn lifecycle_display(l: OnlineState) -> (String, Tone) {
     let tone = match l {
         OnlineState::Online => Tone::Good,
@@ -403,6 +437,9 @@ fn lifecycle_display(l: OnlineState) -> (String, Tone) {
         // view is rendered separately (S5).
         OnlineState::Connecting | OnlineState::Degraded | OnlineState::NeedsLogin => Tone::Warn,
         OnlineState::Offline | OnlineState::AuthFailed | OnlineState::SecurityFailed => Tone::Bad,
+        // M19: the parked `Stopped` state is a deliberate, healthy
+        // disconnect — dim, not an error tone.
+        OnlineState::Stopped => Tone::Dim,
     };
     (format!("{l:?}"), tone)
 }
@@ -546,22 +583,64 @@ mod tests {
 
     #[test]
     fn setting_row_renders_states() {
-        let (l, v, t) = SettingRow::FtpEnabled.render(Some(true), Some(false));
+        let ol = OnlineState::Online;
+        let (l, v, t) = SettingRow::FtpEnabled.render(Some(true), Some(false), ol);
         assert_eq!(l, "ts-ftp server");
         assert_eq!(v, "ON");
         assert_eq!(t, Tone::Good);
-        let (_, v, t) = SettingRow::FtpReadOnly.render(Some(true), Some(false));
+        let (_, v, t) = SettingRow::FtpReadOnly.render(Some(true), Some(false), ol);
         assert_eq!(v, "OFF");
         assert_eq!(t, Tone::Dim);
-        let (_, v, t) = SettingRow::FtpEnabled.render(None, None);
+        let (_, v, t) = SettingRow::FtpEnabled.render(None, None, ol);
         assert_eq!(v, "?");
         assert_eq!(t, Tone::Warn);
-        let (l, _, _) = SettingRow::Reconnect.render(None, None);
+        let (l, _, _) = SettingRow::Reconnect.render(None, None, ol);
         assert_eq!(l, "Reconnect to control");
-        let (l, v, t) = SettingRow::Relogin.render(None, None);
-        assert_eq!(l, "Re-login (expired key)");
+        let (l, v, t) = SettingRow::Reauthenticate.render(None, None, ol);
+        assert_eq!(l, "Re-authenticate");
         assert_eq!(v, "press X");
         assert_eq!(t, Tone::Warn);
+        let (l, _, t) = SettingRow::Logout.render(None, None, ol);
+        assert_eq!(l, "Log out");
+        assert_eq!(t, Tone::Bad);
+    }
+
+    #[test]
+    fn tailnet_toggle_reflects_lifecycle() {
+        // ALL is exactly the six M19 rows, in order.
+        assert_eq!(SettingRow::ALL.len(), 6);
+        assert_eq!(SettingRow::ALL[2], SettingRow::TailnetToggle);
+        let (l, v, t) = SettingRow::TailnetToggle.render(None, None, OnlineState::Online);
+        assert_eq!(l, "Tailnet");
+        assert_eq!(v, "on");
+        assert_eq!(t, Tone::Good);
+        let (_, v, t) = SettingRow::TailnetToggle.render(None, None, OnlineState::Stopped);
+        assert_eq!(v, "off");
+        assert_eq!(t, Tone::Dim);
+    }
+
+    #[test]
+    fn lifecycle_display_stopped_is_dim() {
+        let (label, tone) = lifecycle_display(OnlineState::Stopped);
+        assert_eq!(label, "Stopped");
+        assert_eq!(tone, Tone::Dim);
+        assert_eq!(lifecycle_display(OnlineState::Online).1, Tone::Good);
+    }
+
+    #[test]
+    fn header_right_shows_identity_or_falls_back() {
+        // No identity yet → DERP/uptime fallback (unchanged behavior).
+        let vm = build(&snap_with(vec![]), 1_000_002);
+        assert!(vm.header.right.ends_with("up 2h14m"), "{}", vm.header.right);
+        // login + domain → "login · domain".
+        let mut s = snap_with(vec![]);
+        s.user_login = Some("dave@example.com".into());
+        s.tailnet_domain = Some("example.com".into());
+        assert_eq!(build(&s, 1_000_002).header.right, "dave@example.com · example.com");
+        // login without a domain → just the login name.
+        let mut s = snap_with(vec![]);
+        s.user_login = Some("dave@example.com".into());
+        assert_eq!(build(&s, 1_000_002).header.right, "dave@example.com");
     }
 
     #[test]
