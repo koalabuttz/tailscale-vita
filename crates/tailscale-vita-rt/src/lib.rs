@@ -322,6 +322,24 @@ pub unsafe extern "C" fn ts_vita_rt_stop() {
 /// but driven by `SHUTDOWN` instead of a wall-clock deadline.
 fn run_runtime() {
     trace("rr1: run_runtime entry");
+
+    // Wire structured logging INSIDE the SUPRX. Until now every info!/warn!/
+    // debug! in the plugin process (runtime, netstack, wg_engine, ts-ftp) was
+    // silently dropped: vita_log::init() was ONLY ever called by the eboot
+    // (tailscale-vita-demo/main.rs), never here — so `ux0:.../vita.log` held
+    // eboot events only and the raw `trace()` -> phase2-trace.txt was the
+    // SUPRX's sole diagnostic. That blind spot is why the ts-ftp data-path
+    // fault was undiagnosable from logs. The bootstrap is an SCE-spawned,
+    // pte_osInit'd (parkable) thread precisely so vita_log's writer-thread
+    // spawn (std::thread::Builder) works from here — see bootstrap_main's
+    // header comment. Non-fatal: a logging-init failure must NOT take the
+    // runtime down, so trace the outcome (phase2-trace always works) and
+    // carry on either way.
+    match vita_log::init() {
+        Ok(()) => trace("rr1a: vita_log::init OK — SUPRX runtime logging is live"),
+        Err(e) => trace(&format!("rr1a: vita_log::init FAILED ({e:?}) — runtime stays blind")),
+    }
+
     info!("suprx.runtime.start");
 
     // One-shot WG data-plane crypto self-test, BEFORE any network setup so it's

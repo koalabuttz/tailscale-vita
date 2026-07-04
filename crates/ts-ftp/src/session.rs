@@ -1,19 +1,23 @@
 //! Per-control-connection FTP session: greet, then read CRLF command lines
-//! and dispatch until QUIT or disconnect. Serial (one session at a time) and
-//! PASV-only. Permissive auth — the tailnet ACL is the boundary.
+//! and dispatch until QUIT or disconnect. Each session runs on its own thread
+//! (spawned by the accept loop, bounded by `MAX_SESSIONS`), so one slow or
+//! stalled client can't block others. PASV-only. Permissive auth — the tailnet
+//! ACL is the boundary.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use netstack::tcp::TcpStream;
 use netstack::TcpListener;
-use vita_log::{debug, warn};
+use vita_log::{debug, info, warn};
 
 use crate::command::{self, Command};
 use crate::reply::{dir_reply, reply, reply_multiline};
 use crate::vfs::{self, Vfs};
-use crate::{data, listing, Ctx, CTRL_IDLE_TIMEOUT, DATA_ACCEPT_TIMEOUT, DATA_RW_TIMEOUT};
+use crate::{data, listing, Ctx, CTRL_IDLE_TIMEOUT, CTRL_POLL, DATA_ACCEPT_TIMEOUT, DATA_RW_TIMEOUT};
 
 /// Control reader: a `BufReader` over the control stream. `get_mut()` yields
 /// the underlying stream for writing replies (writes bypass the read buffer).
@@ -24,10 +28,15 @@ enum Flow {
     Quit,
 }
 
-/// Handle one control connection start-to-finish.
-pub(crate) fn handle(ctrl: TcpStream, peer: SocketAddr, ctx: &Ctx) {
+/// Handle one control connection start-to-finish. Runs on its own session
+/// thread; `shutdown` lets an idle/blocked read bail promptly when the server
+/// is stopping instead of lingering the full `CTRL_IDLE_TIMEOUT`.
+pub(crate) fn handle(ctrl: TcpStream, peer: SocketAddr, ctx: &Ctx, shutdown: &AtomicBool) {
     let mut ctrl = ctrl;
-    let _ = ctrl.set_read_timeout(Some(CTRL_IDLE_TIMEOUT));
+    // Short poll timeout (not the full idle budget) so `read_line` can re-check
+    // `shutdown` and the idle deadline between reads. Partial reads accumulate
+    // across polls, so a command split over the wire still assembles.
+    let _ = ctrl.set_read_timeout(Some(CTRL_POLL));
     let _ = ctrl.set_write_timeout(Some(DATA_RW_TIMEOUT));
     let mut reader = BufReader::new(ctrl);
 
@@ -36,10 +45,10 @@ pub(crate) fn handle(ctrl: TcpStream, peer: SocketAddr, ctx: &Ctx) {
     }
 
     let mut session = Session::new(ctx);
-    loop {
-        let line = match read_line(&mut reader) {
+    while !shutdown.load(Ordering::Acquire) {
+        let line = match read_line(&mut reader, shutdown) {
             Some(l) => l,
-            None => break, // EOF, idle timeout, or read error
+            None => break, // EOF, idle timeout, shutdown, or read error
         };
         if line.is_empty() {
             continue;
@@ -54,19 +63,35 @@ pub(crate) fn handle(ctrl: TcpStream, peer: SocketAddr, ctx: &Ctx) {
     }
 }
 
-/// Read one CRLF-terminated command line, stripping the line ending. Returns
-/// `None` on EOF / idle-timeout / error (all end the session).
-fn read_line(reader: &mut Ctrl) -> Option<String> {
+/// Read one CRLF-terminated command line, stripping the line ending. The
+/// control stream carries a short (`CTRL_POLL`) read timeout, so this polls in
+/// a loop: a timeout re-checks `shutdown` and the `CTRL_IDLE_TIMEOUT` budget
+/// rather than ending the session, while partial reads accumulate in `buf`.
+/// Returns `None` on EOF, idle-timeout, shutdown, or a real read error (a
+/// closed stream reports `BrokenPipe`, ending the session promptly).
+fn read_line(reader: &mut Ctrl, shutdown: &AtomicBool) -> Option<String> {
     let mut buf = Vec::new();
-    match reader.read_until(b'\n', &mut buf) {
-        Ok(0) => None,
-        Ok(_) => {
-            while matches!(buf.last(), Some(b'\n' | b'\r')) {
-                buf.pop();
+    let deadline = Instant::now() + CTRL_IDLE_TIMEOUT;
+    loop {
+        match reader.read_until(b'\n', &mut buf) {
+            // EOF. A trailing fragment without a newline is a broken client; drop it.
+            Ok(0) => return None,
+            Ok(_) if matches!(buf.last(), Some(b'\n')) => {
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                return Some(String::from_utf8_lossy(&buf).into_owned());
             }
-            Some(String::from_utf8_lossy(&buf).into_owned())
+            // Read returned bytes but no line end yet — keep reading.
+            Ok(_) => {}
+            // Poll timeout: bail on shutdown or idle-budget exhaustion, else retry.
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                if shutdown.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    return None;
+                }
+            }
+            Err(_) => return None,
         }
-        Err(_) => None,
     }
 }
 
@@ -79,10 +104,6 @@ struct Session {
     pasv: Option<(TcpListener, u16)>,
     /// `RNFR` target, awaiting `RNTO`.
     rename_from: Option<String>,
-    /// Next PASV port to try (rotates through the configured range).
-    next_port: u16,
-    pasv_lo: u16,
-    pasv_hi: u16,
     read_only: bool,
 }
 
@@ -94,9 +115,6 @@ impl Session {
             authed: false,
             pasv: None,
             rename_from: None,
-            next_port: ctx.cfg.passive_port_lo,
-            pasv_lo: ctx.cfg.passive_port_lo,
-            pasv_hi: ctx.cfg.passive_port_hi,
             read_only: ctx.cfg.read_only,
         }
     }
@@ -193,7 +211,12 @@ impl Session {
         };
         // Drop any previous pending listener before binding a new one.
         self.pasv = None;
-        match data::bind_passive(&ctx.stack, &mut self.next_port, self.pasv_lo, self.pasv_hi) {
+        match data::bind_passive(
+            &ctx.stack,
+            &ctx.next_pasv_port,
+            ctx.cfg.passive_port_lo,
+            ctx.cfg.passive_port_hi,
+        ) {
             Ok((listener, port)) => {
                 let text = data::format_227(ip, port);
                 self.pasv = Some((listener, port));
@@ -217,7 +240,12 @@ impl Session {
         // EPSV needs no tailnet IP and works regardless of the address the
         // client reached us on. Drop any previous pending listener first.
         self.pasv = None;
-        match data::bind_passive(&ctx.stack, &mut self.next_port, self.pasv_lo, self.pasv_hi) {
+        match data::bind_passive(
+            &ctx.stack,
+            &ctx.next_pasv_port,
+            ctx.cfg.passive_port_lo,
+            ctx.cfg.passive_port_hi,
+        ) {
             Ok((listener, port)) => {
                 let text = data::format_229(port);
                 self.pasv = Some((listener, port));
@@ -266,8 +294,15 @@ impl Session {
         let real = self.vfs.to_real(&vpath);
         let bytes = match vita_fs::read(Path::new(&real)) {
             Ok(b) => b,
-            Err(_) => return reply(r.get_mut(), 550, "no such file"),
+            Err(e) => {
+                warn!(real = %real, error = %e, "ts-ftp.retr.read_err");
+                return reply(r.get_mut(), 550, "no such file");
+            }
         };
+        // BUG-A probe (2026-07-03): if this logs len=0 while SIZE reports
+        // non-zero, the fault is vita_fs::read/path (fs layer); if len>0 yet
+        // curl gets nothing, it's the data-socket transport (see pump_data).
+        info!(real = %real, len = bytes.len(), "ts-ftp.retr.read");
         self.send_data(&bytes, r)
     }
 
@@ -406,11 +441,15 @@ impl Session {
         };
         reply(r.get_mut(), 150, "opening data connection")?;
         match listener.accept_timeout(DATA_ACCEPT_TIMEOUT) {
-            Ok((mut data, _)) => {
+            Ok((mut data, peer)) => {
+                info!(%peer, want = bytes.len(), "ts-ftp.data.accepted");
                 let _ = data.set_write_timeout(Some(DATA_RW_TIMEOUT));
                 pump_data(data, r.get_mut(), bytes)
             }
-            Err(_) => reply(r.get_mut(), 425, "data connection failed"),
+            Err(_) => {
+                warn!("ts-ftp.data.accept_failed");
+                reply(r.get_mut(), 425, "data connection failed")
+            }
         }
     }
 }
@@ -425,12 +464,21 @@ trait DataStream: Write {
     fn close(self) -> io::Result<()>
     where
         Self: Sized;
+
+    /// Bytes still queued (unsent or unacked) on the connection right now.
+    /// `0` means the peer has acknowledged everything written. Logged before
+    /// close to diagnose a transfer that writes OK yet delivers nothing.
+    fn pending(&self) -> usize;
 }
 
 impl DataStream for TcpStream {
     fn close(self) -> io::Result<()> {
         drop(self); // FIN + bounded TX-drain, see netstack TcpStream::drop
         Ok(())
+    }
+
+    fn pending(&self) -> usize {
+        self.send_queue()
     }
 }
 
@@ -440,7 +488,18 @@ impl DataStream for TcpStream {
 /// failure the socket is still closed and `426` is sent.
 fn pump_data<D: DataStream, C: Write>(mut data: D, ctrl: &mut C, bytes: &[u8]) -> io::Result<()> {
     let sent = data.write_all(bytes);
+    // BUG-A probe: `wrote_ok=false` => write_all stalled in the netstack;
+    // `pending>0` => bytes are queued but the peer hasn't ACK'd them, i.e.
+    // the data socket isn't transmitting (window/WgDevice-drop), which the
+    // netstack Drop now turns into a RST instead of a silent hang.
+    info!(
+        len = bytes.len(),
+        wrote_ok = sent.is_ok(),
+        pending = data.pending(),
+        "ts-ftp.pump.wrote"
+    );
     let _ = data.close(); // close/drain the data socket first
+    info!("ts-ftp.pump.closed");
     match sent {
         Ok(()) => reply(ctrl, 226, "transfer complete"),
         Err(e) => {
@@ -496,6 +555,9 @@ mod tests {
         fn close(self) -> io::Result<()> {
             self.log.borrow_mut().push("close".into());
             Ok(())
+        }
+        fn pending(&self) -> usize {
+            0
         }
     }
 

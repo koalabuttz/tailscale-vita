@@ -111,6 +111,17 @@ toml      = { version = "0.8", default-features = false, features = ["parse"] }
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
+# Host dev/test builds. We never gdb the host binaries (real debugging is
+# on-device via vita.log / phase2-trace.txt), so full DWARF is pure disk
+# cost: `debug = "line-tables-only"` keeps panic/backtrace line numbers while
+# cutting `target/debug/deps` from ~5G to ~1.5G on this space-tight Crostini
+# VM. `debug=0` would shrink it further but drop backtrace line info.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
 [profile.release]
 panic     = "unwind"
 lto       = true

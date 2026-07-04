@@ -3,23 +3,45 @@
 
 use std::io;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use netstack::{StackHandle, TcpListener};
 
-/// Bind a fresh single-use data listener, rotating `*next` through
-/// `[lo, hi]` (inclusive). Tries every port in the range once before giving
-/// up — a port may still be in TIME_WAIT from a prior transfer.
+/// Bind a fresh single-use data listener, advancing the *shared* `next`
+/// cursor through `[lo, hi]` (inclusive). Tries every port in the range once
+/// before giving up — a port may still be in TIME_WAIT from a prior transfer.
+///
+/// `next` is shared across ALL sessions (an `Arc<AtomicU16>` in `Ctx`), not
+/// reset per session. This matters because the common client is one-shot
+/// (connect → single transfer → disconnect): with a per-session cursor every
+/// transfer reused `lo`, so the configured range was inert and rapid same-port
+/// reuse collided with the prior data connection's lingering TIME_WAIT socket
+/// — the intermittent "data connection never establishes" fault (BUG A,
+/// 2026-07-04). A shared cursor spreads consecutive transfers across the whole
+/// range, giving each port the rest of the range as TIME_WAIT clearance.
 pub(crate) fn bind_passive(
     stack: &StackHandle,
-    next: &mut u16,
+    next: &AtomicU16,
     lo: u16,
     hi: u16,
 ) -> io::Result<(TcpListener, u16)> {
     let span = hi.saturating_sub(lo).saturating_add(1).max(1);
     let mut last_err = None;
     for _ in 0..span {
-        let port = (*next).clamp(lo, hi);
-        *next = if port >= hi { lo } else { port + 1 };
+        // Atomically claim the current port and advance the shared cursor.
+        // Single-threaded today (serial sessions), but the CAS keeps it correct
+        // if the accept loop ever gains concurrency.
+        let port = loop {
+            let cur = next.load(Ordering::Relaxed);
+            let claimed = cur.clamp(lo, hi);
+            let advanced = if claimed >= hi { lo } else { claimed + 1 };
+            if next
+                .compare_exchange_weak(cur, advanced, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break claimed;
+            }
+        };
         match TcpListener::bind_handle(stack, port, 1) {
             Ok(l) => return Ok((l, port)),
             Err(e) => last_err = Some(e),

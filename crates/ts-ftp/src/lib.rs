@@ -27,7 +27,8 @@
 
 use std::io;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,11 +45,24 @@ mod session;
 mod vfs;
 
 /// Concurrent control-connection SYNs the listener pool absorbs before the
-/// next one is RST'd (the client retries). Serial sessions need only a small
-/// pool.
-const CONTROL_POOL: usize = 2;
+/// next one is RST'd (the client retries). The pool (self-healing per accept —
+/// see `netstack::TcpListener`) is sized for headroom under an external
+/// client's rapid-reconnect churn.
+const CONTROL_POOL: usize = 4;
+/// Max concurrent session threads. Each accepted control connection runs on its
+/// own thread so one slow/stalled client can't block others (a serial accept
+/// loop let a single hung session wedge the whole server for up to
+/// `CTRL_IDLE_TIMEOUT` — 2026-07-04). Past the cap, new connections get a `421`
+/// so the accept loop never blocks. Bounds thread/stack/heap use under churn.
+const MAX_SESSIONS: usize = 8;
+/// Per-session thread stack. FTP dispatch is light (file bytes go to the heap
+/// via `vita_fs::read`), so this is smaller than the control-plane workers.
+const SESSION_STACK: usize = 192 * 1024;
 /// Accept-loop poll period — bounds how quickly the loop notices `shutdown`.
 const ACCEPT_TICK: Duration = Duration::from_millis(500);
+/// Control-read poll period: a session re-checks `shutdown`/idle between reads
+/// on this cadence instead of one long blocking read (see `session::read_line`).
+pub(crate) const CTRL_POLL: Duration = Duration::from_secs(1);
 /// Idle control connection drop timeout (a stuck/idle client frees the slot).
 pub(crate) const CTRL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long to wait for the client to open the PASV data connection.
@@ -119,6 +133,10 @@ pub(crate) struct Ctx {
     pub(crate) stack: StackHandle,
     pub(crate) cfg: FtpConfig,
     pub(crate) tailnet_ip: TailnetIp,
+    /// Shared passive-port cursor, rotated across ALL sessions so consecutive
+    /// transfers spread over `[passive_port_lo, passive_port_hi]` instead of
+    /// every one-shot session reusing `lo`. See [`data::bind_passive`].
+    pub(crate) next_pasv_port: Arc<AtomicU16>,
 }
 
 /// Running FTP service. Dropping it signals shutdown and joins the thread.
@@ -144,10 +162,12 @@ impl TsFtpServer {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
+        let next_pasv_port = Arc::new(AtomicU16::new(cfg.passive_port_lo));
         let ctx = Ctx {
             stack,
             cfg,
             tailnet_ip,
+            next_pasv_port,
         };
 
         let worker = match thread::Builder::new()
@@ -178,15 +198,73 @@ impl Drop for TsFtpServer {
     }
 }
 
-/// Accept control connections and handle them serially. Polls `shutdown`
-/// between accepts (and per `accept_timeout` window).
+/// One in-flight session thread and its completion flag.
+struct LiveSession {
+    handle: JoinHandle,
+    done: Arc<AtomicBool>,
+}
+
+/// Join and drop every session whose thread has finished, reclaiming its SCE
+/// thread handle (detaching would leak thread slots — `vita_thread` deletes the
+/// handle in `join`, not on thread exit). Only touches `done`-flagged threads,
+/// so it never blocks on a still-running session; the `join` on a done thread
+/// returns as soon as it reaches `sceKernelExitThread`.
+fn reap(live: &mut Vec<LiveSession>) {
+    let mut i = 0;
+    while i < live.len() {
+        if live[i].done.load(Ordering::Acquire) {
+            let s = live.swap_remove(i);
+            let _ = s.handle.join();
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Accept control connections and run each on its own bounded session thread,
+/// so a slow or stalled client never blocks new connections (the old serial
+/// loop let one hung session wedge the whole server for up to
+/// `CTRL_IDLE_TIMEOUT`). Finished threads are reaped each iteration.
 fn accept_loop(listener: TcpListener, shutdown: Arc<AtomicBool>, ctx: Ctx) {
+    let ctx = Arc::new(ctx);
+    let mut live: Vec<LiveSession> = Vec::new();
+
     while !shutdown.load(Ordering::Acquire) {
+        reap(&mut live);
         match listener.accept_timeout(ACCEPT_TICK) {
             Ok((stream, peer)) => {
-                info!(%peer, "ts-ftp.session.start");
-                session::handle(stream, peer, &ctx);
-                info!(%peer, "ts-ftp.session.end");
+                reap(&mut live);
+                if live.len() >= MAX_SESSIONS {
+                    // At capacity: refuse fast so the accept loop stays free.
+                    let mut stream = stream;
+                    let _ = crate::reply::reply(&mut stream, 421, "too many connections, retry shortly");
+                    warn!(%peer, active = live.len(), "ts-ftp.session.rejected_at_cap");
+                    continue;
+                }
+                let done = Arc::new(AtomicBool::new(false));
+                let sctx = Arc::clone(&ctx);
+                let sshut = Arc::clone(&shutdown);
+                let sdone = Arc::clone(&done);
+                info!(%peer, active = live.len() + 1, "ts-ftp.session.start");
+                // `vita_sync::Mutex` doesn't poison and the thread trampoline
+                // already contains panics, but catch here too so `done` is set
+                // even on a panicking session — otherwise its handle is never
+                // reaped and its SCE thread slot leaks. `AssertUnwindSafe`:
+                // TcpStream / &Ctx aren't `UnwindSafe`.
+                let spawned = thread::Builder::new()
+                    .name("ts-ftp-sess")
+                    .stack_size(SESSION_STACK)
+                    .spawn(move || {
+                        let _ = catch_unwind(AssertUnwindSafe(|| {
+                            session::handle(stream, peer, &sctx, &sshut);
+                        }));
+                        sdone.store(true, Ordering::Release);
+                        info!(%peer, "ts-ftp.session.end");
+                    });
+                match spawned {
+                    Ok(handle) => live.push(LiveSession { handle, done }),
+                    Err(e) => warn!(%peer, error = %e, "ts-ftp.session.spawn_failed"),
+                }
             }
             Err(e)
                 if matches!(
@@ -198,6 +276,12 @@ fn accept_loop(listener: TcpListener, shutdown: Arc<AtomicBool>, ctx: Ctx) {
                 thread::sleep(ACCEPT_TICK);
             }
         }
+    }
+
+    // Shutdown: sessions observe `shutdown` via their poll-read and wind down
+    // within ~CTRL_POLL; join them all to reclaim their thread handles.
+    for s in live {
+        let _ = s.handle.join();
     }
     info!("ts-ftp.accept_loop.exit");
 }

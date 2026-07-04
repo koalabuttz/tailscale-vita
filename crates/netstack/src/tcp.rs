@@ -240,6 +240,15 @@ impl TcpStream {
         Ok(self.peer)
     }
 
+    /// Bytes queued in the TX buffer that smoltcp has not yet handed to the
+    /// device *and* had ACK'd (i.e. still in flight or unsent). `0` means the
+    /// peer has acknowledged everything we wrote. Used to diagnose a transfer
+    /// that reports success but delivered nothing (2026-07-03 ts-ftp probe).
+    pub fn send_queue(&self) -> usize {
+        let mut sockets = self.inner.sockets.lock();
+        sockets.get_mut::<tcp::Socket>(self.handle).send_queue()
+    }
+
     /// Construct a `TcpStream` wrapping a socket handle that has just
     /// transitioned to Established via the listener accept path. The
     /// caller (TcpListener) is responsible for ensuring the handle is
@@ -284,10 +293,30 @@ impl Drop for TcpStream {
         // are all "our side of the close is complete." If the timeout
         // elapses first we tear down anyway — better to lose the tail
         // of a stuck stream than block the dropping thread forever.
-        wait_for_drain(&self.inner, self.handle, &self.slot);
+        let drained = wait_for_drain(&self.inner, self.handle, &self.slot);
 
         self.inner.handles.unregister(self.handle);
         let mut sockets = self.inner.sockets.lock();
+        // If the graceful close never completed (peer's window stuck, path
+        // lossy, or our FIN/data never got ACK'd within the drain budget),
+        // send a RST instead of silently removing the socket. A silent
+        // removal leaves the peer's connection open with no data and no FIN
+        // — it hangs until its own timeout (the ts-ftp 0-byte-RETR symptom,
+        // 2026-07-03). `abort()` queues a RST so the peer gets a hard close
+        // and fails fast; we poke so the poll thread emits it before removal.
+        if !drained {
+            let needs_rst = {
+                let s = sockets.get_mut::<tcp::Socket>(self.handle);
+                !matches!(s.state(), tcp::State::Closed)
+            };
+            if needs_rst {
+                sockets.get_mut::<tcp::Socket>(self.handle).abort();
+                drop(sockets);
+                poke(&self.inner.wake);
+                trace!(?self.handle, "tcp.drop.abort_rst");
+                sockets = self.inner.sockets.lock();
+            }
+        }
         let _ = sockets.remove(self.handle);
     }
 }
@@ -295,12 +324,14 @@ impl Drop for TcpStream {
 /// Block until the socket's TX is drained + FIN handshake complete,
 /// or `CLOSE_DRAIN_TIMEOUT` elapses. Pure read-only inspection — no
 /// mutation. Safe to call after `close()` has been issued. See
-/// `CLOSE_DRAIN_TIMEOUT` doc for the rationale.
+/// `CLOSE_DRAIN_TIMEOUT` doc for the rationale. Returns `true` if the
+/// graceful close completed, `false` if the timeout elapsed first (the
+/// caller then sends a RST rather than removing the socket silently).
 fn wait_for_drain(
     inner: &Arc<StackInner>,
     handle: SocketHandle,
     slot: &Arc<HandleSlot>,
-) {
+) -> bool {
     let deadline = Instant::now() + CLOSE_DRAIN_TIMEOUT;
     loop {
         let done = {
@@ -335,11 +366,11 @@ fn wait_for_drain(
         };
         if done {
             trace!(?handle, "tcp.drop.drain.done");
-            return;
+            return true;
         }
         if Instant::now() >= deadline {
             trace!(?handle, "tcp.drop.drain.timeout");
-            return;
+            return false;
         }
         // The slot's `closed` event fires when `is_active()` flips
         // false (i.e., on TimeWait/Closed). FinWait2 is still active,
