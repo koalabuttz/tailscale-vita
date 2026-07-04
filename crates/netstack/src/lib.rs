@@ -80,6 +80,21 @@ pub struct StackInner {
     pub(crate) handles: Arc<HandleRegistry>,
     pub(crate) wake: Arc<(Mutex<bool>, Condvar)>,
     pub(crate) shutdown: Arc<AtomicBool>,
+    /// Epoch for smoltcp's monotonic clock. smoltcp timestamps MUST be
+    /// `epoch.elapsed()`, never `SmolInstant::from(StdInstant::now())` —
+    /// that conversion is `now().elapsed()` ≈ 0µs every call, freezing
+    /// smoltcp's clock at t=0 so RTO retransmit timers NEVER fire. Any
+    /// lost segment was then lost forever (the 2026-07-04 ts-ftp fails:
+    /// lost EPSV 229 replies hanging clients 30s, burst-lost data never
+    /// resent). Host tests never caught it: loopback never drops frames.
+    pub(crate) epoch: StdInstant,
+}
+
+impl StackInner {
+    /// Current smoltcp time: microseconds since stack creation.
+    pub(crate) fn now(&self) -> SmolInstant {
+        SmolInstant::from_micros(self.epoch.elapsed().as_micros() as i64)
+    }
 }
 
 /// Owner of the netstack. **Not** `Arc`-shareable — there's exactly one
@@ -120,8 +135,9 @@ impl Stack {
             cfg.mtu,
         );
 
+        let epoch = StdInstant::now();
         let config = Config::new(HardwareAddress::Ip);
-        let mut iface = Interface::new(config, &mut device, SmolInstant::from(StdInstant::now()));
+        let mut iface = Interface::new(config, &mut device, SmolInstant::from_micros(0));
         if let Some(local_ip) = cfg.local_ip {
             iface.update_ip_addrs(|store| {
                 let _ = store.push(IpCidr::Ipv4(local_ip));
@@ -134,6 +150,7 @@ impl Stack {
             handles: Arc::new(HandleRegistry::new()),
             wake: Arc::clone(&engine.rx_notify),
             shutdown: Arc::new(AtomicBool::new(false)),
+            epoch,
         });
 
         let inner_for_thread = Arc::clone(&inner);

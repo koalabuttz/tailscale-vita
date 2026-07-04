@@ -285,6 +285,11 @@ fn alloc_listening_socket(
     let (rx, tx) = make_tcp_buffers(DEFAULT_TCP_RX_BUF, DEFAULT_TCP_TX_BUF);
     let mut socket = tcp::Socket::new(rx, tx);
     socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(60)));
+    // Pace sends via a congestion window. Without this smoltcp bursts the whole
+    // 16KB tx buffer in one poll (~13 MTU datagrams in 3ms on-device), overrunning
+    // the Vita's WiFi path and dropping packets — the residual ts-ftp transfer
+    // failures (2026-07-04). Reno starts cwnd at 2KB and grows via slow-start.
+    socket.set_congestion_control(tcp::CongestionControl::Reno);
     socket
         .listen(IpListenEndpoint { addr: None, port })
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("smoltcp listen: {e:?}")))?;

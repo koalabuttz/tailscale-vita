@@ -46,6 +46,12 @@ const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// transitions emit slot events, and FinWait2 is still active. So
 /// poll the socket state at this cadence as a fallback.
 const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Max time `Drop` waits for a queued RST (from `abort()`) to be dispatched by
+/// the poll thread before removing the socket. One poll cycle suffices in
+/// practice; this is a safety net against a wedged poll thread.
+const RST_EMIT_TIMEOUT: Duration = Duration::from_millis(250);
+/// Poll interval while waiting for the RST to be emitted (see `wait_for_rst_sent`).
+const RST_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 pub struct TcpStream {
     inner: Arc<StackInner>,
@@ -66,6 +72,8 @@ impl TcpStream {
         let (rx_buf, tx_buf) = make_tcp_buffers(DEFAULT_TCP_RX_BUF, DEFAULT_TCP_TX_BUF);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
         socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(60)));
+        // Pace sends via a congestion window (see tcp_listener::alloc_listening_socket).
+        socket.set_congestion_control(tcp::CongestionControl::Reno);
 
         let handle = {
             let mut iface = inner.iface.lock();
@@ -314,6 +322,14 @@ impl Drop for TcpStream {
                 drop(sockets);
                 poke(&self.inner.wake);
                 trace!(?self.handle, "tcp.drop.abort_rst");
+                // `abort()` only *queues* the RST — smoltcp emits it on the next
+                // poll. If we re-lock and remove immediately we beat the poll
+                // thread to it and the RST is discarded, so the peer never gets a
+                // hard close and hangs its full timeout anyway (the very hang the
+                // abort() is meant to prevent — 2026-07-04). Wait (bounded) for
+                // the socket to reach `Closed`, which smoltcp sets once the RST
+                // has been dispatched, before removing.
+                wait_for_rst_sent(&self.inner, self.handle, &self.slot);
                 sockets = self.inner.sockets.lock();
             }
         }
@@ -378,6 +394,41 @@ fn wait_for_drain(
         // window catches it.
         slot.wait_until(
             deadline.min(Instant::now() + CLOSE_POLL_INTERVAL),
+            |ev| ev.closed,
+        );
+    }
+}
+
+/// After `tcp::Socket::abort()` queues a RST, block (briefly, bounded) until the
+/// poll thread has dispatched it — smoltcp moves the socket to `Closed` once the
+/// RST is on the wire. Removing the socket before that discards the queued RST,
+/// so the peer never gets a hard close and hangs its own timeout. This is a much
+/// shorter wait than `wait_for_drain` (one poll cycle is enough); the deadline is
+/// just a safety net so a wedged poll thread can't block `Drop` forever.
+fn wait_for_rst_sent(inner: &Arc<StackInner>, handle: SocketHandle, slot: &Arc<HandleSlot>) {
+    let deadline = Instant::now() + RST_EMIT_TIMEOUT;
+    loop {
+        let closed = {
+            let sockets = inner.sockets.lock();
+            let state = sockets
+                .iter()
+                .find(|(h, _)| *h == handle)
+                .and_then(|(_, sock)| match sock {
+                    smoltcp::socket::Socket::Tcp(s) => Some(s.state()),
+                    _ => None,
+                });
+            match state {
+                Some(s) => matches!(s, tcp::State::Closed),
+                None => true, // already gone
+            }
+        };
+        if closed || Instant::now() >= deadline {
+            return;
+        }
+        // `is_active()` flips false on the transition to Closed, so the slot's
+        // `closed` event wakes us; the short poll window is a fallback.
+        slot.wait_until(
+            deadline.min(Instant::now() + RST_POLL_INTERVAL),
             |ev| ev.closed,
         );
     }

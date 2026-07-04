@@ -911,6 +911,29 @@ fn worker_loop(
                             send_v6.as_ref().unwrap_or(&send_v4)
                         };
                         let res = sock.send_to(&bytes, addr);
+                        // Per-frame sendto ground truth (`wg.net.tx` upstream only
+                        // proves ENQUEUE). WG message types are 1..=4 in byte0;
+                        // Disco ("TS💬") and STUN never start with those. debug so
+                        // it's there when hunting; an actual egress failure is warn.
+                        let b0 = bytes.first().copied().unwrap_or(0);
+                        if (1..=4).contains(&b0) {
+                            match &res {
+                                Ok(n) => debug!(
+                                    %addr,
+                                    t = b0,
+                                    req = bytes.len(),
+                                    sent = *n,
+                                    "magicsock.tx.wg"
+                                ),
+                                Err(e) => warn!(
+                                    %addr,
+                                    t = b0,
+                                    req = bytes.len(),
+                                    error = %e,
+                                    "magicsock.tx.wg.err"
+                                ),
+                            }
+                        }
                         if let Some(log) = &send_log {
                             push_send_record(
                                 log,
@@ -1513,11 +1536,11 @@ fn send_pong(
         return;
     }
 
-    if let Err(e) = socket.send_to(&buf, src) {
-        trace!(?e, %src, "magicsock.disco.pong.send_failed");
-        return;
+    // A pong that fails to egress starves the peer's path trust — warn, not trace.
+    match socket.send_to(&buf, src) {
+        Ok(n) => debug!(%src, sent = n, req = buf.len(), "magicsock.disco.pong.sent"),
+        Err(e) => warn!(%src, error = %e, "magicsock.disco.pong.send_failed"),
     }
-    debug!(%src, "magicsock.disco.pong.sent");
 }
 
 #[cfg(test)]

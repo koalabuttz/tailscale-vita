@@ -1,11 +1,10 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant as StdInstant};
+use std::time::Duration;
 
 use vita_sync::{Condvar, Mutex};
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
-use smoltcp::time::Instant as SmolInstant;
 use vita_log::{info, trace};
 
 use crate::device::WgDevice;
@@ -20,7 +19,9 @@ pub fn run(inner: Arc<StackInner>, mut device: WgDevice) {
         let result = {
             let mut iface = inner.iface.lock();
             let mut sockets = inner.sockets.lock();
-            iface.poll(SmolInstant::from(StdInstant::now()), &mut device, &mut *sockets)
+            // inner.now(), NOT SmolInstant::from(StdInstant::now()) — that
+            // conversion yields ~0µs every call (frozen clock, no RTO ever).
+            iface.poll(inner.now(), &mut device, &mut *sockets)
         };
         if matches!(result, smoltcp::iface::PollResult::SocketStateChanged) {
             trace!("netstack iface.poll: socket state changed");
@@ -32,7 +33,7 @@ pub fn run(inner: Arc<StackInner>, mut device: WgDevice) {
             let mut iface = inner.iface.lock();
             let sockets = inner.sockets.lock();
             iface
-                .poll_delay(SmolInstant::from(StdInstant::now()), &sockets)
+                .poll_delay(inner.now(), &sockets)
                 .map(|d| Duration::from_micros(d.total_micros() as u64))
                 .unwrap_or(MAX_SLEEP)
                 .min(MAX_SLEEP)

@@ -407,7 +407,14 @@ fn send_outbound<T: Transport + ?Sized>(
     if let Err(e) = transport.send(addr, bytes) {
         warn!(peer_pub = %short_hex(peer_pub), error = %e, "transport send error");
     } else {
-        info!(peer_pub = %short_hex(peer_pub), bytes = bytes.len(), "wg.net.tx");
+        // `to=` matters: without the destination this line can't distinguish
+        // direct-vs-DERP-vs-hairpin egress (how the 2026-07-04 path flap was seen).
+        info!(
+            peer_pub = %short_hex(peer_pub),
+            to = %fmt_sel(&Some(addr)),
+            bytes = bytes.len(),
+            "wg.net.tx"
+        );
     }
 }
 

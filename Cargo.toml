@@ -48,6 +48,12 @@ parking_lot      = "0.12"
 smoltcp = { version = "0.12", default-features = false, features = [
     "std", "log", "medium-ip", "proto-ipv4",
     "socket-tcp", "socket-udp", "socket-icmp",
+    # Reno TCP congestion control. Without a controller smoltcp defaults to
+    # CongestionControl::None — it dumps the whole send window in one poll with
+    # no pacing, which on the Vita's WiFi produced ~13 full-MTU datagrams in 3ms
+    # and dropped packets (the residual ts-ftp transfer failures, 2026-07-04).
+    # Reno (integer-only; cubic needs f64 math, wrong for armv7) paces via cwnd.
+    "socket-tcp-reno",
 ] }
 
 # --- Noise IK ---
