@@ -66,16 +66,36 @@ If the plugin crashes during `module_start` or otherwise misbehaves:
 
 The default `*TVIT00010` config is intentionally low-risk: a misbehaving plugin can only break the one app that loads it.
 
-## Promoting to *main (Phase 3 — NOT YET RECOMMENDED)
+## Promoting to *main (M20-D — gated on a clean 24h soak)
 
-Staging under `*main` means the plugin runs in SceShell's address space and stays up even when our demo isn't launched. That's the eventual goal — a Tailscale daemon that survives game launches.
+Staging under `*main` means the plugin runs in SceShell's address space and stays up even when our demo isn't launched. That's the goal — a Tailscale daemon that survives game launches, reachable (FTP/Taildrop/LocalAPI-via-demo) while the Vita sits on the LiveArea.
 
-We're not doing this yet because:
-- SceShell crashes brick the device until reboot.
-- We haven't profiled heap/CPU under sustained load.
-- The plugin's panic-catch (`std::panic::catch_unwind`) is in place but untested at SceShell scope.
+**Gate**: a clean 24-hour run under `*TVIT00010` — dashboard uptime counter
+never resets, no OOM trend in `ux0:data/tailscale-vita/vita.log`, ts-ftp +
+taildrop + peer ping still working at hour 24.
 
-When ready, the config.txt change is one line — change `*TVIT00010` → `*main`. Don't do this until the plugin has logged a clean 24-hour run under `*TVIT00010`.
+**Procedure** (edit `ur0:/tai/config.txt` over FTP, then reboot):
+
+1. **Comment out — don't delete — the `*TVIT00010` stanza** and add the same
+   `ur0:tai/tailscale-vita-plugin.suprx` line under `*main`. Keeping the old
+   stanza commented makes rollback a two-character edit (swap which one has
+   the `#`).
+2. **NEVER leave both stanzas active.** SceShell and the demo would EACH load
+   the plugin: two runtimes, two node-key users, both binding port 21/8098/
+   41112 on the same stack — undefined and definitely broken.
+3. Reboot ×3 back-to-back; confirm LiveArea is responsive each time, then
+   sleep/wake once. Only then trust it.
+4. Post-promotion sanity: with the demo CLOSED, ts-ftp answers on the tailnet
+   and a Taildrop PUT lands. That's the payoff proof.
+
+**Rollback / recovery** (in escalating order):
+- Boot works, plugin misbehaves: FTP in (vitacompanion is SceShell-side and
+  independent of our plugin), swap the `#` between the two stanzas, reboot.
+- Boot loops / SceShell dies before FTP: hold **L during boot** — taiHEN
+  skips `ur0:tai/config.txt` entirely for that boot (henkaku "skip plugins"
+  path); then fix config.txt via VitaShell or FTP and reboot normally.
+- Worst case: Safe Mode (hold L + R + Start + PS at power-on) → re-flash
+  HENkaku / restore. Never observed; listed for completeness.
 
 ## Heap / thread budget (current)
 
