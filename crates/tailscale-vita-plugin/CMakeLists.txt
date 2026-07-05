@@ -82,3 +82,21 @@ set_target_properties(${PROJECT_NAME}
 vita_create_self(${PROJECT_NAME}.suprx ${PROJECT_NAME}
   CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/tailscale_vita_plugin.yml
   UNSAFE)
+
+# M20-D take 5: tiny two-stage loader (see src/loader.c header). Pure C,
+# no Rust staticlib — it must stay a few KB so its boot-time load into
+# SceShell is negligible. It sceKernelLoadStartModule's the fat SUPRX
+# above at boot+60s.
+add_executable(tailscale_vita_loader src/loader.c)
+target_link_libraries(tailscale_vita_loader
+  SceIofilemgr_stub_weak
+  SceLibKernel_stub_weak
+  SceKernelThreadMgr_stub_weak
+  SceKernelModulemgr_stub_weak
+  SceSysmem_stub_weak
+  gcc)
+set_target_properties(tailscale_vita_loader
+  PROPERTIES LINK_FLAGS "-nostartfiles")
+vita_create_self(tailscale_vita_loader.suprx tailscale_vita_loader
+  CONFIG ${CMAKE_CURRENT_SOURCE_DIR}/tailscale_vita_loader.yml
+  UNSAFE)
