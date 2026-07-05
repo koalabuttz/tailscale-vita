@@ -86,6 +86,16 @@ const PING_INTERVAL: Duration = Duration::from_secs(5);
 /// A direct path is "alive" if we've received a Pong for it within
 /// this many seconds.
 const ALIVE_TTL: Duration = Duration::from_secs(30);
+/// Cap on tracked paths per peer (netmap-advertised + CMM-merged +
+/// ping-learned). Bounds state growth against a hostile/buggy peer
+/// spraying pings from many sources.
+const MAX_PEER_PATHS: usize = 24;
+/// How long a ping-learned (unadvertised) candidate survives
+/// `upsert_peer`'s netmap-driven prune after the peer last pinged us
+/// from it. Upstream GC's ping-learned candidates once the source has
+/// been quiet for a few minutes; the exact value is not load-bearing
+/// (an alive peer re-pings every few seconds).
+const LEARNED_SRC_TTL: Duration = Duration::from_secs(10 * 60);
 /// recv_from timeout; bounds how long we wait between ping pumps AND how long
 /// an enqueued outbound packet waits before the worker drains+sends it (the
 /// M16 worker-thread send fix). Lowered from 500ms so WG handshakes/replies
@@ -160,6 +170,11 @@ struct PathState {
     /// ping; v1 doesn't track multiple in-flight pings per path).
     outstanding_tx_id: Option<[u8; 12]>,
     rtt: Option<Duration>,
+    /// When this peer last pinged US from this address. Set on every
+    /// inbound Disco ping. This is what keeps a ping-learned
+    /// (unadvertised) candidate alive across `upsert_peer`'s
+    /// netmap-driven prune — see `LEARNED_SRC_TTL`.
+    last_src_ping_at: Option<Instant>,
 }
 
 impl PathState {
@@ -169,6 +184,7 @@ impl PathState {
             last_pong_at: None,
             outstanding_tx_id: None,
             rtt: None,
+            last_src_ping_at: None,
         }
     }
 
@@ -479,10 +495,29 @@ impl MagicSocketCtl {
             paths: HashMap::new(),
         });
         entry.disco_pub = disco_pub;
-        entry.endpoints = endpoints.clone();
 
-        // Drop paths for endpoints no longer in the candidate list.
-        entry.paths.retain(|addr, _| endpoints.contains(addr));
+        // Drop paths for endpoints no longer in the candidate list —
+        // EXCEPT ping-learned candidates the peer has recently pinged
+        // us from. Those are unadvertised by definition (that's why
+        // they were learned), so a plain netmap prune would wipe their
+        // validated state on every delta.
+        let now = Instant::now();
+        entry.paths.retain(|addr, st| {
+            endpoints.contains(addr)
+                || st
+                    .last_src_ping_at
+                    .map(|t| now.duration_since(t) < LEARNED_SRC_TTL)
+                    .unwrap_or(false)
+        });
+        // Candidate list = advertised endpoints + surviving learned paths.
+        let preserved: Vec<SocketAddr> = entry
+            .paths
+            .keys()
+            .filter(|a| !endpoints.contains(a))
+            .copied()
+            .collect();
+        entry.endpoints = endpoints.clone();
+        entry.endpoints.extend(preserved);
         // Add fresh PathState entries for new endpoints.
         for addr in endpoints {
             entry.paths.entry(addr).or_insert_with(PathState::new);
@@ -1090,6 +1125,36 @@ fn handle_disco(
                 ?maybe_node,
                 "magicsock.disco.ping.recv"
             );
+            // Learn the ping's source as a direct-path candidate
+            // (upstream `addCandidateEndpoint`): a peer behind NAT — or
+            // one that never advertises its real LAN address, like a
+            // ChromeOS VM — reaches us from an address missing from its
+            // netmap endpoint list. Without this, such a source is
+            // ponged but never pinged back, so it can never be
+            // validated and never becomes the selected direct path.
+            // Known senders only (the disco key must already resolve to
+            // a node), bounded per peer.
+            if let Some(node_pub) = maybe_node {
+                let now = Instant::now();
+                let mut s = state.lock();
+                if let Some(peer) = s.peers.get_mut(&node_pub) {
+                    if let Some(path) = peer.paths.get_mut(&src) {
+                        path.last_src_ping_at = Some(now);
+                    } else if peer.paths.len() < MAX_PEER_PATHS {
+                        if !peer.endpoints.contains(&src) {
+                            peer.endpoints.push(src);
+                        }
+                        let mut path = PathState::new();
+                        path.last_src_ping_at = Some(now);
+                        peer.paths.insert(src, path);
+                        info!(
+                            peer_pub = %hex32(&node_pub),
+                            %src,
+                            "magicsock.disco.ping.src_learned"
+                        );
+                    }
+                }
+            }
             // Always reply with a Pong — ping-from-unknown is fine; the
             // peer's MapResponse may catch up in a moment.
             send_pong(socket, our_disco_priv, &sender_pub, src, tx_id);
@@ -1806,6 +1871,73 @@ mod tests {
         assert_eq!(n, payload.len());
         // Direct sends bypass the drain, so no new ring entry for them.
         assert!(ctl.take_send_records().iter().all(|r| r.dst != dst));
+    }
+
+    /// M20-A2: ping-src candidate learning — the ChromeOS-test-PC
+    /// scenario. B knows A's disco identity but has NO endpoints for
+    /// it (A never advertises its real address). A pings B; B must
+    /// learn A's source address as a candidate, ping it back, and
+    /// end up with a validated (alive) direct path to A. Without
+    /// `addCandidateEndpoint` semantics this can never converge.
+    /// Also covers upsert-survival: a netmap delta re-upserting A
+    /// with empty endpoints must NOT wipe the learned path.
+    #[test]
+    fn ping_src_learned_as_candidate_and_survives_upsert() {
+        let a_priv = DiscoPrivateKey::random();
+        let b_priv = DiscoPrivateKey::random();
+        let a_pub = a_priv.public_key();
+        let b_pub = b_priv.public_key();
+        let a_node_bytes = [0x11; 32];
+        let b_node_bytes = [0x22; 32];
+        let a_node = NodePublicKey::from(a_node_bytes);
+        let b_node = NodePublicKey::from(b_node_bytes);
+
+        let (a_non_tx, _a_non_rx) = unbounded::<NonDiscoPacket>();
+        let (b_non_tx, _b_non_rx) = unbounded::<NonDiscoPacket>();
+        let (_a_sock, a_ctl) = MagicSocket::bind(
+            loopback(0),
+            DiscoPrivateKey::from_bytes(*a_priv.as_bytes()),
+            a_node,
+            a_non_tx,
+        )
+        .unwrap();
+        let (_b_sock, b_ctl) = MagicSocket::bind(
+            loopback(0),
+            DiscoPrivateKey::from_bytes(*b_priv.as_bytes()),
+            b_node,
+            b_non_tx,
+        )
+        .unwrap();
+
+        // A knows B's endpoint (so A's pump pings B). B knows A's disco
+        // identity ONLY — empty endpoint list, like a peer that never
+        // advertises its reachable address.
+        a_ctl.upsert_peer(b_node_bytes, b_pub, vec![b_ctl.local_addr()]);
+        b_ctl.upsert_peer(a_node_bytes, a_pub, vec![]);
+
+        // B must converge to an alive direct path to A, learnable only
+        // from A's inbound ping src. Budget: A's first pump ping + B's
+        // next pump cycle + pong.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(addr) = b_ctl.alive_endpoint(&a_node_bytes) {
+                assert_eq!(addr, a_ctl.local_addr());
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("B never validated A's learned src as a direct path");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // Netmap delta: re-upsert A with (still) empty endpoints. The
+        // learned+validated path must survive the prune.
+        b_ctl.upsert_peer(a_node_bytes, a_pub, vec![]);
+        assert_eq!(
+            b_ctl.alive_endpoint(&a_node_bytes),
+            Some(a_ctl.local_addr()),
+            "learned path wiped by upsert_peer"
+        );
     }
 
     /// Address-family dispatch correctness: when no v6 socket is
