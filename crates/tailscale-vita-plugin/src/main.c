@@ -249,35 +249,53 @@ void *pthread_getspecific(pthread_key_t key)
     return v;
 }
 
-int module_start(SceSize argc, const void *args)
+/* M20-D (2026-07-05): ALL memory acquisition is deferred off module_start.
+ * Three *main boot attempts froze at/after the PS logo because module_start
+ * ran at SceShell-boot+0.5s and grabbed ~36 MB out of the shell's partition
+ * (32 MB newlib heap memblock + 4 MB taipool) while the shell itself was
+ * still allocating its boot working set — even when module_start RETURNED
+ * SUCCESS the shell starved (take-3 trace: watcher armed, c6 returned, boot
+ * still froze). module_start now only spawns a tiny (64 KB) init thread and
+ * returns; that thread waits until system uptime >= BOOT_GRACE before doing
+ * the heavy init. Under *TVIT00010 staging (app launch, uptime >> grace)
+ * the wait is zero and behavior is unchanged. */
+#define BOOT_GRACE_US (60ULL * 1000 * 1000)
+/* taipool retry: transient boot-time pressure gets three more chances. */
+#define POOL_RETRIES     3
+#define POOL_RETRY_US    (10 * 1000 * 1000)
+
+static volatile int g_pool_inited = 0;
+static volatile int g_stopping    = 0;
+
+/* The old module_start body: taipool + newlib chain + pte shim + Rust
+ * start. Runs on the deferred-init thread (or synchronously from
+ * module_start only as a last-resort fallback if even the tiny thread
+ * can't be created). Returns 0 on success. */
+static int heavy_init_and_start(void)
 {
-    (void)argc;
-    (void)args;
-
-    /* Best-effort mkdir; ignore failure (might already exist). */
-    sceIoMkdir("ux0:data/tailscale-vita", 0777);
-
-    /* Truncate the trace file so we only see this run's output. */
-    SceUID truncfd = sceIoOpen(TRACE_PATH,
-                               SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC,
-                               0666);
-    if (truncfd >= 0) {
-        sceIoClose(truncfd);
-    }
-
-    trace("c1: module_start entry");
-
     char buf[64];
     sceClibSnprintf(buf, sizeof buf, "c2: pre-taipool_init(%d)",
                     TAIPOOL_BYTES);
     trace(buf);
 
-    int pool_rc = taipool_init(TAIPOOL_BYTES);
-    sceClibSnprintf(buf, sizeof buf, "c3: taipool_init -> %d", pool_rc);
-    trace(buf);
-    if (pool_rc < 0) {
-        return SCE_KERNEL_START_FAILED;
+    int pool_rc = -1;
+    for (int i = 0; i <= POOL_RETRIES; i++) {
+        pool_rc = taipool_init(TAIPOOL_BYTES);
+        sceClibSnprintf(buf, sizeof buf, "c3: taipool_init -> %d (try %d)",
+                        pool_rc, i + 1);
+        trace(buf);
+        if (pool_rc >= 0) {
+            break;
+        }
+        if (g_stopping) {
+            return -1;
+        }
+        sceKernelDelayThread(POOL_RETRY_US);
     }
+    if (pool_rc < 0) {
+        return -1;
+    }
+    g_pool_inited = 1;
 
     /* CRITICAL: replicate the libc/pthread init chain that crt0's
      * `_start` would normally have run before main(). With
@@ -321,10 +339,79 @@ int module_start(SceSize argc, const void *args)
     trace(buf);
     if (rust_rc != 0) {
         taipool_term();
-        return SCE_KERNEL_START_FAILED;
+        g_pool_inited = 0;
+        return -1;
+    }
+    trace("c6: heavy init complete");
+    return 0;
+}
+
+/* Deferred-init thread entry: wait out SceShell's boot rush, then run
+ * the heavy init. System uptime (µs since boot) distinguishes *main-at-
+ * boot (wait the remainder of the grace window) from app-launch staging
+ * or a late load (uptime past grace: init immediately). */
+static int deferred_init_main(SceSize args, void *argp)
+{
+    (void)args;
+    (void)argp;
+    SceUInt64 up = sceKernelGetSystemTimeWide();
+    if (up < BOOT_GRACE_US) {
+        trace("d1: early boot — delaying heavy init until boot grace");
+        sceKernelDelayThread((SceUInt32)(BOOT_GRACE_US - up));
+    }
+    if (g_stopping) {
+        trace("d2: stop requested before init; aborting");
+        sceKernelExitDeleteThread(0);
+        return 0;
+    }
+    trace("d3: boot grace passed; running heavy init");
+    int rc = heavy_init_and_start();
+    trace(rc == 0 ? "d4: heavy init OK" : "d5: heavy init FAILED");
+    sceKernelExitDeleteThread(0);
+    return 0;
+}
+
+int module_start(SceSize argc, const void *args)
+{
+    (void)argc;
+    (void)args;
+
+    /* Best-effort mkdir; ignore failure (might already exist). */
+    sceIoMkdir("ux0:data/tailscale-vita", 0777);
+
+    /* Truncate the trace file so we only see this run's output. */
+    SceUID truncfd = sceIoOpen(TRACE_PATH,
+                               SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC,
+                               0666);
+    if (truncfd >= 0) {
+        sceIoClose(truncfd);
     }
 
-    trace("c6: returning SCE_KERNEL_START_SUCCESS");
+    trace("c1: module_start entry (deferred-init)");
+
+    /* Nothing heavy here — see BOOT_GRACE_US comment. 64 KB stack: the
+     * init chain itself is shallow; the Rust runtime gets its own 4 MB
+     * bootstrap stack later. */
+    SceUID thid = sceKernelCreateThread("ts-vita-init", deferred_init_main,
+                                        0x60, 64 * 1024, 0, 0, NULL);
+    if (thid < 0) {
+        /* Can't even make a 64 KB thread: fall back to synchronous init
+         * (the staging path of old). If THAT fails, fail the module. */
+        trace("c1a: init-thread create failed; falling back to sync init");
+        if (heavy_init_and_start() != 0) {
+            return SCE_KERNEL_START_FAILED;
+        }
+        return SCE_KERNEL_START_SUCCESS;
+    }
+    if (sceKernelStartThread(thid, 0, NULL) < 0) {
+        trace("c1b: init-thread start failed; falling back to sync init");
+        if (heavy_init_and_start() != 0) {
+            return SCE_KERNEL_START_FAILED;
+        }
+        return SCE_KERNEL_START_SUCCESS;
+    }
+
+    trace("c7: init thread armed; module_start returning SUCCESS");
     return SCE_KERNEL_START_SUCCESS;
 }
 
@@ -334,7 +421,10 @@ int module_stop(SceSize argc, const void *args)
     (void)args;
 
     sceClibPrintf("[ts-vita] module_stop\n");
+    g_stopping = 1;
     ts_vita_rt_stop();
-    taipool_term();
+    if (g_pool_inited) {
+        taipool_term();
+    }
     return SCE_KERNEL_STOP_SUCCESS;
 }
