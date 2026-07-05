@@ -74,6 +74,10 @@ extern "C" {
     ) -> c_int;
     fn sceKernelStartThread(thid: c_int, arg_len: u32, argp: *mut c_void) -> c_int;
     fn sceKernelExitDeleteThread(status: c_int) -> c_int;
+    // M20-D watcher: raw SCE sleep (µs) — the watcher thread must not
+    // touch libc/newlib (it may run before any pthread/reent context
+    // exists for it), so no std::thread::sleep there.
+    fn sceKernelDelayThread(delay_usec: u32) -> c_int;
 
     // Phase 2 diagnostic: try pthread_create directly. If this works
     // from SCE-bootstrap context, we know pthread is functional and
@@ -266,18 +270,14 @@ unsafe extern "C" fn bootstrap_main(_args: u32, _argp: *mut c_void) -> i32 {
     unsafe { sceKernelExitDeleteThread(0) }
 }
 
-/// C entry point: spawn the bootstrap thread via the SCE thread API
-/// and return. Called from `module_start` AFTER `taipool_init`
-/// succeeded. Returns 0 on success, negative SCE error on failure.
-#[no_mangle]
-pub unsafe extern "C" fn ts_vita_rt_start() -> i32 {
-    trace("r1: ts_vita_rt_start entry");
-
-    SHUTDOWN.store(false, Ordering::SeqCst);
-
-    trace("r2: pre-sceKernelCreateThread");
+/// Create + start the heavy bootstrap thread (4 MB stack). Returns 0 on
+/// success, negative SCE error on failure. The 4 MB stack allocation is
+/// the piece that fails under memory pressure at SceShell boot
+/// (0x80024302 on 2026-07-05, M20-D take 2) — callers must treat a
+/// failure as retryable, not fatal.
+unsafe fn spawn_bootstrap() -> i32 {
     // SAFETY: name + entry are statics; arg/option null. Negative
-    // return = SCE error code, propagated to C.
+    // return = SCE error code, propagated.
     let thid = unsafe {
         sceKernelCreateThread(
             c"ts-vita-rt-boot".as_ptr(),
@@ -296,19 +296,103 @@ pub unsafe extern "C" fn ts_vita_rt_start() -> i32 {
         )
     };
     if thid < 0 {
-        trace("r3: sceKernelCreateThread failed");
         return thid;
     }
-
-    trace("r4: pre-sceKernelStartThread");
     // SAFETY: thid is valid (just created); no args.
     let rc = unsafe { sceKernelStartThread(thid, 0, ptr::null_mut()) };
     if rc < 0 {
-        trace("r5: sceKernelStartThread failed");
         return rc;
     }
+    0
+}
 
-    trace("r6: spawn ok; returning 0");
+/// M20-D watcher-thread retry schedule: first retry 5 s after the
+/// immediate attempt failed, then spaced out to ride out SceShell's
+/// boot-time memory crunch (~170 s total window).
+const WATCHER_BACKOFF_SECS: [u32; 8] = [5, 10, 15, 20, 30, 30, 30, 30];
+
+/// Tiny watcher thread (32 KB stack): retries the heavy bootstrap spawn
+/// with backoff. Runs when the immediate spawn failed — i.e. under
+/// `*main` while SceShell is still booting and its partition can't fit
+/// a 4 MB thread stack yet. NO libc here: raw SCE delay only.
+unsafe extern "C" fn watcher_main(_args: u32, _argp: *mut c_void) -> i32 {
+    trace("rw1: watcher start");
+    for (i, secs) in WATCHER_BACKOFF_SECS.iter().enumerate() {
+        // SAFETY: raw SCE sleep, µs.
+        unsafe { sceKernelDelayThread(secs * 1_000_000) };
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            trace("rw2: watcher observed shutdown; exiting");
+            // SAFETY: extern C call to exit cleanly.
+            unsafe { sceKernelExitDeleteThread(0) };
+        }
+        // SAFETY: spawn_bootstrap's own contract.
+        let rc = unsafe { spawn_bootstrap() };
+        if rc == 0 {
+            // Static strings only on this thread: no format!/alloc —
+            // the watcher never runs the pthread/reent init chain.
+            trace("rw3: bootstrap spawned on retry");
+            // SAFETY: extern C call to exit cleanly.
+            unsafe { sceKernelExitDeleteThread(0) };
+        }
+        let _ = i;
+        trace("rw4: retry failed");
+    }
+    trace("rw5: watcher exhausted; runtime not started this boot");
+    // SAFETY: extern C call to exit cleanly.
+    unsafe { sceKernelExitDeleteThread(0) };
+    0
+}
+
+/// C entry point: spawn the bootstrap thread via the SCE thread API
+/// and return. Called from `module_start` AFTER `taipool_init`
+/// succeeded. Returns 0 on success, negative SCE error on failure.
+///
+/// M20-D: the heavy (4 MB-stack) spawn is attempted ONCE immediately —
+/// under `*TVIT00010` staging (app launch, memory plentiful) it succeeds
+/// and behavior is unchanged. If it fails (SceShell boot, partition
+/// still crowded), a 32 KB watcher thread retries with backoff instead;
+/// module_start itself never blocks the shell and never fails on
+/// memory pressure.
+#[no_mangle]
+pub unsafe extern "C" fn ts_vita_rt_start() -> i32 {
+    trace("r1: ts_vita_rt_start entry");
+
+    SHUTDOWN.store(false, Ordering::SeqCst);
+
+    trace("r2: pre-spawn_bootstrap (immediate attempt)");
+    // SAFETY: spawn_bootstrap's own contract.
+    let rc = unsafe { spawn_bootstrap() };
+    if rc == 0 {
+        trace("r6: spawn ok; returning 0");
+        return 0;
+    }
+    let _ = rc;
+    trace("r3: immediate spawn failed; starting watcher");
+
+    // SAFETY: name + entry are statics; tiny stack — if even 32 KB
+    // can't be allocated the module is beyond saving this boot.
+    let thid = unsafe {
+        sceKernelCreateThread(
+            c"ts-vita-rt-watch".as_ptr(),
+            watcher_main,
+            0x60,       // lower priority than the shell's own boot work
+            32 * 1024,  // stack: trace() + spawn calls only
+            0,
+            0,
+            ptr::null(),
+        )
+    };
+    if thid < 0 {
+        trace("r7: watcher create failed");
+        return thid;
+    }
+    // SAFETY: thid is valid (just created); no args.
+    let rc = unsafe { sceKernelStartThread(thid, 0, ptr::null_mut()) };
+    if rc < 0 {
+        trace("r8: watcher start failed");
+        return rc;
+    }
+    trace("r9: watcher armed; returning 0");
     0
 }
 
