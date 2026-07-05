@@ -16,6 +16,7 @@ crate-type  = ["staticlib"]
 # Path deps — the runtime + log + listener types we wrap.
 tailscale-vita = { path = "../tailscale-vita" }
 vita-log       = { path = "../vita-log" }
+vita-fs        = { path = "../vita-fs" }
 netstack       = { path = "../netstack" }
 vita-thread    = { path = "../vita-thread" }
 

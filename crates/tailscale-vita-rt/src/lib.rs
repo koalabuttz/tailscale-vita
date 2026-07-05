@@ -40,6 +40,13 @@ mod handler;
 const CONFIG_PATH: &str = "ux0:/data/tailscale-vita/config.toml";
 const ACCEPT_POLL: Duration = Duration::from_millis(500);
 const NET_SETTLE: Duration = Duration::from_secs(3);
+/// M20-D boot-settle bounds: under `*main` the bootstrap thread starts at
+/// SceShell-boot+~0.5s, racing the ux0 mount (boot #1 on 2026-07-05 froze
+/// the shell right after `suprx.runtime.start`; boot #2 won the race).
+/// Poll until ux0 answers a read_dir, bounded so a genuinely broken card
+/// still proceeds to a clean config error instead of waiting forever.
+const BOOT_SETTLE_MAX: Duration = Duration::from_secs(60);
+const BOOT_SETTLE_POLL: Duration = Duration::from_millis(500);
 
 // ---------------- Diagnostic trace (matches main.c's TRACE_PATH) ----------------
 //
@@ -341,6 +348,24 @@ fn run_runtime() {
     }
 
     info!("suprx.runtime.start");
+
+    // M20-D boot-settle: do NOTHING heavy (crypto selftest, net, config I/O)
+    // until ux0 is actually mounted and answering. Runs on the bootstrap
+    // thread — module_start has already returned, so a slow settle can never
+    // wedge SceShell boot; the DANGER is early syscalls against half-ready
+    // services, which is exactly what this loop waits out.
+    trace("rr1b: boot-settle begin");
+    let settle_deadline = std::time::Instant::now() + BOOT_SETTLE_MAX;
+    let mut settle_tries = 0u32;
+    while std::time::Instant::now() < settle_deadline {
+        if vita_fs::read_dir(Path::new("ux0:/data")).is_ok() {
+            break;
+        }
+        settle_tries += 1;
+        std::thread::sleep(BOOT_SETTLE_POLL);
+    }
+    trace(&format!("rr1c: boot-settle done tries={settle_tries}"));
+    info!(tries = settle_tries, "suprx.boot_settle.done");
 
     // One-shot WG data-plane crypto self-test, BEFORE any network setup so it's
     // fully isolated (no sockets, no peers) and runs even if the control plane
