@@ -27,6 +27,14 @@ use super::config_edit;
 const LOCALAPI_ADDR: &str = "127.0.0.1:41112";
 /// config.toml path — the eboot rewrites this for [ftp] toggles.
 pub const CONFIG_PATH: &str = "ux0:/data/tailscale-vita/config.toml";
+/// Default Taildrop inbox — mirrors the runtime's `[taildrop] dir` default
+/// and is `TAILDROP_DIR_PRESETS[0]`, so an absent/custom dir cycles into the
+/// ring at index 0.
+pub const TAILDROP_DIR_DEFAULT: &str = "ux0:/data/tailscale-vita/taildrop";
+/// The dir values `CycleTaildropDir` rotates through (wrapping). A custom or
+/// unrecognized current dir jumps to `[0]` on the next press.
+const TAILDROP_DIR_PRESETS: [&str; 3] =
+    [TAILDROP_DIR_DEFAULT, "ux0:/vpk", "ux0:/downloads"];
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const STATUS_READ_TIMEOUT: Duration = Duration::from_secs(3);
 /// `/ping` and `/reconnect` block server-side; leave headroom.
@@ -48,6 +56,11 @@ pub struct Shared {
     /// couldn't read the file.
     pub ftp_enabled: Option<bool>,
     pub ftp_read_only: Option<bool>,
+    /// M20-C4 Taildrop settings, same "re-read after each toggle" contract
+    /// as the ftp fields (applied on next launch). `taildrop_dir == None`
+    /// when the key is absent — the UI renders that as "inbox (default)".
+    pub taildrop_enabled: Option<bool>,
+    pub taildrop_dir: Option<String>,
 }
 
 impl Shared {
@@ -61,6 +74,8 @@ impl Shared {
             action: ActionState::Idle,
             ftp_enabled: None,
             ftp_read_only: None,
+            taildrop_enabled: None,
+            taildrop_dir: None,
         }))
     }
 }
@@ -79,6 +94,10 @@ pub enum UiAction {
     Reconnect,
     /// Toggle a `[ftp]` bool (`"enabled"` or `"read_only"`).
     ToggleFtp { key: &'static str },
+    /// M20-C4: flip `[taildrop] enabled` (inserts the section if absent).
+    ToggleTaildrop,
+    /// M20-C4: rotate `[taildrop] dir` through `TAILDROP_DIR_PRESETS`.
+    CycleTaildropDir,
     /// M19 lifecycle actions (zero-parameter LocalAPI POSTs). `TailnetUp`/
     /// `TailnetDown` also persist `[tailnet] want_running` for next boot.
     TailnetUp,
@@ -93,6 +112,8 @@ impl UiAction {
             UiAction::Ping { peer_name, .. } => format!("pinging {peer_name}..."),
             UiAction::Reconnect => "reconnecting...".into(),
             UiAction::ToggleFtp { key } => format!("saving ftp.{key}..."),
+            UiAction::ToggleTaildrop => "saving taildrop...".into(),
+            UiAction::CycleTaildropDir => "changing folder...".into(),
             UiAction::TailnetUp => "starting tailnet...".into(),
             UiAction::TailnetDown => "stopping tailnet...".into(),
             UiAction::Logout => "logging out...".into(),
@@ -108,6 +129,8 @@ pub fn spawn_worker(shared: Arc<Mutex<Shared>>, action_rx: Receiver<UiAction>) {
         let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
         s.ftp_enabled = config_edit::read_toggle(CONFIG_PATH, "ftp", "enabled");
         s.ftp_read_only = config_edit::read_toggle(CONFIG_PATH, "ftp", "read_only");
+        s.taildrop_enabled = config_edit::read_toggle(CONFIG_PATH, "taildrop", "enabled");
+        s.taildrop_dir = config_edit::read_toggle_str(CONFIG_PATH, "taildrop", "dir");
     }
     let spawned = vita_thread::Builder::new()
         .name("ui-worker")
@@ -173,6 +196,14 @@ fn run_action(shared: &Arc<Mutex<Shared>>, action: UiAction) {
         UiAction::ToggleFtp { key } => {
             info!(key, "ui.action.toggle_ftp");
             do_toggle_ftp(shared, key)
+        }
+        UiAction::ToggleTaildrop => {
+            info!("ui.action.toggle_taildrop");
+            do_toggle_taildrop(shared)
+        }
+        UiAction::CycleTaildropDir => {
+            info!("ui.action.cycle_taildrop_dir");
+            do_cycle_taildrop_dir(shared)
         }
         UiAction::TailnetUp => {
             info!("ui.action.tailnet_up");
@@ -329,6 +360,50 @@ fn do_toggle_ftp(shared: &Arc<Mutex<Shared>>, key: &'static str) -> (String, boo
             )
         }
         Err(e) => (format!("save ftp.{key} failed: {e}"), false),
+    }
+}
+
+/// Flip `[taildrop] enabled`. Unlike the ts-ftp keys (which ship in the
+/// config template) the whole `[taildrop]` section may be ABSENT on an
+/// older device config, so we read-then-`apply_set` (which INSERTS) rather
+/// than `apply_toggle` (which errors on a missing key). Applies next launch.
+fn do_toggle_taildrop(shared: &Arc<Mutex<Shared>>) -> (String, bool) {
+    let current = config_edit::read_toggle(CONFIG_PATH, "taildrop", "enabled").unwrap_or(false);
+    match config_edit::apply_set(CONFIG_PATH, "taildrop", "enabled", !current) {
+        Ok(new_val) => {
+            {
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
+                s.taildrop_enabled = Some(new_val);
+            }
+            (
+                format!("taildrop: {} (next launch)", if new_val { "ON" } else { "OFF" }),
+                true,
+            )
+        }
+        Err(e) => (format!("save taildrop.enabled failed: {e}"), false),
+    }
+}
+
+/// Rotate `[taildrop] dir` to the next preset (wrapping). A custom/unknown
+/// current dir resets to `TAILDROP_DIR_PRESETS[0]`. Applies next launch.
+fn do_cycle_taildrop_dir(shared: &Arc<Mutex<Shared>>) -> (String, bool) {
+    let current = config_edit::read_toggle_str(CONFIG_PATH, "taildrop", "dir")
+        .unwrap_or_else(|| TAILDROP_DIR_DEFAULT.to_string());
+    let next_idx = TAILDROP_DIR_PRESETS
+        .iter()
+        .position(|p| *p == current)
+        .map(|i| (i + 1) % TAILDROP_DIR_PRESETS.len())
+        .unwrap_or(0);
+    let next = TAILDROP_DIR_PRESETS[next_idx];
+    match config_edit::apply_set_str(CONFIG_PATH, "taildrop", "dir", next) {
+        Ok(saved) => {
+            {
+                let mut s = shared.lock().unwrap_or_else(|p| p.into_inner());
+                s.taildrop_dir = Some(saved.clone());
+            }
+            (format!("folder: {saved} (next launch)"), true)
+        }
+        Err(e) => (format!("save taildrop.dir failed: {e}"), false),
     }
 }
 

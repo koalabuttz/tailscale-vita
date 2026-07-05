@@ -125,7 +125,7 @@ pub fn run(exit: &AtomicBool) {
         prev_touch = touch.is_some();
 
         // ── Pull worker state; rebuild viewmodel on generation change ──
-        let (generation, snap_opt, action, last_error, failures, last_ok, ftp_en, ftp_ro) = {
+        let (generation, snap_opt, action, last_error, failures, last_ok, ftp_en, ftp_ro, td_en, td_dir) = {
             let s = shared.lock().unwrap_or_else(|p| p.into_inner());
             (
                 s.generation,
@@ -136,6 +136,8 @@ pub fn run(exit: &AtomicBool) {
                 s.last_ok_at,
                 s.ftp_enabled,
                 s.ftp_read_only,
+                s.taildrop_enabled,
+                s.taildrop_dir.clone(),
             )
         };
         if generation != seen_generation {
@@ -268,6 +270,8 @@ pub fn run(exit: &AtomicBool) {
                             SettingRow::FtpReadOnly => {
                                 send(UiAction::ToggleFtp { key: "read_only" })
                             }
+                            SettingRow::TaildropEnabled => send(UiAction::ToggleTaildrop),
+                            SettingRow::TaildropDir => send(UiAction::CycleTaildropDir),
                             SettingRow::TailnetToggle => {
                                 // Flip by current lifecycle: Stopped → up.
                                 let stopped = matches!(
@@ -324,7 +328,7 @@ pub fn run(exit: &AtomicBool) {
                     let kx = viewmodel::key_expiry_line(snap, now_u);
                     let rows: Vec<(String, String, Tone)> = SettingRow::ALL
                         .iter()
-                        .map(|r| r.render(ftp_en, ftp_ro, snap.lifecycle))
+                        .map(|r| r.render(ftp_en, ftp_ro, td_en, td_dir.as_deref(), snap.lifecycle))
                         .collect();
                     renderer.settings_body(
                         (&acl.0, acl.1),

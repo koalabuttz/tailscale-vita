@@ -48,17 +48,20 @@ impl Tab {
     }
 }
 
-/// A row in the Settings tab. The two ftp rows are config toggles
-/// (rewrite config.toml, relaunch to apply). `TailnetToggle` (M19) flips
-/// the live `want_running` state (`/up`/`/down`, also persisted); its
-/// value cell shows `on`/`off` from the lifecycle. `Reconnect` rebuilds
-/// the control session; `Reauthenticate` (M19) starts a fresh interactive
-/// login (`/login-interactive`); `Logout` expires the node's key at
-/// control (guarded by a confirm overlay).
+/// A row in the Settings tab. The two ftp rows + two taildrop rows are
+/// config toggles (rewrite config.toml, relaunch to apply). `TaildropDir`
+/// (M20-C4) cycles the inbox path preset; the rest are unchanged.
+/// `TailnetToggle` (M19) flips the live `want_running` state (`/up`/`/down`,
+/// also persisted); its value cell shows `on`/`off` from the lifecycle.
+/// `Reconnect` rebuilds the control session; `Reauthenticate` (M19) starts a
+/// fresh interactive login (`/login-interactive`); `Logout` expires the
+/// node's key at control (guarded by a confirm overlay).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingRow {
     FtpEnabled,
     FtpReadOnly,
+    TaildropEnabled,
+    TaildropDir,
     TailnetToggle,
     Reconnect,
     Reauthenticate,
@@ -66,9 +69,11 @@ pub enum SettingRow {
 }
 
 impl SettingRow {
-    pub const ALL: [SettingRow; 6] = [
+    pub const ALL: [SettingRow; 8] = [
         SettingRow::FtpEnabled,
         SettingRow::FtpReadOnly,
+        SettingRow::TaildropEnabled,
+        SettingRow::TaildropDir,
         SettingRow::TailnetToggle,
         SettingRow::Reconnect,
         SettingRow::Reauthenticate,
@@ -76,13 +81,15 @@ impl SettingRow {
     ];
 
     /// Display label + right-hand value string for the current state.
-    /// `ftp_enabled`/`ftp_read_only` are the live config.toml values
-    /// (`None` = couldn't read the file); `lifecycle` drives the tailnet
-    /// on/off value cell (`Stopped` ⇒ off).
+    /// `ftp_enabled`/`ftp_read_only`/`taildrop_enabled`/`taildrop_dir` are
+    /// the live config.toml values (`None` = couldn't read the file);
+    /// `lifecycle` drives the tailnet on/off value cell (`Stopped` ⇒ off).
     pub fn render(
         self,
         ftp_enabled: Option<bool>,
         ftp_read_only: Option<bool>,
+        taildrop_enabled: Option<bool>,
+        taildrop_dir: Option<&str>,
         lifecycle: OnlineState,
     ) -> (String, String, Tone) {
         let on_off = |b: Option<bool>| match b {
@@ -99,6 +106,15 @@ impl SettingRow {
                 let (v, t) = on_off(ftp_read_only);
                 ("ts-ftp read-only".into(), v, t)
             }
+            SettingRow::TaildropEnabled => {
+                let (v, t) = on_off(taildrop_enabled);
+                ("Taildrop receive".into(), v, t)
+            }
+            SettingRow::TaildropDir => (
+                "Taildrop folder".into(),
+                taildrop_dir_label(taildrop_dir),
+                Tone::Dim,
+            ),
             SettingRow::TailnetToggle => {
                 if lifecycle == OnlineState::Stopped {
                     ("Tailnet".into(), "off".into(), Tone::Dim)
@@ -361,6 +377,25 @@ pub fn build_debug_rows(
     let (kx, kt) = key_expiry_line(snap, now_unix);
     rows.push(("self key".into(), kx.trim_start_matches("key: ").into(), kt));
     rows.push(("build".into(), build.into(), Tone::Dim));
+
+    // M20-C4: Taildrop activity feed (newest-first, as delivered by the
+    // snapshot). A header row, then one line per received file — value =
+    // "{size} {sender} {status} {age}" — or a single dim placeholder when
+    // empty. Transient by design (see RuntimeSnapshot::recent_taildrops).
+    rows.push(("-- taildrop inbox --".into(), String::new(), Tone::Dim));
+    if snap.recent_taildrops.is_empty() {
+        rows.push(("(no files received)".into(), String::new(), Tone::Dim));
+    } else {
+        for ev in &snap.recent_taildrops {
+            let age = fmt_duration_secs(now_unix.saturating_sub(ev.at_unix));
+            let tone = if ev.status == "ok" { Tone::Good } else { Tone::Warn };
+            rows.push((
+                truncate_ellipsis(&ev.name, 20),
+                format!("{} {} {} {}", humanize_bytes(ev.size), ev.sender, ev.status, age),
+                tone,
+            ));
+        }
+    }
     rows
 }
 
@@ -447,6 +482,50 @@ pub fn fmt_duration_secs(secs: u64) -> String {
         format!("{m}m")
     } else {
         format!("{secs}s")
+    }
+}
+
+/// The runtime's default Taildrop inbox — rendered as "inbox (default)"
+/// rather than the long raw path. Mirrors `client::TAILDROP_DIR_DEFAULT`
+/// by value; viewmodel stays dependency-free so it host-tests cleanly.
+const TAILDROP_DIR_DEFAULT: &str = "ux0:/data/tailscale-vita/taildrop";
+
+/// Friendly Settings value for `[taildrop] dir`. The unset value (`None`)
+/// and the default path both read as "inbox (default)"; any custom path is
+/// shown raw, truncated to 26 chars with a trailing '…' so it can't overrun
+/// the row's value cell.
+pub fn taildrop_dir_label(dir: Option<&str>) -> String {
+    match dir {
+        None => "inbox (default)".to_string(),
+        Some(d) if d == TAILDROP_DIR_DEFAULT => "inbox (default)".to_string(),
+        Some(d) => truncate_ellipsis(d, 26),
+    }
+}
+
+/// Truncate `s` to at most `max` content chars, appending '…' when it was
+/// longer. Char-based (not byte) so a multibyte path can't split a code
+/// point. Shared by the taildrop dir label and the debug-feed file names.
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let kept: String = s.chars().take(max).collect();
+        format!("{kept}…")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Humanize a byte count for the taildrop feed: `B` below 1 KiB, else
+/// `KB`/`MB` with one decimal. Binary (1024) units to match on-disk sizes.
+fn humanize_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let f = n as f64;
+    if f < KB {
+        format!("{n} B")
+    } else if f < MB {
+        format!("{:.1} KB", f / KB)
+    } else {
+        format!("{:.1} MB", f / MB)
     }
 }
 
@@ -646,39 +725,115 @@ mod tests {
     #[test]
     fn setting_row_renders_states() {
         let ol = OnlineState::Online;
-        let (l, v, t) = SettingRow::FtpEnabled.render(Some(true), Some(false), ol);
+        let (l, v, t) = SettingRow::FtpEnabled.render(Some(true), Some(false), None, None, ol);
         assert_eq!(l, "ts-ftp server");
         assert_eq!(v, "ON");
         assert_eq!(t, Tone::Good);
-        let (_, v, t) = SettingRow::FtpReadOnly.render(Some(true), Some(false), ol);
+        let (_, v, t) = SettingRow::FtpReadOnly.render(Some(true), Some(false), None, None, ol);
         assert_eq!(v, "OFF");
         assert_eq!(t, Tone::Dim);
-        let (_, v, t) = SettingRow::FtpEnabled.render(None, None, ol);
+        let (_, v, t) = SettingRow::FtpEnabled.render(None, None, None, None, ol);
         assert_eq!(v, "?");
         assert_eq!(t, Tone::Warn);
-        let (l, _, _) = SettingRow::Reconnect.render(None, None, ol);
+        let (l, _, _) = SettingRow::Reconnect.render(None, None, None, None, ol);
         assert_eq!(l, "Reconnect to control");
-        let (l, v, t) = SettingRow::Reauthenticate.render(None, None, ol);
+        let (l, v, t) = SettingRow::Reauthenticate.render(None, None, None, None, ol);
         assert_eq!(l, "Re-authenticate");
         assert_eq!(v, "press X");
         assert_eq!(t, Tone::Warn);
-        let (l, _, t) = SettingRow::Logout.render(None, None, ol);
+        let (l, _, t) = SettingRow::Logout.render(None, None, None, None, ol);
         assert_eq!(l, "Log out");
         assert_eq!(t, Tone::Bad);
     }
 
     #[test]
+    fn taildrop_rows_render_state() {
+        let ol = OnlineState::Online;
+        // Taildrop receive uses the same ON/OFF/? machinery as ts-ftp.
+        let (l, v, t) = SettingRow::TaildropEnabled.render(None, None, Some(true), None, ol);
+        assert_eq!(l, "Taildrop receive");
+        assert_eq!(v, "ON");
+        assert_eq!(t, Tone::Good);
+        let (_, v, t) = SettingRow::TaildropEnabled.render(None, None, Some(false), None, ol);
+        assert_eq!(v, "OFF");
+        assert_eq!(t, Tone::Dim);
+        // Folder row: None → default label; a custom path shows raw.
+        let (l, v, t) = SettingRow::TaildropDir.render(None, None, None, None, ol);
+        assert_eq!(l, "Taildrop folder");
+        assert_eq!(v, "inbox (default)");
+        assert_eq!(t, Tone::Dim);
+        let (_, v, _) = SettingRow::TaildropDir.render(None, None, None, Some("ux0:/vpk"), ol);
+        assert_eq!(v, "ux0:/vpk");
+    }
+
+    #[test]
     fn tailnet_toggle_reflects_lifecycle() {
-        // ALL is exactly the six M19 rows, in order.
-        assert_eq!(SettingRow::ALL.len(), 6);
-        assert_eq!(SettingRow::ALL[2], SettingRow::TailnetToggle);
-        let (l, v, t) = SettingRow::TailnetToggle.render(None, None, OnlineState::Online);
+        // ALL is exactly the eight rows (2 ftp + 2 taildrop + M19 four), in
+        // order; TailnetToggle moved to index 4 after the taildrop pair.
+        assert_eq!(SettingRow::ALL.len(), 8);
+        assert_eq!(SettingRow::ALL[2], SettingRow::TaildropEnabled);
+        assert_eq!(SettingRow::ALL[3], SettingRow::TaildropDir);
+        assert_eq!(SettingRow::ALL[4], SettingRow::TailnetToggle);
+        let (l, v, t) =
+            SettingRow::TailnetToggle.render(None, None, None, None, OnlineState::Online);
         assert_eq!(l, "Tailnet");
         assert_eq!(v, "on");
         assert_eq!(t, Tone::Good);
-        let (_, v, t) = SettingRow::TailnetToggle.render(None, None, OnlineState::Stopped);
+        let (_, v, t) =
+            SettingRow::TailnetToggle.render(None, None, None, None, OnlineState::Stopped);
         assert_eq!(v, "off");
         assert_eq!(t, Tone::Dim);
+    }
+
+    #[test]
+    fn taildrop_dir_label_friendly() {
+        // Unset + the default path both collapse to the friendly label.
+        assert_eq!(taildrop_dir_label(None), "inbox (default)");
+        assert_eq!(
+            taildrop_dir_label(Some("ux0:/data/tailscale-vita/taildrop")),
+            "inbox (default)"
+        );
+        // A short custom path is shown verbatim.
+        assert_eq!(taildrop_dir_label(Some("ux0:/vpk")), "ux0:/vpk");
+        // A path over 26 chars is truncated with a trailing ellipsis (26
+        // kept + '…' = 27 glyphs).
+        let long = "ux0:/downloads/incoming/from-tailnet-peers";
+        let label = taildrop_dir_label(Some(long));
+        assert!(label.ends_with('…'), "{label}");
+        assert_eq!(label.chars().count(), 27);
+    }
+
+    #[test]
+    fn humanize_bytes_units() {
+        assert_eq!(humanize_bytes(0), "0 B");
+        assert_eq!(humanize_bytes(512), "512 B");
+        assert_eq!(humanize_bytes(1024), "1.0 KB");
+        assert_eq!(humanize_bytes(1536), "1.5 KB");
+        assert_eq!(humanize_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(humanize_bytes(3 * 1024 * 1024 + 512 * 1024), "3.5 MB");
+    }
+
+    #[test]
+    fn debug_rows_include_taildrop_feed() {
+        use tailscale_vita::snapshot::TaildropEvent;
+        let mut s = snap_with(vec![]);
+        // Empty feed → the header + a single placeholder row.
+        let rows = build_debug_rows(&s, 1_000_000, "b");
+        assert!(rows.iter().any(|(l, _, _)| l == "-- taildrop inbox --"));
+        assert!(rows.iter().any(|(l, _, _)| l == "(no files received)"));
+        // A received file renders name (left) + humanized size/sender/status/age.
+        s.recent_taildrops = vec![TaildropEvent {
+            name: "photo.jpg".into(),
+            size: 1536,
+            sender: "100.64.0.5:52233".into(),
+            status: "ok".into(),
+            at_unix: 1_000_000 - 120, // 2 minutes ago
+        }];
+        let rows = build_debug_rows(&s, 1_000_000, "b");
+        let feed = rows.iter().find(|(l, _, _)| l == "photo.jpg").unwrap();
+        assert_eq!(feed.1, "1.5 KB 100.64.0.5:52233 ok 2m");
+        assert_eq!(feed.2, Tone::Good);
+        assert!(!rows.iter().any(|(l, _, _)| l == "(no files received)"));
     }
 
     #[test]

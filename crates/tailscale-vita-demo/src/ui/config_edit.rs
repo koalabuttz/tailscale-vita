@@ -129,6 +129,65 @@ pub fn set_bool(text: &str, section: &str, key: &str, value: bool) -> (String, b
     (out, value)
 }
 
+/// Set a string `key` under `[section]` to an explicit `value`, written as
+/// a TOML basic (double-quoted) string — `key = "value"`. The string form
+/// of [`set_bool`]; same **always-succeeds** insert-if-missing semantics
+/// (append to the section tail, or a fresh `[section]` at EOF). Used for
+/// device paths (`[taildrop] dir`), so no escaping is performed — a value
+/// with an embedded `"` would produce malformed TOML, but paths never do.
+/// Returns the new file text.
+pub fn set_str(text: &str, section: &str, key: &str, value: &str) -> String {
+    let mut in_section = false;
+    let mut saw_section = false;
+    let mut wrote = false;
+    let mut out = String::with_capacity(text.len() + value.len() + 32);
+
+    for line in text.lines() {
+        if let Some(name) = section_name(line) {
+            // Crossing into the next header while inside the target section
+            // and the key never appeared → insert it at the section tail.
+            if in_section && !wrote {
+                push_str_kv(&mut out, "", key, value);
+                wrote = true;
+            }
+            in_section = name == section;
+            if in_section {
+                saw_section = true;
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        } else if in_section && !wrote {
+            // Same active-key match as `set_bool`: `key` before `=`, ignoring
+            // indent; a commented-out key doesn't match and is re-inserted.
+            if let Some((lhs, _rhs)) = line.split_once('=') {
+                if lhs.trim() == key {
+                    let indent = &line[..line.len() - line.trim_start().len()];
+                    push_str_kv(&mut out, indent, key, value);
+                    wrote = true;
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    // Target section was the last one and the key never appeared → append.
+    if in_section && !wrote {
+        push_str_kv(&mut out, "", key, value);
+    } else if !saw_section {
+        // Section absent entirely → append a fresh `[section]` + key.
+        out.push('\n');
+        out.push('[');
+        out.push_str(section);
+        out.push_str("]\n");
+        push_str_kv(&mut out, "", key, value);
+    }
+
+    out
+}
+
 /// Write one `{indent}{key} = {value}` line + newline, matching
 /// [`toggle_bool`]'s exact ` = ` spacing.
 fn push_bool(out: &mut String, indent: &str, key: &str, value: bool) {
@@ -136,6 +195,16 @@ fn push_bool(out: &mut String, indent: &str, key: &str, value: bool) {
     out.push_str(key);
     out.push_str(&format!(" = {value}"));
     out.push('\n');
+}
+
+/// Write one `{indent}{key} = "{value}"` line + newline — a double-quoted
+/// TOML basic string, matching [`push_bool`]'s ` = ` spacing.
+fn push_str_kv(out: &mut String, indent: &str, key: &str, value: &str) {
+    out.push_str(indent);
+    out.push_str(key);
+    out.push_str(" = \"");
+    out.push_str(value);
+    out.push_str("\"\n");
 }
 
 /// Read the current bool from a `key = value` line (defaults to false if
@@ -164,6 +233,36 @@ pub fn read_bool(text: &str, section: &str, key: &str) -> Option<bool> {
     None
 }
 
+/// Read the current string value of a `key` under `[section]`, if present
+/// and a well-formed TOML basic (double-quoted) string. RHS parse only:
+/// trim, require a leading `"`, take chars up to the next `"`. No escape
+/// handling — values are device paths (`ux0:/vpk`) — so an unquoted or
+/// unterminated RHS yields `None`.
+pub fn read_str(text: &str, section: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in text.lines() {
+        if let Some(name) = section_name(line) {
+            in_section = name == section;
+        } else if in_section {
+            if let Some((lhs, rhs)) = line.split_once('=') {
+                if lhs.trim() == key {
+                    return parse_basic_string(rhs);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Extract a TOML basic string's contents from a `= "…"` RHS: trim, strip
+/// the opening `"`, take everything up to the next `"`. `None` if the value
+/// isn't a terminated double-quoted string.
+fn parse_basic_string(rhs: &str) -> Option<String> {
+    let body = rhs.trim().strip_prefix('"')?;
+    let end = body.find('"')?;
+    Some(body[..end].to_string())
+}
+
 /// Read config.toml, flip `[section] key`, write it back. Returns the
 /// new value on success.
 ///
@@ -182,47 +281,55 @@ pub fn apply_toggle(config_path: &str, section: &str, key: &str) -> Result<bool,
         .map_err(|e| format!("read config: {e}"))?;
     let (new_text, new_value) = toggle_bool(&text, section, key)
         .ok_or_else(|| format!("no `{key}` under [{section}]"))?;
-
-    // 1. Backup the ORIGINAL before anything destructive (best-effort).
-    let bak = format!("{config_path}.bak");
-    let _ = vita_fs::write(Path::new(&bak), text.as_bytes());
-
-    // 2. Stage the new content, then swap it in. A staging-write failure
-    //    leaves config.toml untouched (rename never runs).
-    let tmp = format!("{config_path}.tmp");
-    vita_fs::write(Path::new(&tmp), new_text.as_bytes())
-        .map_err(|e| format!("write tmp: {e}"))?;
-    let _rename = vita_fs::rename(Path::new(&tmp), Path::new(config_path));
-
-    // 3. Verify the swap landed a good file; if the non-atomic rename
-    //    lost it (error mid-swap), rewrite the new content directly.
-    let good = matches!(
-        vita_fs::read_to_string(Path::new(config_path)),
-        Ok(ref s) if !s.trim().is_empty()
-    );
-    if !good {
-        vita_fs::write(Path::new(config_path), new_text.as_bytes())
-            .map_err(|e| format!("config swap failed; original saved at {bak}: {e}"))?;
-    }
+    crash_safe_swap(config_path, &text, &new_text)?;
     Ok(new_value)
 }
 
 /// Read config.toml, set `[section] key` to an explicit `value` (inserting
 /// the section/key if absent — see [`set_bool`]), and write it back.
-/// Returns the value set.
-///
-/// Uses the identical crash-safe swap as [`apply_toggle`]: a `.bak` of the
-/// original first, stage to `.tmp`, non-atomic `vita_fs::rename`, then
-/// verify-and-rewrite if the rename lost the file. See that function for
-/// the durability rationale (`vita_fs::rename` is remove-then-rename).
+/// Returns the value set. Uses the identical crash-safe swap as
+/// [`apply_toggle`] (see [`crash_safe_swap`]).
 pub fn apply_set(config_path: &str, section: &str, key: &str, value: bool) -> Result<bool, String> {
     let text = vita_fs::read_to_string(Path::new(config_path))
         .map_err(|e| format!("read config: {e}"))?;
     let (new_text, new_value) = set_bool(&text, section, key, value);
+    crash_safe_swap(config_path, &text, &new_text)?;
+    Ok(new_value)
+}
 
+/// Read config.toml, set string `[section] key` to `value` (inserting the
+/// section/key if absent — see [`set_str`]), and write it back. Returns the
+/// value set. Uses the identical crash-safe swap as [`apply_toggle`] (see
+/// [`crash_safe_swap`]).
+pub fn apply_set_str(
+    config_path: &str,
+    section: &str,
+    key: &str,
+    value: &str,
+) -> Result<String, String> {
+    let text = vita_fs::read_to_string(Path::new(config_path))
+        .map_err(|e| format!("read config: {e}"))?;
+    let new_text = set_str(&text, section, key, value);
+    crash_safe_swap(config_path, &text, &new_text)?;
+    Ok(value.to_string())
+}
+
+/// Crash-safe swap of `new_text` into `config_path`, preserving the pre-edit
+/// `original` at `{config_path}.bak`. Shared by every apply fn.
+///
+/// Durability note: `vita_fs::rename` is NOT an atomic swap on the Vita — it
+/// does remove-then-rename, so a rename *error* (not just a crash) could
+/// otherwise leave config.toml missing while the runtime rewrites a blank
+/// template over it, stranding the user's auth_key. We defend on two fronts:
+/// (1) a `.bak` copy of the original is written FIRST, so the pre-edit file
+/// (auth_key and all) is always recoverable; (2) after the swap we VERIFY
+/// config.toml is present and non-empty, and if the non-atomic rename lost
+/// it, we rewrite the new content directly. `new_text` is a full copy that
+/// preserves every non-target line, so this restore is lossless.
+fn crash_safe_swap(config_path: &str, original: &str, new_text: &str) -> Result<(), String> {
     // 1. Backup the ORIGINAL before anything destructive (best-effort).
     let bak = format!("{config_path}.bak");
-    let _ = vita_fs::write(Path::new(&bak), text.as_bytes());
+    let _ = vita_fs::write(Path::new(&bak), original.as_bytes());
 
     // 2. Stage the new content, then swap it in. A staging-write failure
     //    leaves config.toml untouched (rename never runs).
@@ -241,13 +348,19 @@ pub fn apply_set(config_path: &str, section: &str, key: &str, value: bool) -> Re
         vita_fs::write(Path::new(config_path), new_text.as_bytes())
             .map_err(|e| format!("config swap failed; original saved at {bak}: {e}"))?;
     }
-    Ok(new_value)
+    Ok(())
 }
 
 /// Read config.toml and return the live value of `[section] key`.
 pub fn read_toggle(config_path: &str, section: &str, key: &str) -> Option<bool> {
     let text = vita_fs::read_to_string(Path::new(config_path)).ok()?;
     read_bool(&text, section, key)
+}
+
+/// Read config.toml and return the live string value of `[section] key`.
+pub fn read_toggle_str(config_path: &str, section: &str, key: &str) -> Option<String> {
+    let text = vita_fs::read_to_string(Path::new(config_path)).ok()?;
+    read_str(&text, section, key)
 }
 
 #[cfg(test)]
@@ -381,5 +494,54 @@ rounds             = 5
         // Exactly one [tailnet] header; [ftp] preserved after it.
         assert_eq!(out.matches("[tailnet]").count(), 1);
         assert!(out.contains("[ftp]\nenabled = false"));
+    }
+
+    #[test]
+    fn set_str_inserts_missing_section() {
+        // The on-device case: no [taildrop] section at all → append the
+        // section + a quoted key rather than failing.
+        assert_eq!(read_str(CFG, "taildrop", "dir"), None);
+        let out = set_str(CFG, "taildrop", "dir", "ux0:/downloads");
+        assert!(out.contains("[taildrop]\n"));
+        assert!(out.contains("dir = \"ux0:/downloads\"\n"));
+        assert_eq!(read_str(&out, "taildrop", "dir"), Some("ux0:/downloads".into()));
+        // Pre-existing content preserved verbatim.
+        assert_eq!(read_bool(&out, "ftp", "enabled"), Some(false));
+        assert_eq!(read_bool(&out, "egress_probe", "enabled"), Some(false));
+    }
+
+    #[test]
+    fn set_str_replaces_existing_value() {
+        // Section present with an active dir line → rewrite it in place,
+        // leaving a sibling key untouched and creating no duplicate.
+        let cfg = "[taildrop]\nenabled = true\ndir = \"ux0:/data/tailscale-vita/taildrop\"\n";
+        let out = set_str(cfg, "taildrop", "dir", "ux0:/vpk");
+        assert_eq!(read_str(&out, "taildrop", "dir"), Some("ux0:/vpk".into()));
+        assert_eq!(out.matches("dir = ").count(), 1);
+        assert_eq!(read_bool(&out, "taildrop", "enabled"), Some(true));
+    }
+
+    #[test]
+    fn read_str_round_trips_and_rejects_unquoted() {
+        let out = set_str(CFG, "taildrop", "dir", "ux0:/downloads");
+        assert_eq!(read_str(&out, "taildrop", "dir"), Some("ux0:/downloads".into()));
+        // A non-quoted RHS is not a TOML basic string → None.
+        assert_eq!(read_str("[taildrop]\ndir = ux0:/vpk\n", "taildrop", "dir"), None);
+        // Absent key → None.
+        assert_eq!(read_str(&out, "taildrop", "missing"), None);
+    }
+
+    #[test]
+    fn set_str_leaves_auth_key_untouched() {
+        let out = set_str(CFG, "taildrop", "dir", "ux0:/vpk");
+        assert!(out.contains("auth_key = \"secret-key-do-not-touch\""));
+    }
+
+    #[test]
+    fn set_str_device_path_round_trips() {
+        // A device path with ':' and '/' must survive the quote round-trip.
+        let out = set_str(CFG, "taildrop", "dir", "ux0:/vpk");
+        assert!(out.contains("dir = \"ux0:/vpk\"\n"));
+        assert_eq!(read_str(&out, "taildrop", "dir"), Some("ux0:/vpk".into()));
     }
 }

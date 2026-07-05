@@ -52,10 +52,11 @@ pub fn tab_cell_w() -> f32 {
     (SCREEN_W - 2.0 * MARGIN as f32) / TAB_COUNT as f32
 }
 
-// Settings rows. SET_ROW_H shrank to 36 (M19) so all six rows fit above
-// FOOTER_TOP: 232 + 6·36 = 448 < 484.
+// Settings rows. SET_ROW_H shrank again to 31 (M20-C4) so all EIGHT rows
+// (2 ts-ftp + 2 taildrop + tailnet/reconnect/reauth/logout) fit above
+// FOOTER_TOP: 232 + 8·31 = 480 < 484.
 const SET_TOP: i32 = 232;
-const SET_ROW_H: i32 = 36;
+const SET_ROW_H: i32 = 31;
 
 // M18 interactive-login (NeedsLogin) full-screen view geometry.
 const LOGIN_TITLE_Y: i32 = 36;
