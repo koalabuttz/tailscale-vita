@@ -66,6 +66,19 @@ pub fn write(path: &Path, data: &[u8]) -> io::Result<()> {
     imp::write(path, data)
 }
 
+/// Append `data` to the END of `path`, creating it if absent. Unlike
+/// [`write`], this does **not** remove the file first — successive calls
+/// accumulate. That's the primitive ts-peerapi uses to stream a
+/// multi-MB Taildrop body to disk in 32 KB chunks without ever holding
+/// the whole file in RAM (`write`, which truncates each call, can't do
+/// this). Each call opens/writes/closes (no persistent handle in the
+/// public API); at 32 KB chunks the per-chunk open cost is negligible.
+/// A caller starting a fresh file should [`remove_file`] any stale copy
+/// first so the append begins from empty.
+pub fn append(path: &Path, data: &[u8]) -> io::Result<()> {
+    imp::append(path, data)
+}
+
 /// Create `path` and all missing parents. Idempotent.
 pub fn create_dir_all(path: &Path) -> io::Result<()> {
     imp::create_dir_all(path)
@@ -119,6 +132,22 @@ mod tests {
         assert_eq!(entries[0], DirEntry { name: "a.txt".into(), is_dir: false, size: 5 });
         assert_eq!(entries[1], DirEntry { name: "sub".into(), is_dir: true, size: 0 });
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_accumulates_across_calls() {
+        let dir = std::env::temp_dir().join(format!("vita-fs-ap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("stream.bin");
+        // Fresh streamed file: start empty (caller removes any stale), then
+        // accumulate chunks — the ts-peerapi Taildrop write path.
+        let _ = remove_file(&p);
+        append(&p, b"chunk-a").unwrap();
+        append(&p, b"chunk-b").unwrap();
+        append(&p, b"chunk-c").unwrap();
+        assert_eq!(read(&p).unwrap(), b"chunk-achunk-bchunk-c");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -141,6 +141,34 @@ pub(super) fn write(path: &Path, data: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+pub(super) fn append(path: &Path, data: &[u8]) -> io::Result<()> {
+    let cp = cstr(&norm(path)?)?;
+    // No pre-remove: O_APPEND accumulates onto the existing file (create
+    // if absent). O_APPEND is also what makes sceIo writes commit at all
+    // (vita-log S1 finding). This is the streaming counterpart to `write`.
+    // SAFETY: cp null-terminated; flags/mode constants.
+    let fd = unsafe { sceIoOpen(cp.as_ptr(), SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0o666) };
+    if fd < 0 {
+        return Err(sce_err(fd, "sceIoOpen(append)"));
+    }
+    let mut buf = data;
+    while !buf.is_empty() {
+        // SAFETY: fd valid; buf valid slice.
+        let n = unsafe { sceIoWrite(fd, buf.as_ptr() as *const c_void, buf.len() as u32) };
+        if n <= 0 {
+            unsafe { sceIoClose(fd) };
+            return Err(sce_err(n, "sceIoWrite(append)"));
+        }
+        buf = &buf[n as usize..];
+    }
+    // SAFETY: fd valid. Best-effort sync, then close (close flushes).
+    unsafe {
+        let _ = sceIoSyncByFd(fd, 0);
+        sceIoClose(fd);
+    }
+    Ok(())
+}
+
 pub(super) fn create_dir_all(path: &Path) -> io::Result<()> {
     let s = norm(path)?;
     // mkdir each cumulative level after the device prefix, ignoring

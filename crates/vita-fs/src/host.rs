@@ -12,6 +12,15 @@ pub(super) fn write(path: &Path, data: &[u8]) -> io::Result<()> {
     std::fs::write(path, data)
 }
 
+pub(super) fn append(path: &Path, data: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(data)
+}
+
 pub(super) fn create_dir_all(path: &Path) -> io::Result<()> {
     std::fs::create_dir_all(path)
 }

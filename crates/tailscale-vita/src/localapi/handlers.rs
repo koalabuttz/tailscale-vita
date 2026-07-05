@@ -414,6 +414,7 @@ mod tests {
                 );
                 m
             },
+            recent_taildrops: Vec::new(),
         };
         let arc = Arc::new(RwLock::new(snap));
         let (tx, rx) = unbounded();

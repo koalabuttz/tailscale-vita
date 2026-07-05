@@ -12,6 +12,7 @@ ts-derp      = { path = "../ts-derp" }
 ts-disco     = { path = "../ts-disco" }
 ts-magicsock = { path = "../ts-magicsock" }
 ts-ftp       = { path = "../ts-ftp" }
+ts-peerapi   = { path = "../ts-peerapi" }
 wg-engine    = { path = "../wg-engine" }
 netstack     = { path = "../netstack" }
 vita-thread  = { path = "../vita-thread" }

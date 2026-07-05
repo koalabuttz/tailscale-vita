@@ -101,6 +101,10 @@ pub struct Runtime {
     /// Optional FTP-on-the-tailnet service. `None` if `config.ftp.enabled`
     /// is false or the bind failed. Dropped (stop + join) on shutdown.
     _ts_ftp: Option<ts_ftp::TsFtpServer>,
+    /// M20: optional Taildrop receiver (peerapi) on the tailnet IP. `None`
+    /// if `config.taildrop.enabled` is false or the bind failed. Dropped
+    /// (stop + join) on shutdown.
+    _ts_peerapi: Option<ts_peerapi::TsPeerApi>,
     /// Node's tailnet IPv4, published on the first MapResponse (in
     /// `run_event_loop`, alongside `stack.set_local_addrs`). Shared with
     /// the ts-ftp service for PASV `227` replies. `None` until registered.
@@ -492,6 +496,39 @@ impl Runtime {
             None
         };
 
+        // M20: spawn the Taildrop receiver (peerapi) if enabled. Bind
+        // failure is non-fatal. We ensure the drop dir exists first
+        // (create_dir_all is idempotent) so the first PUT doesn't fail on a
+        // missing directory, and hand the service a sink that pushes each
+        // completed drop into the shared snapshot (newest-first, capped 8).
+        // The C1 Services advertisement is gated on this same flag
+        // (`finish_session` plumbs `taildrop.enabled.then_some(port)` into
+        // the MapRequest Hostinfo), so we only advertise peerapi4 when the
+        // receiver is actually listening.
+        let ts_peerapi = if config.taildrop.enabled {
+            if let Err(e) = vita_fs::create_dir_all(Path::new(&config.taildrop.dir)) {
+                warn!(dir = %config.taildrop.dir, error = %e, "taildrop.dir.create_failed");
+            }
+            let snap_for_sink = Arc::clone(&snapshot);
+            let sink: ts_peerapi::TaildropSink =
+                Arc::new(move |r: ts_peerapi::TaildropReport| {
+                    let ev = crate::snapshot::TaildropEvent {
+                        name: r.name,
+                        size: r.size,
+                        sender: r.sender,
+                        status: r.status,
+                        at_unix: crate::snapshot::now_unix(),
+                    };
+                    let mut w = snap_for_sink.write();
+                    w.recent_taildrops.insert(0, ev);
+                    w.recent_taildrops.truncate(8);
+                });
+            ts_peerapi::TsPeerApi::spawn(stack.handle(), config.taildrop.clone(), Some(sink))
+        } else {
+            info!("ts-peerapi.disabled (config.taildrop.enabled = false)");
+            None
+        };
+
         // Fork-B diagnostic: UDP egress-shape probe (E2/E3). Config-gated,
         // off by default. ~15 s after startup it sends a tagged shape
         // battery through the production tx_queue path (plus a direct-send
@@ -528,6 +565,7 @@ impl Runtime {
             snapshot,
             _localapi: localapi,
             _ts_ftp: ts_ftp,
+            _ts_peerapi: ts_peerapi,
             tailnet_ip,
         })
     }
@@ -1862,6 +1900,10 @@ fn finish_session(
         state_dir.to_path_buf(),
         local_endpoints,
         local_endpoint_types,
+        // M20 (Taildrop): advertise `peerapi4` in Hostinfo.Services only
+        // when the receiver is actually enabled — otherwise `tailscale
+        // file cp vita:` would find a target that isn't listening.
+        config.taildrop.enabled.then_some(config.taildrop.port),
     )
 }
 
@@ -2344,6 +2386,10 @@ fn publish_parked_state(
     w.our_addrs.clear();
     w.public_endpoint = None;
     w.alive_derp_regions.clear();
+    // M20: the taildrop feed is a live-session activity list; clear it when
+    // we park (`/down`) or log out so a stale feed doesn't linger on the
+    // Stopped/NeedsLogin screens.
+    w.recent_taildrops.clear();
     if logged_out {
         w.user_login = None;
         w.tailnet_domain = None;
@@ -2486,8 +2532,19 @@ fn publish_snapshot(
         user_login: netmap.our_login_name().map(str::to_owned),
         login_in_progress: false,
         peers,
+        // Placeholder — the transient taildrop feed is carried over from the
+        // live snapshot below (this builder rebuilds from the netmap, which
+        // has no knowledge of taildrops).
+        recent_taildrops: Vec::new(),
     };
-    *out.write() = new_snap;
+    let mut w = out.write();
+    // M20: preserve the ts-peerapi activity feed across this full-replace
+    // publish. The peerapi service thread pushes events directly into the
+    // shared snapshot; a naive `*w = new_snap` would wipe them every ~3 s.
+    // They're cleared deliberately only on park/logout (publish_parked_state).
+    let mut new_snap = new_snap;
+    new_snap.recent_taildrops = std::mem::take(&mut w.recent_taildrops);
+    *w = new_snap;
 }
 
 /// Patch the published snapshot's lifecycle + fatal_reason without

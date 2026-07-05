@@ -1,0 +1,26 @@
+[package]
+name = "ts-peerapi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# ts-peerapi: Taildrop *receive* over the tailnet. Binds a netstack
+# TcpListener on the node's tailnet IP and serves the peerapi PUT surface
+# (`PUT /v0/put/<name>`), streaming incoming file bodies straight to the
+# memory card via vita-fs. Lifecycle mirrors ts-ftp (spawn → accept loop →
+# Drop-join). Hand-rolled HTTP/1.1 on `httparse` (parse-only) because the
+# body is MBs and must stream to disk, never buffer in RAM.
+[dependencies]
+netstack    = { path = "../netstack" }
+vita-fs     = { path = "../vita-fs" }
+vita-log    = { path = "../vita-log" }
+vita-thread = { path = "../vita-thread" }
+vita-sync   = { path = "../vita-sync" }
+serde       = { workspace = true }
+httparse    = { workspace = true }
+
+[dev-dependencies]
+# Host-only: exercise the per-field `#[serde(default)]` on TaildropConfig
+# against a partial `[taildrop]` section, the way the runtime's Config does.
+toml        = { workspace = true }

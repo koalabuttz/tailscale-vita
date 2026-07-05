@@ -33,6 +33,7 @@ use crate::netmap::{NetMap, NetMapDelta};
 use crate::persist::atomic_write;
 use crate::types::{
     DiscoPublic, MapHostinfoWire, MapRequestWire, MapResponseWire, NetInfoWire, NodePublic,
+    ServiceWire,
 };
 use crate::ControlError;
 
@@ -79,6 +80,15 @@ pub struct MapClient {
     /// pair; missing this is suspected to make the server reject our
     /// endpoint advertisements as "untyped".
     local_endpoint_types: Vec<u8>,
+    /// M20 (Taildrop): TCP port of the local peerapi/Taildrop service, or
+    /// `None` when Taildrop is off. When `Some`, every MapRequest we send
+    /// (streaming `build_map_request` AND the lite `send_netinfo_update`)
+    /// advertises `Hostinfo.Services = [{peerapi4, <port>, peerapi}]` so
+    /// control tells peers where to `tailscale file cp` us. Held on the
+    /// client so `reissue()` and periodic netinfo updates keep advertising
+    /// it — a later MapRequest with a Services-less Hostinfo would drop the
+    /// advertisement.
+    peerapi_port: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -124,6 +134,7 @@ impl MapClient {
         state_dir: PathBuf,
         local_endpoints: Vec<String>,
         local_endpoint_types: Vec<u8>,
+        peerapi_port: Option<u16>,
     ) -> Result<Self, ControlError> {
         debug_assert_eq!(
             local_endpoints.len(),
@@ -147,6 +158,7 @@ impl MapClient {
             &session_handle,
             &local_endpoints,
             &local_endpoint_types,
+            peerapi_port,
         );
         let body = serde_json::to_vec(&request)?;
         info!(
@@ -197,6 +209,7 @@ impl MapClient {
             last_frame_at: Instant::now(),
             local_endpoints,
             local_endpoint_types,
+            peerapi_port,
         })
     }
 
@@ -306,6 +319,7 @@ impl MapClient {
             &self.netmap.session_handle,
             &self.local_endpoints,
             &self.local_endpoint_types,
+            self.peerapi_port,
         );
         let body = serde_json::to_vec(&request)?;
         // M14D: Ts-Lb sticky-session hint, same as initial start().
@@ -399,6 +413,22 @@ impl MapClient {
                 "DerpLatency": latencies,
             }),
         );
+        // M20 (Taildrop): re-advertise the peerapi4 service here too. Each
+        // MapRequest's Hostinfo REPLACES the server's stored copy (it's not
+        // a field-merge), so a Services-less lite update sent right after
+        // the streaming request establishes would silently drop the
+        // Taildrop advertisement. Mirror `build_map_request`'s entry shape.
+        if let Some(port) = self.peerapi_port {
+            let svc = service_wire(port);
+            hostinfo.insert(
+                "Services".into(),
+                json!([{
+                    "Proto": svc.proto,
+                    "Port": svc.port,
+                    "Description": svc.description,
+                }]),
+            );
+        }
 
         let mut body_map = serde_json::Map::new();
         body_map.insert("Version".into(), json!(MAP_VERSION));
@@ -471,6 +501,7 @@ fn build_map_request(
     session_handle: &str,
     endpoints: &[String],
     endpoint_types: &[u8],
+    peerapi_port: Option<u16>,
 ) -> MapRequestWire {
     // M14K: revert from M14J's tsrs-minimum body. The minimal-body
     // diagnostic produced a stub response from real Tailscale (no peers,
@@ -509,6 +540,10 @@ fn build_map_request(
             os_version: None,
             net_info: None,
             app: Some(APP_NAME.into()),
+            // M20 (Taildrop): advertise the peerapi4 service only when the
+            // Taildrop receiver is actually bound (`Some(port)`); otherwise
+            // omit the field so the body is unchanged from pre-M20.
+            services: peerapi_port.map(|port| vec![service_wire(port)]),
         },
         stream: true,
         omit_peers: false,
@@ -521,6 +556,22 @@ fn build_map_request(
 }
 
 const APP_NAME: &str = "tailscale-vita/0.1.0";
+
+/// Taildrop's `tailcfg.Service.Proto` for the IPv4 peerapi endpoint. Our
+/// netstack is v4-only, so we never advertise `peerapi6`.
+const PEERAPI4_PROTO: &str = "peerapi4";
+
+/// Build the single `Hostinfo.Services` entry advertising the Taildrop
+/// receiver on `port`. Shared by the streaming `build_map_request` and the
+/// lite `send_netinfo_update` so both MapRequests carry an identical entry
+/// (a later request with a Services-less Hostinfo would drop it).
+fn service_wire(port: u16) -> ServiceWire {
+    ServiceWire {
+        proto: PEERAPI4_PROTO.to_string(),
+        port,
+        description: "peerapi".to_string(),
+    }
+}
 
 /// Match upstream Go's `controlclient.Direct.sendMapRequest` which
 /// sets `request.Compress = "zstd"`. Server responds with

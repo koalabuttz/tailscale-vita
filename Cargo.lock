@@ -1639,6 +1639,7 @@ dependencies = [
  "ts-disco",
  "ts-ftp",
  "ts-magicsock",
+ "ts-peerapi",
  "vita-chan",
  "vita-fs",
  "vita-log",
@@ -1998,6 +1999,20 @@ dependencies = [
  "vita-thread",
  "wg-engine",
  "zerocopy",
+]
+
+[[package]]
+name = "ts-peerapi"
+version = "0.1.0"
+dependencies = [
+ "httparse",
+ "netstack",
+ "serde",
+ "toml",
+ "vita-fs",
+ "vita-log",
+ "vita-sync",
+ "vita-thread",
 ]
 
 [[package]]

@@ -87,6 +87,13 @@ pub struct Config {
     #[serde(default)]
     pub ftp: ts_ftp::FtpConfig,
 
+    /// `[taildrop]` — optional Taildrop receiver (peerapi) on the tailnet
+    /// IP, so `tailscale file cp <f> vita:` drops files onto the memory
+    /// card. Disabled by default (any ACL-permitted peer can write; the
+    /// tailnet ACL is the boundary). See [`ts_peerapi::TaildropConfig`].
+    #[serde(default)]
+    pub taildrop: ts_peerapi::TaildropConfig,
+
     /// `[egress_probe]` — Fork-B diagnostic: UDP egress-shape probe for
     /// the WG data-plane bug. Off by default. See
     /// [`crate::egress_probe::EgressProbeConfig`] + docs/EGRESS-PROBE.md.
@@ -230,6 +237,19 @@ read_only       = false
 passive_port_lo = 30000
 passive_port_hi = 30009
 
+# Taildrop receiver (peerapi) on the tailnet IP. When enabled, run
+# `tailscale file cp <file> vita:` from any device on your tailnet and the
+# file lands in `dir`. Off by default: like FTP it accepts writes from any
+# ACL-permitted peer (the tailnet ACL is the boundary; WireGuard encrypts
+# the transfer). `max_size` (bytes) caps a single file. Tip: point `dir` at
+# "ux0:/vpk" to turn the Vita into a VPK sideload inbox — drop a .vpk from
+# your PC and install it in VitaShell, no USB/FTP dance.
+[taildrop]
+enabled  = false
+dir      = "ux0:/data/tailscale-vita/taildrop"
+port     = 8098
+max_size = 268435456   # 256 MB
+
 # Fork-B diagnostic (docs/EGRESS-PROBE.md): ~15 s after startup, send a
 # battery of tagged UDP shapes through the production send path to each
 # target, to learn which shapes actually egress. Run
@@ -289,6 +309,12 @@ mod tests {
         // [tailnet] want_running = true in the template, and the default
         // resolves to true even if the section were absent.
         assert!(cfg.tailnet.want_running);
+        // [taildrop] parses from the template block with the expected
+        // defaults (off, conventional peerapi port, 256 MB cap).
+        assert!(!cfg.taildrop.enabled);
+        assert_eq!(cfg.taildrop.port, 8098);
+        assert_eq!(cfg.taildrop.dir, "ux0:/data/tailscale-vita/taildrop");
+        assert_eq!(cfg.taildrop.max_size, 268_435_456);
     }
 
     #[test]
@@ -307,6 +333,7 @@ mod tests {
             suprx_host_only: false,
             localapi_port: Some(crate::localapi::DEFAULT_PORT),
             ftp: ts_ftp::FtpConfig::default(),
+            taildrop: ts_peerapi::TaildropConfig::default(),
             egress_probe: Default::default(),
             tailnet: TailnetConfig::default(),
         };
@@ -329,6 +356,7 @@ mod tests {
             suprx_host_only: false,
             localapi_port: Some(crate::localapi::DEFAULT_PORT),
             ftp: ts_ftp::FtpConfig::default(),
+            taildrop: ts_peerapi::TaildropConfig::default(),
             egress_probe: Default::default(),
             tailnet: TailnetConfig::default(),
         };
@@ -349,5 +377,8 @@ mod tests {
         // Load-bearing: a config predating [tailnet] must default to
         // running, NOT the bool-default `false` (which would boot Stopped).
         assert!(cfg.tailnet.want_running);
+        // A config predating [taildrop] gets the section default: off.
+        assert!(!cfg.taildrop.enabled);
+        assert_eq!(cfg.taildrop.port, 8098);
     }
 }

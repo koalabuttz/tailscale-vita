@@ -227,6 +227,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_dir,
         Vec::new(), // no advertised endpoints — match tsrs's diagnostic shape
         Vec::new(),
+        None, // M20: no peerapi/Taildrop service in the diagnostic
     )?;
 
     // 9. Loop and log events. The critical line is

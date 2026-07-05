@@ -90,6 +90,32 @@ pub struct RuntimeSnapshot {
     pub login_in_progress: bool,
     /// Per-peer view, keyed by node-key hex.
     pub peers: HashMap<String, PeerView>,
+    /// M20 (Taildrop): most-recent received-file events, newest first,
+    /// capped at 8. Pushed directly into the shared snapshot by the
+    /// ts-peerapi service thread (via a runtime-installed sink), carried
+    /// across the event loop's full-replace publishes, and cleared on
+    /// park/logout. Transient by design — an in-memory activity feed, not
+    /// persisted state.
+    #[serde(default)]
+    pub recent_taildrops: Vec<TaildropEvent>,
+}
+
+/// One received-file event surfaced in [`RuntimeSnapshot::recent_taildrops`].
+/// Fields mirror `ts_peerapi::TaildropReport` plus a receive timestamp; kept
+/// as a distinct type so the snapshot (and any JSON consumer) doesn't depend
+/// on the ts-peerapi crate.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaildropEvent {
+    /// Final on-disk name (post collision-rename), or the rejected name.
+    pub name: String,
+    /// Bytes written (0 for a rejection).
+    pub size: u64,
+    /// Source tailnet address (`ip:port`).
+    pub sender: String,
+    /// Outcome tag: `"ok"`, `"rejected: …"`, or `"error: …"`.
+    pub status: String,
+    /// Unix time the event was recorded.
+    pub at_unix: u64,
 }
 
 /// What scope the server has granted this Vita on the tailnet. When
@@ -182,6 +208,7 @@ impl RuntimeSnapshot {
             user_login: None,
             login_in_progress: false,
             peers: HashMap::new(),
+            recent_taildrops: Vec::new(),
         }
     }
 }
@@ -262,6 +289,36 @@ mod tests {
         assert!(json.contains("\"tailnet_domain\":\"example.com\""));
         assert!(json.contains("\"user_login\":\"dave@example.com\""));
         assert!(json.contains("\"login_in_progress\":true"));
+    }
+
+    #[test]
+    fn recent_taildrops_serializes_and_legacy_defaults_empty() {
+        // Newly-built snapshot starts with an empty feed.
+        let mut snap = RuntimeSnapshot::empty("vita".into(), "0.0.0.0:41641".parse().unwrap());
+        assert!(snap.recent_taildrops.is_empty());
+        snap.recent_taildrops.push(TaildropEvent {
+            name: "photo.jpg".into(),
+            size: 2048,
+            sender: "100.64.0.5:52233".into(),
+            status: "ok".into(),
+            at_unix: 1_700_000_500,
+        });
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"recent_taildrops\":[{"));
+        assert!(json.contains("\"name\":\"photo.jpg\""));
+        assert!(json.contains("\"status\":\"ok\""));
+
+        // A snapshot JSON written by a pre-M20 binary (no recent_taildrops)
+        // must still parse thanks to `#[serde(default)]`.
+        let legacy = r#"{
+            "updated_at_unix": 1, "started_at_unix": 1, "hostname": "vita",
+            "our_addrs": [], "lifecycle": "Connecting", "fatal_reason": null,
+            "peer_count": 0, "derp_home_region": 0, "alive_derp_regions": [],
+            "magic_local": "0.0.0.0:41641", "public_endpoint": null,
+            "acl": {"tags": [], "has_tags": false}, "peers": {}
+        }"#;
+        let parsed: RuntimeSnapshot = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.recent_taildrops.is_empty());
     }
 
     #[test]

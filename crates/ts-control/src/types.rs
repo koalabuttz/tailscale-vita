@@ -288,6 +288,34 @@ pub(crate) struct MapHostinfoWire {
     pub os_version: Option<String>,
     #[serde(rename = "NetInfo", skip_serializing_if = "Option::is_none")]
     pub net_info: Option<NetInfoWire>,
+    /// M20 (Taildrop): services this node offers on the tailnet. Control
+    /// propagates these into every peer's netmap; `tailscale file cp <f>
+    /// vita:` reports "no targets" unless we advertise a `peerapi4`
+    /// entry here. `None` (the default) omits the field entirely, so a
+    /// services-less MapRequest is byte-identical to the pre-M20 body —
+    /// control is strict about the Hostinfo envelope shape (TS2021
+    /// lesson), so we don't want to send an empty `[]` either.
+    #[serde(rename = "Services", skip_serializing_if = "Option::is_none")]
+    pub services: Option<Vec<ServiceWire>>,
+}
+
+/// One `Hostinfo.Services` entry — a service this node offers, advertised
+/// to peers via the netmap. Wire shape mirrors Tailscale's
+/// `tailcfg.Service`: `{"Proto":"peerapi4","Port":8098,
+/// "Description":"peerapi"}`. PascalCase tags are load-bearing.
+#[derive(Serialize)]
+pub(crate) struct ServiceWire {
+    /// e.g. `"peerapi4"` (Taildrop over IPv4). Our netstack is v4-only,
+    /// so we never advertise `peerapi6`.
+    #[serde(rename = "Proto")]
+    pub proto: String,
+    /// TCP port the service listens on at our tailnet IP.
+    #[serde(rename = "Port")]
+    pub port: u16,
+    /// Free-text label; Tailscale uses `"peerapi"` for the Taildrop
+    /// endpoint.
+    #[serde(rename = "Description")]
+    pub description: String,
 }
 
 #[derive(Serialize, Default)]
@@ -522,6 +550,7 @@ mod tests {
                 os: Some("linux".into()),
                 os_version: Some("vita-3.74".into()),
                 net_info: Some(NetInfoWire::default()),
+                services: None,
             },
             stream: true,
             omit_peers: false,
@@ -558,6 +587,58 @@ mod tests {
         // (skip_serializing_if = "Vec::is_empty"), preserving
         // backwards-compat with Headscale and earlier capvers.
         assert!(v.get("EndpointTypes").is_none());
+    }
+
+    #[test]
+    fn hostinfo_services_serializes_exact_shape() {
+        // M20: a Taildrop-advertising Hostinfo carries a single
+        // `peerapi4` Service. Assert the EXACT wire keys/values control
+        // expects — a malformed Hostinfo can break the map stream.
+        let hi = MapHostinfoWire {
+            ipn_version: None,
+            app: None,
+            backend_log_id: None,
+            hostname: "vita".into(),
+            os: None,
+            os_version: None,
+            net_info: None,
+            services: Some(vec![ServiceWire {
+                proto: "peerapi4".into(),
+                port: 8098,
+                description: "peerapi".into(),
+            }]),
+        };
+        let v = serde_json::to_value(&hi).unwrap();
+        let svc = &v["Services"][0];
+        assert_eq!(svc["Proto"], "peerapi4");
+        assert_eq!(svc["Port"], 8098);
+        assert_eq!(svc["Description"], "peerapi");
+        // Exact wire bytes: serialize the STRUCT (not via `to_value`,
+        // which alphabetizes keys) so field order + PascalCase are
+        // asserted as they hit the wire. No lowercase serde leakage.
+        let s = serde_json::to_string(&hi).unwrap();
+        assert!(
+            s.contains(r#""Services":[{"Proto":"peerapi4","Port":8098,"Description":"peerapi"}]"#),
+            "unexpected Services shape: {s}"
+        );
+    }
+
+    #[test]
+    fn hostinfo_services_none_omits_field() {
+        // `None` must drop the field ENTIRELY (not emit `"Services":null`
+        // or `[]`) so the pre-M20 body shape is preserved byte-for-byte.
+        let hi = MapHostinfoWire {
+            ipn_version: None,
+            app: None,
+            backend_log_id: None,
+            hostname: "vita".into(),
+            os: None,
+            os_version: None,
+            net_info: None,
+            services: None,
+        };
+        let v = serde_json::to_value(&hi).unwrap();
+        assert!(v.get("Services").is_none());
     }
 
     #[test]
