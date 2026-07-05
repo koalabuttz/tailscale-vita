@@ -107,12 +107,14 @@ fn pick_addr(
     peer: &Peer,
     hint: Option<&dyn DirectPathHint>,
 ) -> Option<TransportAddr> {
-    let pick = if let Some(auth) = peer.auth_src_load() {
+    let pick = if let Some(auth) = peer.auth_src_fresh(std::time::Instant::now()) {
         // WireGuard roaming: reply to where the peer's last AUTHENTICATED packet
         // actually arrived from. This beats a possibly-stale Disco endpoint for
         // a roaming/symmetric-NAT peer and is exactly what makes Disco pongs
-        // work (reply to the ping's source). Falls through to Disco/DERP below
-        // only until the first authenticated packet sets this.
+        // work (reply to the ping's source). M20-A3: honored only within
+        // AUTH_SRC_TRUST (6.5 s) of the last authenticated inbound — past
+        // that, an idle-gap address (e.g. a WAN-hairpin mapping the router
+        // happened to deliver once) must not outrank a Disco-validated path.
         Some(auth)
     } else if let Some(h) = hint {
         if let Some(udp) = h.alive_endpoint(&peer.pubkey) {
@@ -435,4 +437,99 @@ fn short_hex(bytes: &[u8; 32]) -> String {
         let _ = write!(s, "{:02x}", b);
     }
     s
+}
+
+#[cfg(test)]
+mod pick_addr_tests {
+    use super::*;
+    use crate::peer::PeerStats;
+    use arc_swap::ArcSwap;
+    use rand_core::{OsRng, RngCore};
+    use std::net::SocketAddr;
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    fn test_peer(fallback: Option<TransportAddr>) -> Peer {
+        let secret = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let peer_pub =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::random_from_rng(OsRng));
+        Peer {
+            pubkey: *peer_pub.as_bytes(),
+            our_index: OsRng.next_u32() & 0xFF_FFFF,
+            allowed_ips: vec![],
+            transport_addr: ArcSwap::from(Arc::new(fallback)),
+            auth_src: ArcSwap::from(Arc::new(None)),
+            tunn: Mutex::new(Tunn::new(secret, peer_pub, None, None, 7, None)),
+            stats: Mutex::new(PeerStats::default()),
+        }
+    }
+
+    struct FixedHint(Option<SocketAddr>);
+    impl DirectPathHint for FixedHint {
+        fn alive_endpoint(&self, _node: &[u8; 32]) -> Option<SocketAddr> {
+            self.0
+        }
+    }
+
+    const DERP: TransportAddr = TransportAddr::Derp {
+        region: 1,
+        peer_pubkey: [0u8; 32],
+    };
+
+    /// M20-A3 precedence: a FRESH auth_src outranks the disco hint —
+    /// roaming/symmetric-NAT replies keep working.
+    #[test]
+    fn fresh_auth_src_wins_over_hint() {
+        let peer = test_peer(Some(DERP));
+        peer.set_auth_src(TransportAddr::Udp(addr(1000)));
+        let hint = FixedHint(Some(addr(2000)));
+        assert_eq!(
+            pick_addr(&peer, Some(&hint)),
+            Some(TransportAddr::Udp(addr(1000)))
+        );
+    }
+
+    /// M20-A3: past the trust window the auth_src is skipped and the
+    /// Disco-validated hint takes over (the WAN-hairpin-stale case).
+    #[test]
+    fn stale_auth_src_falls_to_hint() {
+        let peer = test_peer(Some(DERP));
+        peer.set_auth_src_at(
+            TransportAddr::Udp(addr(1000)),
+            Instant::now() - crate::AUTH_SRC_TRUST - Duration::from_millis(100),
+        );
+        let hint = FixedHint(Some(addr(2000)));
+        assert_eq!(
+            pick_addr(&peer, Some(&hint)),
+            Some(TransportAddr::Udp(addr(2000)))
+        );
+    }
+
+    /// M20-A3: stale auth_src + no alive hint → DERP fallback, never
+    /// the stale address.
+    #[test]
+    fn stale_auth_src_no_hint_falls_to_derp() {
+        let peer = test_peer(Some(DERP));
+        peer.set_auth_src_at(
+            TransportAddr::Udp(addr(1000)),
+            Instant::now() - crate::AUTH_SRC_TRUST - Duration::from_millis(100),
+        );
+        let hint = FixedHint(None);
+        assert_eq!(pick_addr(&peer, Some(&hint)), Some(DERP));
+    }
+
+    /// No auth_src at all → hint, then DERP (pre-M20 behavior intact).
+    #[test]
+    fn no_auth_src_uses_hint_then_derp() {
+        let peer = test_peer(Some(DERP));
+        let hint = FixedHint(Some(addr(2000)));
+        assert_eq!(
+            pick_addr(&peer, Some(&hint)),
+            Some(TransportAddr::Udp(addr(2000)))
+        );
+        let dead_hint = FixedHint(None);
+        assert_eq!(pick_addr(&peer, Some(&dead_hint)), Some(DERP));
+    }
 }

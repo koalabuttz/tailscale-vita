@@ -83,8 +83,17 @@ fn hex32_disco(d: &DiscoPublicKey) -> String {
 
 /// Period between Ping bursts for each peer-endpoint pair.
 const PING_INTERVAL: Duration = Duration::from_secs(5);
+/// Heartbeat period for paths that are currently ALIVE. Upstream Go
+/// re-pings its best path every 3 s (`heartbeatInterval`) so liveness
+/// is renewed BEFORE it lapses. Without this an alive path is never
+/// re-pinged, always ages out at ALIVE_TTL, and the selected direct
+/// path flaps 30s-alive/≤5s-dead by design — observed 2026-07-04 as
+/// the LAN↔WAN-hairpin path wander.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 /// A direct path is "alive" if we've received a Pong for it within
-/// this many seconds.
+/// this many seconds. Deliberately NOT shrunk to upstream's 6.5 s
+/// trust window yet: do that only after the 3 s heartbeat is proven
+/// on hardware, or a single lost heartbeat pong flaps the path.
 const ALIVE_TTL: Duration = Duration::from_secs(30);
 /// Cap on tracked paths per peer (netmap-advertised + CMM-merged +
 /// ping-learned). Bounds state growth against a hostile/buggy peer
@@ -877,7 +886,7 @@ fn worker_loop(
 ) {
     info!(local = ?socket.local_addr(), run_ping_pump, "magicsock.worker.start");
     let mut buf = vec![0u8; RECV_BUF];
-    let mut last_ping_pump = Instant::now() - PING_INTERVAL;
+    let mut last_ping_pump = Instant::now() - HEARTBEAT_INTERVAL;
     let (send_v4, send_v6) = send_sockets;
 
     loop {
@@ -885,8 +894,12 @@ fn worker_loop(
             break;
         }
 
-        // Periodic ping pump. Family dispatch through Sockets.
-        if run_ping_pump && last_ping_pump.elapsed() >= PING_INTERVAL {
+        // Periodic ping pump. Gate at the FASTER heartbeat cadence —
+        // per-path spacing (heartbeat vs retry) is path_needs_ping's
+        // job; this gate only bounds how often we scan. The recv loop
+        // wakes every RECV_TIMEOUT (50 ms) regardless, so a 3 s gate
+        // costs nothing. Family dispatch through Sockets.
+        if run_ping_pump && last_ping_pump.elapsed() >= HEARTBEAT_INTERVAL {
             let sockets = Sockets {
                 v4: &send_v4,
                 v6: send_v6.as_deref(),
@@ -1331,6 +1344,30 @@ fn handle_call_me_maybe(
     }
 }
 
+/// Should this path be pinged now?
+///
+/// - Untracked → yes (fresh candidate).
+/// - ALIVE → heartbeat every `HEARTBEAT_INTERVAL` (3 s), like upstream's
+///   `de.heartbeat()`: liveness renews before ALIVE_TTL can lapse, so a
+///   healthy path never flaps dead.
+/// - DEAD/untested → retry on the slower `PING_INTERVAL` cadence (don't
+///   hammer candidates that aren't answering).
+fn path_needs_ping(path: Option<&PathState>, now: Instant) -> bool {
+    match path {
+        None => true,
+        Some(p) => {
+            let interval = if p.alive(now) {
+                HEARTBEAT_INTERVAL
+            } else {
+                PING_INTERVAL
+            };
+            p.last_ping_at
+                .map(|t| now.duration_since(t) >= interval)
+                .unwrap_or(true)
+        }
+    }
+}
+
 fn ping_pump(
     sockets: &Sockets<'_>,
     state: &Mutex<MagicState>,
@@ -1345,20 +1382,7 @@ fn ping_pump(
         let mut out = Vec::new();
         for (node_pub, peer) in &s.peers {
             for addr in &peer.endpoints {
-                let path = peer.paths.get(addr);
-                let needs_ping = match path {
-                    None => true,
-                    Some(p) => {
-                        // Re-ping if no recent ping AND no recent pong.
-                        let stale_ping = p
-                            .last_ping_at
-                            .map(|t| now.duration_since(t) >= PING_INTERVAL)
-                            .unwrap_or(true);
-                        let dead = !p.alive(now);
-                        stale_ping && dead
-                    }
-                };
-                if needs_ping {
+                if path_needs_ping(peer.paths.get(addr), now) {
                     out.push((*node_pub, peer.disco_pub, *addr));
                 }
             }
@@ -1871,6 +1895,41 @@ mod tests {
         assert_eq!(n, payload.len());
         // Direct sends bypass the drain, so no new ring entry for them.
         assert!(ctl.take_send_records().iter().all(|r| r.dst != dst));
+    }
+
+    /// M20-A1: the heartbeat matrix. The old gate (`stale_ping &&
+    /// dead`) never re-pinged an alive path — the flap-by-design bug.
+    #[test]
+    fn path_needs_ping_matrix() {
+        let now = Instant::now();
+        // Untracked candidate → ping.
+        assert!(path_needs_ping(None, now));
+        // Never pinged → ping.
+        assert!(path_needs_ping(Some(&PathState::new()), now));
+
+        // ALIVE + heartbeat-fresh (pinged 1 s ago) → hold.
+        let mut p = PathState::new();
+        p.last_ping_at = Some(now - Duration::from_secs(1));
+        p.last_pong_at = Some(now - Duration::from_secs(2));
+        assert!(!path_needs_ping(Some(&p), now));
+
+        // ALIVE + heartbeat-stale (pinged 4 s ago) → ping. THE flap
+        // killer: the old logic held here until the pong aged out.
+        p.last_ping_at = Some(now - Duration::from_secs(4));
+        assert!(path_needs_ping(Some(&p), now));
+
+        // Still alive with the pong about to age out → still ping.
+        p.last_pong_at = Some(now - Duration::from_secs(29));
+        assert!(path_needs_ping(Some(&p), now));
+
+        // DEAD (no pong), pinged 4 s ago → hold (5 s retry cadence).
+        let mut d = PathState::new();
+        d.last_ping_at = Some(now - Duration::from_secs(4));
+        assert!(!path_needs_ping(Some(&d), now));
+
+        // DEAD, pinged 6 s ago → retry.
+        d.last_ping_at = Some(now - Duration::from_secs(6));
+        assert!(path_needs_ping(Some(&d), now));
     }
 
     /// M20-A2: ping-src candidate learning — the ChromeOS-test-PC

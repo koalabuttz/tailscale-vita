@@ -33,6 +33,13 @@ pub use error::WgError;
 pub use peer::{DirectPathHint, Ipv4Cidr, Peer, PeerConfig, PeerStats, TransportAddr};
 pub use transport::{NoopTransport, Transport, UdpTransport};
 
+/// How long an authenticated inbound source stays trusted as the reply/send
+/// address (upstream `trustUDPAddrDuration` = 6.5 s). Refreshed by every
+/// authenticated inbound datagram, so it only lapses across idle gaps; past
+/// it, `pick_addr` falls to the Disco-validated hint (kept continuously
+/// alive by the M20-A1 3 s heartbeat) instead of a possibly-stale address.
+pub const AUTH_SRC_TRUST: std::time::Duration = std::time::Duration::from_millis(6500);
+
 /// Fork-B diagnostic: bounded ring of outbound path-selection decisions,
 /// pre-formatted for raw tracing. `handle_outbound` (data), `tick_timers`
 /// (timer keepalives) and `handle_inbound` (src-addr replies) record here;

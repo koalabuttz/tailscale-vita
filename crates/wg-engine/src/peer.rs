@@ -87,12 +87,20 @@ pub struct Peer {
     pub allowed_ips: Vec<Ipv4Cidr>,
     pub transport_addr: ArcSwap<Option<TransportAddr>>,
     /// WireGuard-style roaming endpoint: the source of the most recent
-    /// AUTHENTICATED inbound packet (a handshake/data that the `Tunn` accepted).
-    /// Replies go here first — exactly like a Disco pong replies to the ping's
-    /// source — so a roaming/symmetric-NAT peer is answered at wherever it
-    /// actually reached us from, not a possibly-stale Disco-discovered endpoint.
-    /// Set only on authenticated packets (safe re: M12's "don't roam on junk").
-    pub auth_src: ArcSwap<Option<TransportAddr>>,
+    /// AUTHENTICATED inbound packet (a handshake/data that the `Tunn` accepted),
+    /// plus WHEN it arrived. Replies go here first — exactly like a Disco pong
+    /// replies to the ping's source — so a roaming/symmetric-NAT peer is
+    /// answered at wherever it actually reached us from, not a possibly-stale
+    /// Disco-discovered endpoint. Set only on authenticated packets (safe re:
+    /// M12's "don't roam on junk").
+    ///
+    /// M20-A3: the timestamp bounds trust (upstream `trustUDPAddrDuration`,
+    /// 6.5 s). Refreshed on every authenticated inbound, so it only goes stale
+    /// across idle gaps — and a stale one is exactly how the 2026-07-04
+    /// WAN-hairpin address stayed selected for 2½ minutes. `pick_addr` skips
+    /// (but doesn't clear) a stale entry and falls to the Disco hint, which the
+    /// 3 s heartbeat (M20-A1) keeps continuously alive to catch the handoff.
+    pub auth_src: ArcSwap<Option<(TransportAddr, Instant)>>,
     /// `Tunn` is `!Sync`. Held only on the wg_engine thread; never held
     /// across I/O or filesystem operations.
     pub tunn: Mutex<Tunn>,
@@ -110,12 +118,28 @@ impl Peer {
         self.transport_addr.store(Arc::new(Some(addr)));
     }
 
+    /// The auth_src address regardless of freshness — for diagnostics
+    /// (selection_log). Path selection must use `auth_src_fresh`.
     pub fn auth_src_load(&self) -> Option<TransportAddr> {
-        *self.auth_src.load().as_ref()
+        self.auth_src.load().as_ref().map(|(addr, _)| addr)
+    }
+
+    /// The auth_src address only while inside its trust window
+    /// (`AUTH_SRC_TRUST`). `now` is a parameter for testability.
+    pub fn auth_src_fresh(&self, now: Instant) -> Option<TransportAddr> {
+        self.auth_src.load().as_ref().and_then(|(addr, at)| {
+            (now.duration_since(at) < crate::AUTH_SRC_TRUST).then_some(addr)
+        })
     }
 
     pub fn set_auth_src(&self, addr: TransportAddr) {
-        self.auth_src.store(Arc::new(Some(addr)));
+        self.auth_src.store(Arc::new(Some((addr, Instant::now()))));
+    }
+
+    /// Test-only: backdate the auth_src stamp to simulate an idle gap.
+    #[cfg(test)]
+    pub fn set_auth_src_at(&self, addr: TransportAddr, at: Instant) {
+        self.auth_src.store(Arc::new(Some((addr, at))));
     }
 }
 
