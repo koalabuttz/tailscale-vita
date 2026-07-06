@@ -22,17 +22,11 @@ cmake .. >/dev/null
 make -j
 
 echo "==> param.sfo (launcher, gdc) + param2.sfo (bgapp, gdd)"
-# ATTRIBUTE values lifted verbatim from BGFTP's released param.sfo pair:
-# launcher 0x1009000 (+ATTRIBUTE_MINOR 0x11), bgapp 0x81000.
-vita-mksfoex \
-  -s CATEGORY=gdc -s TITLE_ID=TVBG00001 \
-  -d ATTRIBUTE=16814080 -d ATTRIBUTE_MINOR=17 \
-  "TS BGApp Spike" "$BUILD/param.sfo"
-vita-mksfoex \
-  -s CATEGORY=gdd -s TITLE_ID=TVBG00002 \
-  -s INSTALL_DIR_ADDCONT=TVBG00001 -s INSTALL_DIR_SAVEDATA=TVBG00001 \
-  -d ATTRIBUTE=528384 \
-  "TS BG Service" "$BUILD/param2.sfo"
+# Structural clones of BGFTP's released SFO pair (see sfo_make.py) —
+# round 1's mksfoex output (empty CONTENT_ID etc.) launched the
+# launcher fine but the bgapp spawn failed "could not find application"
+# despite complete app.db registration.
+python3 "$SPIKE_DIR/sfo_make.py" "$BUILD"
 
 echo "==> vita-pack-vpk"
 vita-pack-vpk \
