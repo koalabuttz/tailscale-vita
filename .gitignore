@@ -30,3 +30,4 @@ last_seq
 # OS detritus
 .DS_Store
 Thumbs.db
+spikes/*/build/
