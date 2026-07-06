@@ -51,6 +51,8 @@ target_link_libraries(${PROJECT_NAME}
   taipool
   SceLibKernel_stub_weak
   SceKernelThreadMgr_stub_weak
+  # take 6: sceKernelGetFreeMemorySize (budget preflight in main.c)
+  SceSysmem_stub_weak
   SceNet_stub_weak
   SceNetCtl_stub_weak
   SceSysmodule_stub_weak

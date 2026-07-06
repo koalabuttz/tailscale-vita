@@ -97,10 +97,33 @@ taildrop + peer ping still working at hour 24.
 - Worst case: Safe Mode (hold L + R + Start + PS at power-on) → re-flash
   HENkaku / restore. Never observed; listed for completeness.
 
-## Heap / thread budget (current)
+## Heap / thread budget (current — M20-D take 6 diet)
 
-- 16 MB taipool heap pre-allocated by `module_start` (main.c).
-- ~5 threads at runtime: bootstrap, magicsock-v4, netstack-poll, localapi-accept, derp-recv.
-- Per-thread stack: 256 KB (~1.3 MB total).
+- 16 MB newlib heap (`_newlib_heap_size_user`, main.c) — backs ALL Rust
+  allocation (Global = System) since S7. Was 32 MB; halved for SceShell fit.
+- 1 MB taipool (vestigial reservation, not Rust's allocator since S7).
+- 2 MB bootstrap-thread stack (was 4 MB; the demo eboot runs the same
+  bring-up on its ~1 MB main thread, so 2 MB keeps 2x margin).
+- ~5 runtime threads at 256 KB stack each (~1.3 MB total).
 - Estimated Rust crate heap use: 3-5 MB (magicsock + DERP + smoltcp + boringtun + h2).
-- Comfortable margin within 16 MB; profile under sustained traffic if expanding scope.
+- Total steady-state demand ≈ 21 MB + the ~2.3 MB module image.
+- `heavy_init_and_start` preflights `sceKernelGetFreeMemorySize` (needs
+  heap+taipool+1 MB slack) before grabbing anything, so a load into a
+  cache-filled SceShell logs `c2m`/`c2n` and retries instead of crashing.
+
+## *main two-stage loader (take 6)
+
+Under `*main`, config.txt lists ONLY `ur0:tai/tailscale-vita-loader.suprx`
+(~6 KB). Boot-time mapping of the fat module froze SceShell (takes 1-4);
+a single post-boot load at +60 s hit a cache-filled partition (take 5).
+The take-6 loader instead:
+
+- logs free-memory probes at uptime 12/20/30 s (no load),
+- attempts `sceKernelLoadStartModule` on a ladder at 40/50/62/75/90/120/
+  180/240/300/360 s, logging `sceKernelGetFreeMemorySize` before each try,
+- writes everything to `ux0:data/tailscale-vita/loader-trace.txt`
+  (truncated per boot; separate from phase2-trace.txt, which the fat
+  module truncates when it starts).
+
+Even a fully failed boot yields SceShell's free-memory curve — the data
+that picks the next lever (earlier rung, image diet, kubridge).

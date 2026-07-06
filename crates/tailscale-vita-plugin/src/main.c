@@ -25,6 +25,7 @@
 #include <psp2/io/stat.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/modulemgr.h>
+#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/types.h>
 #include <pthread.h>
@@ -75,7 +76,9 @@ static void trace(const char *msg)
 /* S7: taipool is no longer Rust's global allocator (that's now newlib's
  * System) — keep a small reservation only in case something still touches
  * taipool_alloc; the runtime's heap is the newlib heap below. */
-#define TAIPOOL_BYTES (4 * 1024 * 1024)
+/* M20-D take 6: 4 MB -> 1 MB. Vestigial reservation; every MB counts
+ * inside SceShell's partition. */
+#define TAIPOOL_BYTES (1 * 1024 * 1024)
 
 /* Defined in crates/tailscale-vita-rt/src/lib.rs. */
 extern int  ts_vita_rt_start(void);
@@ -114,7 +117,10 @@ extern void __sinit(struct _reent *);
 /* S7: the newlib heap now backs ALL Rust allocation (Global = System) plus
  * C-side libc + pthread internals — bumped to 32 MB to cover the runtime
  * (smoltcp bufs, h2 frames, rustls cert chains, crypto, the netmap). */
-unsigned int _newlib_heap_size_user = 32 * 1024 * 1024;
+/* M20-D take 6: 32 MB -> 16 MB. Estimated real use is 3-5 MB (PLUGIN-
+ * DEPLOY.md budget); 16 MB keeps >3x margin while halving the biggest
+ * single grab from SceShell's partition. */
+unsigned int _newlib_heap_size_user = 16 * 1024 * 1024;
 
 /* Phase 2: stubs for the two libc-cleanup symbols normally provided
  * by vitasdk's crti.o / crtn.o / vita startup files. We use
@@ -259,7 +265,13 @@ void *pthread_getspecific(pthread_key_t key)
  * returns; that thread waits until system uptime >= BOOT_GRACE before doing
  * the heavy init. Under *TVIT00010 staging (app launch, uptime >> grace)
  * the wait is zero and behavior is unchanged. */
-#define BOOT_GRACE_US (60ULL * 1000 * 1000)
+/* Take 6: 60 s -> 30 s. Under the two-stage loader the LOAD time is what
+ * gates us (loader ladder starts at 40 s), so uptime is already past this
+ * grace when module_start runs and heavy init proceeds immediately —
+ * grabbing the heap while the window that admitted the image is still
+ * open. The grace only still matters if someone lists the fat SUPRX
+ * directly under *main again (don't). */
+#define BOOT_GRACE_US (30ULL * 1000 * 1000)
 /* taipool retry: transient boot-time pressure gets three more chances. */
 #define POOL_RETRIES     3
 #define POOL_RETRY_US    (10 * 1000 * 1000)
@@ -271,9 +283,56 @@ static volatile int g_stopping    = 0;
  * start. Runs on the deferred-init thread (or synchronously from
  * module_start only as a last-resort fallback if even the tiny thread
  * can't be created). Returns 0 on success. */
+/* Take 6 preflight: before grabbing taipool + the 16 MB newlib heap out
+ * of the host process's partition, check there's actually room. Inside
+ * SceShell post-boot the partition can be cache-filled (take-5's
+ * 0x80024302); plowing ahead would fail _init_vita_heap and abort Rust
+ * alloc mid-init — inside the shell that's a crash, not a log line. A
+ * failed probe (rc<0) is treated as "unknown, proceed". Under app
+ * staging the app partition is roomy and this passes on try 1. */
+#define BUDGET_RETRIES 6
+
+static int budget_preflight(void)
+{
+    char buf[96];
+    /* taipool + the newlib heap grab + 1 MB slack for thread stacks. */
+    int need = (int)(TAIPOOL_BYTES + _newlib_heap_size_user
+                     + 1 * 1024 * 1024);
+    for (int i = 0; i <= BUDGET_RETRIES; i++) {
+        SceKernelFreeMemorySizeInfo mi;
+        mi.size = sizeof mi;
+        int rc = sceKernelGetFreeMemorySize(&mi);
+        if (rc < 0) {
+            sceClibSnprintf(buf, sizeof buf,
+                            "c2m: free probe failed (0x%08X); proceeding",
+                            (unsigned)rc);
+            trace(buf);
+            return 0;
+        }
+        sceClibSnprintf(buf, sizeof buf,
+                        "c2m: free user=%dK need=%dK (try %d)",
+                        mi.size_user / 1024, need / 1024, i + 1);
+        trace(buf);
+        if (mi.size_user >= need) {
+            return 0;
+        }
+        if (g_stopping) {
+            return -1;
+        }
+        sceKernelDelayThread(POOL_RETRY_US);
+    }
+    return -1;
+}
+
 static int heavy_init_and_start(void)
 {
     char buf[64];
+
+    if (budget_preflight() != 0) {
+        trace("c2n: budget preflight failed; heavy init aborted");
+        return -1;
+    }
+
     sceClibSnprintf(buf, sizeof buf, "c2: pre-taipool_init(%d)",
                     TAIPOOL_BYTES);
     trace(buf);

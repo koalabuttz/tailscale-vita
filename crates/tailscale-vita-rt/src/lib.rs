@@ -270,11 +270,11 @@ unsafe extern "C" fn bootstrap_main(_args: u32, _argp: *mut c_void) -> i32 {
     unsafe { sceKernelExitDeleteThread(0) }
 }
 
-/// Create + start the heavy bootstrap thread (4 MB stack). Returns 0 on
-/// success, negative SCE error on failure. The 4 MB stack allocation is
-/// the piece that fails under memory pressure at SceShell boot
-/// (0x80024302 on 2026-07-05, M20-D take 2) — callers must treat a
-/// failure as retryable, not fatal.
+/// Create + start the heavy bootstrap thread (2 MB stack). Returns 0 on
+/// success, negative SCE error on failure. This stack allocation (4 MB
+/// at the time) is the piece that failed under memory pressure at
+/// SceShell boot (0x80024302 on 2026-07-05, M20-D take 2) — callers
+/// must treat a failure as retryable, not fatal.
 unsafe fn spawn_bootstrap() -> i32 {
     // SAFETY: name + entry are statics; arg/option null. Negative
     // return = SCE error code, propagated.
@@ -283,13 +283,15 @@ unsafe fn spawn_bootstrap() -> i32 {
             c"ts-vita-rt-boot".as_ptr(),
             bootstrap_main,
             0x40,            // priority (matches vitacompanion)
-            // S7: 4 MB stack. The bootstrap thread runs the whole
+            // S7: big stack. The bootstrap thread runs the whole
             // synchronous bring-up on one stack — toml/serde parsing
             // (very stack-heavy), then rustls + h2 + Noise handshakes
             // (big cert/frame buffers). The old 256 KB overflowed in
             // toml::from_str (hard abort, no panic) where the eboot's
-            // ~1 MB main thread does not. Generous here; tune later.
-            4 * 1024 * 1024, // stack
+            // ~1 MB main thread does not. M20-D take 6: 4 MB -> 2 MB —
+            // still 2x the eboot main thread that runs this same path,
+            // and 2 MB less pressure on SceShell's partition.
+            2 * 1024 * 1024, // stack
             0,
             0,
             ptr::null(),
@@ -314,7 +316,7 @@ const WATCHER_BACKOFF_SECS: [u32; 8] = [5, 10, 15, 20, 30, 30, 30, 30];
 /// Tiny watcher thread (32 KB stack): retries the heavy bootstrap spawn
 /// with backoff. Runs when the immediate spawn failed — i.e. under
 /// `*main` while SceShell is still booting and its partition can't fit
-/// a 4 MB thread stack yet. NO libc here: raw SCE delay only.
+/// a multi-MB thread stack yet. NO libc here: raw SCE delay only.
 unsafe extern "C" fn watcher_main(_args: u32, _argp: *mut c_void) -> i32 {
     trace("rw1: watcher start");
     for (i, secs) in WATCHER_BACKOFF_SECS.iter().enumerate() {
@@ -347,7 +349,7 @@ unsafe extern "C" fn watcher_main(_args: u32, _argp: *mut c_void) -> i32 {
 /// and return. Called from `module_start` AFTER `taipool_init`
 /// succeeded. Returns 0 on success, negative SCE error on failure.
 ///
-/// M20-D: the heavy (4 MB-stack) spawn is attempted ONCE immediately —
+/// M20-D: the heavy (2 MB-stack) spawn is attempted ONCE immediately —
 /// under `*TVIT00010` staging (app launch, memory plentiful) it succeeds
 /// and behavior is unchanged. If it fails (SceShell boot, partition
 /// still crowded), a 32 KB watcher thread retries with backoff instead;
