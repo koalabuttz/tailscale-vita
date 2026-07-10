@@ -33,8 +33,7 @@ pub const CONFIG_PATH: &str = "ux0:/data/tailscale-vita/config.toml";
 pub const TAILDROP_DIR_DEFAULT: &str = "ux0:/data/tailscale-vita/taildrop";
 /// The dir values `CycleTaildropDir` rotates through (wrapping). A custom or
 /// unrecognized current dir jumps to `[0]` on the next press.
-const TAILDROP_DIR_PRESETS: [&str; 3] =
-    [TAILDROP_DIR_DEFAULT, "ux0:/vpk", "ux0:/downloads"];
+const TAILDROP_DIR_PRESETS: [&str; 3] = [TAILDROP_DIR_DEFAULT, "ux0:/vpk", "ux0:/downloads"];
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const STATUS_READ_TIMEOUT: Duration = Duration::from_secs(3);
 /// `/ping` and `/reconnect` block server-side; leave headroom.
@@ -90,10 +89,15 @@ pub enum ActionState {
 
 /// A request from the UI thread to the worker.
 pub enum UiAction {
-    Ping { ip: Ipv4Addr, peer_name: String },
+    Ping {
+        ip: Ipv4Addr,
+        peer_name: String,
+    },
     Reconnect,
     /// Toggle a `[ftp]` bool (`"enabled"` or `"read_only"`).
-    ToggleFtp { key: &'static str },
+    ToggleFtp {
+        key: &'static str,
+    },
     /// M20-C4: flip `[taildrop] enabled` (inserts the section if absent).
     ToggleTaildrop,
     /// M20-C4: rotate `[taildrop] dir` through `TAILDROP_DIR_PRESETS`.
@@ -251,7 +255,11 @@ fn do_ping(ip: Ipv4Addr, peer_name: &str) -> (String, bool) {
     let path = format!("/localapi/v0/ping?ip={ip}");
     match http_req("GET", &path, ACTION_READ_TIMEOUT) {
         Ok((_status, body)) => match serde_json::from_slice::<PingResp>(&body) {
-            Ok(PingResp { rtt_ms: Some(rtt), endpoint, .. }) => (
+            Ok(PingResp {
+                rtt_ms: Some(rtt),
+                endpoint,
+                ..
+            }) => (
                 format!(
                     "pong from {peer_name}: {rtt} ms @ {}",
                     endpoint.unwrap_or_else(|| "?".into())
@@ -352,10 +360,7 @@ fn do_toggle_ftp(shared: &Arc<Mutex<Shared>>, key: &'static str) -> (String, boo
                 s.ftp_read_only = ro;
             }
             (
-                format!(
-                    "ftp.{key} = {new_val} saved — relaunch to apply",
-                    key = key
-                ),
+                format!("ftp.{key} = {new_val} saved — relaunch to apply", key = key),
                 true,
             )
         }
@@ -376,7 +381,10 @@ fn do_toggle_taildrop(shared: &Arc<Mutex<Shared>>) -> (String, bool) {
                 s.taildrop_enabled = Some(new_val);
             }
             (
-                format!("taildrop: {} (next launch)", if new_val { "ON" } else { "OFF" }),
+                format!(
+                    "taildrop: {} (next launch)",
+                    if new_val { "ON" } else { "OFF" }
+                ),
                 true,
             )
         }
@@ -410,9 +418,11 @@ fn do_cycle_taildrop_dir(shared: &Arc<Mutex<Shared>>) -> (String, bool) {
 /// Minimal loopback HTTP/1.1 request (`Connection: close`, read to EOF).
 /// Returns (status_code, body).
 fn http_req(method: &str, path: &str, read_timeout: Duration) -> Result<(u16, Vec<u8>), String> {
-    let addr: SocketAddr = LOCALAPI_ADDR.parse().map_err(|e| format!("bad addr: {e}"))?;
-    let mut conn =
-        TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| format!("runtime down ({e})"))?;
+    let addr: SocketAddr = LOCALAPI_ADDR
+        .parse()
+        .map_err(|e| format!("bad addr: {e}"))?;
+    let mut conn = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        .map_err(|e| format!("runtime down ({e})"))?;
     conn.set_read_timeout(Some(read_timeout))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
     conn.set_write_timeout(Some(Duration::from_secs(2)))
@@ -420,11 +430,13 @@ fn http_req(method: &str, path: &str, read_timeout: Duration) -> Result<(u16, Ve
     let req = format!(
         "{method} {path} HTTP/1.1\r\n\
          Host: localhost:41112\r\n\
+         X-Tailscale-Vita-Local: 1\r\n\
          Connection: close\r\n\
          Content-Length: 0\r\n\
          \r\n"
     );
-    conn.write_all(req.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    conn.write_all(req.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
     let mut response = Vec::with_capacity(4096);
     let mut tmp = [0u8; 2048];
     loop {

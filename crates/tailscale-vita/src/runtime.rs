@@ -29,10 +29,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use vita_chan::{unbounded, Receiver, Sender, TryRecvError};
-use vita_sync::{Mutex, RwLock};
 use smoltcp::wire::Ipv4Cidr as SmolIpv4Cidr;
+use vita_chan::{unbounded, Receiver, Sender, TryRecvError};
 use vita_log::{debug, info, warn};
+use vita_sync::{Mutex, RwLock};
 
 use netstack::{Stack, StackConfig};
 use ts_control::async_io::AsyncNoiseStream;
@@ -48,10 +48,10 @@ use crate::config::Config;
 use crate::dual_transport::DualTransport;
 use crate::error::RuntimeError;
 use crate::lifecycle::{FatalKind, LifecycleTracker, OnlineState};
+use crate::proto::{consume_early_payload, hex_short, read_server_response};
 use crate::snapshot::{
     node_key_hex, now_unix, AclSummary, AllowedIpView, PeerView, RuntimeSnapshot,
 };
-use crate::proto::{consume_early_payload, hex_short, read_server_response};
 
 pub struct Runtime {
     config: Config,
@@ -163,10 +163,7 @@ impl ControlHandle {
     }
 
     /// Low-level send for future signal variants.
-    pub fn send(
-        &self,
-        sig: ControlSignal,
-    ) -> Result<(), vita_chan::SendError<ControlSignal>> {
+    pub fn send(&self, sig: ControlSignal) -> Result<(), vita_chan::SendError<ControlSignal>> {
         self.tx.send(sig)
     }
 }
@@ -250,10 +247,7 @@ impl Runtime {
     /// calling `up` directly — the supervisor drops + re-runs `up` on a
     /// mid-life re-login (there is no in-place WG/DERP re-key API, so the
     /// whole Runtime must be rebuilt around the fresh node key).
-    pub fn up(
-        config: Config,
-        should_stop: &mut dyn FnMut() -> bool,
-    ) -> Result<Self, RuntimeError> {
+    pub fn up(config: Config, should_stop: &mut dyn FnMut() -> bool) -> Result<Self, RuntimeError> {
         suprx_trace("up1: Runtime::up entry");
         let state_dir = PathBuf::from(&config.state_dir);
         let host_authority = config.host_authority();
@@ -280,11 +274,8 @@ impl Runtime {
         let (non_disco_tx, non_disco_rx) = unbounded();
         let disco_priv = DiscoPrivateKey::from_bytes(ks.disco_priv.0);
         let our_node_pub_disco = NodePublicKey::from(ks.node_pub.0);
-        let (magic_socket, magic_ctl) = bind_magicsock(
-            disco_priv,
-            our_node_pub_disco,
-            non_disco_tx,
-        )?;
+        let (magic_socket, magic_ctl) =
+            bind_magicsock(disco_priv, our_node_pub_disco, non_disco_tx)?;
         let magic_local = magic_ctl.local_addr();
         suprx_trace("up3: magicsock bound");
         info!(%magic_local, "magicsock.bound");
@@ -329,13 +320,9 @@ impl Runtime {
         // OS TIME_WAIT). Retry the bind for a few seconds so the rebind
         // doesn't lose the race to EADDRINUSE.
         let localapi = match config.localapi_port {
-            Some(port) => spawn_localapi_with_retry(
-                port,
-                &snapshot,
-                &signal_tx,
-                &magic_ctl,
-                should_stop,
-            ),
+            Some(port) => {
+                spawn_localapi_with_retry(port, &snapshot, &signal_tx, &magic_ctl, should_stop)
+            }
             None => {
                 info!("localapi.disabled (config.localapi_port = None)");
                 None
@@ -486,11 +473,7 @@ impl Runtime {
         // the daemon keeps running without FTP. `stack.handle()` is a Send
         // handle so the FTP thread can bind PASV listeners on its own.
         let ts_ftp = if config.ftp.enabled {
-            ts_ftp::TsFtpServer::spawn(
-                stack.handle(),
-                config.ftp.clone(),
-                Arc::clone(&tailnet_ip),
-            )
+            ts_ftp::TsFtpServer::spawn(stack.handle(), config.ftp.clone(), Arc::clone(&tailnet_ip))
         } else {
             info!("ts-ftp.disabled (config.ftp.enabled = false)");
             None
@@ -510,19 +493,18 @@ impl Runtime {
                 warn!(dir = %config.taildrop.dir, error = %e, "taildrop.dir.create_failed");
             }
             let snap_for_sink = Arc::clone(&snapshot);
-            let sink: ts_peerapi::TaildropSink =
-                Arc::new(move |r: ts_peerapi::TaildropReport| {
-                    let ev = crate::snapshot::TaildropEvent {
-                        name: r.name,
-                        size: r.size,
-                        sender: r.sender,
-                        status: r.status,
-                        at_unix: crate::snapshot::now_unix(),
-                    };
-                    let mut w = snap_for_sink.write();
-                    w.recent_taildrops.insert(0, ev);
-                    w.recent_taildrops.truncate(8);
-                });
+            let sink: ts_peerapi::TaildropSink = Arc::new(move |r: ts_peerapi::TaildropReport| {
+                let ev = crate::snapshot::TaildropEvent {
+                    name: r.name,
+                    size: r.size,
+                    sender: r.sender,
+                    status: r.status,
+                    at_unix: crate::snapshot::now_unix(),
+                };
+                let mut w = snap_for_sink.write();
+                w.recent_taildrops.insert(0, ev);
+                w.recent_taildrops.truncate(8);
+            });
             ts_peerapi::TsPeerApi::spawn(stack.handle(), config.taildrop.clone(), Some(sink))
         } else {
             info!("ts-peerapi.disabled (config.taildrop.enabled = false)");
@@ -540,11 +522,7 @@ impl Runtime {
                 suprx_trace(s);
                 info!("{}", s);
             });
-            crate::egress_probe::spawn(
-                magic_ctl.clone(),
-                config.egress_probe.clone(),
-                trace_fn,
-            );
+            crate::egress_probe::spawn(magic_ctl.clone(), config.egress_probe.clone(), trace_fn);
         }
 
         Ok(Self {
@@ -652,9 +630,10 @@ impl Runtime {
         // (`want_running = false` skipped MapClient::start in `up()`).
         // The event loop holds `Stopped` until the first `/up`.
         let mut map_opt: Option<MapClient> = self.map.take();
-        let signal_rx = self.signal_rx.take().ok_or_else(|| {
-            RuntimeError::Internal("runtime signal_rx already taken".into())
-        })?;
+        let signal_rx = self
+            .signal_rx
+            .take()
+            .ok_or_else(|| RuntimeError::Internal("runtime signal_rx already taken".into()))?;
         // Capture the start-time once so /health uptime is stable
         // across reconnect-induced republishes.
         let started_at_unix = now_unix();
@@ -679,6 +658,10 @@ impl Runtime {
         let mut control_errors = 0u32;
         let mut derp_map_set = false;
         let mut local_addrs_set = false;
+        // One-shot warning if peers are present but control never sent a
+        // packet filter: the engine stays deny-by-default and silently drops
+        // ALL inbound, which otherwise only shows up as trace logs.
+        let mut warned_no_filter = false;
         // Track each peer's DERP region. Used to dispatch CallMeMaybe
         // sends queued by magicsock — magicsock owns the encryption
         // half; the runtime owns DERP transport, so we need to know
@@ -881,9 +864,7 @@ impl Runtime {
 
             // M13 reconnect: sessionless + running + not logged-out → sleep
             // with backoff + attempt bootstrap.
-            if map_opt.is_none()
-                && self.lifecycle.lock().state() != OnlineState::NeedsLogin
-            {
+            if map_opt.is_none() && self.lifecycle.lock().state() != OnlineState::NeedsLogin {
                 let delay = reconnect_backoff(reconnect_attempt);
                 info!(
                     delay_secs = delay.as_secs(),
@@ -954,10 +935,7 @@ impl Runtime {
                                 self.lifecycle
                                     .lock()
                                     .mark_fatal(FatalKind::Auth, e.to_string());
-                                publish_fatal_state(
-                                    &self.snapshot,
-                                    &self.lifecycle,
-                                );
+                                publish_fatal_state(&self.snapshot, &self.lifecycle);
                                 return Err(RuntimeError::Control(e));
                             }
                             ErrorClass::SecurityFatal => {
@@ -965,10 +943,7 @@ impl Runtime {
                                 self.lifecycle
                                     .lock()
                                     .mark_fatal(FatalKind::Security, e.to_string());
-                                publish_fatal_state(
-                                    &self.snapshot,
-                                    &self.lifecycle,
-                                );
+                                publish_fatal_state(&self.snapshot, &self.lifecycle);
                                 return Err(RuntimeError::Control(e));
                             }
                             ErrorClass::Transient => {
@@ -1011,10 +986,7 @@ impl Runtime {
                             self.lifecycle
                                 .lock()
                                 .mark_fatal(FatalKind::Auth, e.to_string());
-                            publish_fatal_state(
-                                &self.snapshot,
-                                &self.lifecycle,
-                            );
+                            publish_fatal_state(&self.snapshot, &self.lifecycle);
                             return Err(RuntimeError::Control(e));
                         }
                         ErrorClass::SecurityFatal => {
@@ -1022,10 +994,7 @@ impl Runtime {
                             self.lifecycle
                                 .lock()
                                 .mark_fatal(FatalKind::Security, e.to_string());
-                            publish_fatal_state(
-                                &self.snapshot,
-                                &self.lifecycle,
-                            );
+                            publish_fatal_state(&self.snapshot, &self.lifecycle);
                             return Err(RuntimeError::Control(e));
                         }
                         ErrorClass::Transient => {
@@ -1054,11 +1023,9 @@ impl Runtime {
                         let derp_map = build_derp_map(map.netmap());
                         self.derp_ctl.set_derp_map(derp_map.clone());
                         match self.derp_ctl.pick_and_set_home(&derp_map) {
-                            Ok(home) => info!(
-                                home,
-                                regions = derp_map.regions.len(),
-                                "derp.home.selected"
-                            ),
+                            Ok(home) => {
+                                info!(home, regions = derp_map.regions.len(), "derp.home.selected")
+                            }
                             Err(e) => warn!(error = %e, "derp.home.selection.failed"),
                         }
                         derp_map_set = true;
@@ -1142,8 +1109,7 @@ impl Runtime {
                         // in any CallMeMaybe we send: our LAN binding
                         // plus the STUN-reflected public address(es).
                         // These are what peers will dial back to.
-                        let mut local_eps: Vec<SocketAddr> =
-                            vec![self.magic_ctl.local_addr()];
+                        let mut local_eps: Vec<SocketAddr> = vec![self.magic_ctl.local_addr()];
                         if let Some(v6_local) = self.magic_ctl.local_addr_v6() {
                             local_eps.push(v6_local);
                         }
@@ -1159,10 +1125,7 @@ impl Runtime {
                         }
                         self.magic_ctl.set_local_endpoints(local_eps);
                         match map.send_netinfo_update(preferred_derp, latencies, extra) {
-                            Ok(()) => info!(
-                                preferred_derp,
-                                "control.map.netinfo_update.sent"
-                            ),
+                            Ok(()) => info!(preferred_derp, "control.map.netinfo_update.sent"),
                             Err(e) => warn!(error = %e, "control.map.netinfo_update.failed"),
                         }
                     }
@@ -1185,12 +1148,16 @@ impl Runtime {
                     }
 
                     push_delta_to_engine(&self.engine, &snap, self.derp_ctl.home_region());
+                    if !warned_no_filter && snap.packet_filter.is_none() && snap.peer_count > 0 {
+                        warn!(
+                            peers = snap.peer_count,
+                            "control.map.packet_filter.absent — engine is deny-by-default, \
+                             all inbound tailnet traffic is dropped until a PacketFilter arrives"
+                        );
+                        warned_no_filter = true;
+                    }
                     push_delta_to_magicsock(&self.magic_ctl, &snap);
-                    update_peer_regions(
-                        &mut peer_regions,
-                        &snap,
-                        self.derp_ctl.home_region(),
-                    );
+                    update_peer_regions(&mut peer_regions, &snap, self.derp_ctl.home_region());
                     // M14: republish the LocalAPI-readable snapshot.
                     // `map` is still in scope as `&mut MapClient` from
                     // the next_event() result; netmap() is &self.
@@ -1468,8 +1435,7 @@ fn spawn_localapi_with_retry(
         }
         warn!(
             port,
-            attempt,
-            "localapi.bind.retry (port busy from a prior runtime?)"
+            attempt, "localapi.bind.retry (port busy from a prior runtime?)"
         );
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -1558,11 +1524,7 @@ fn build_derp_map(nm: &NetMap) -> DerpMap {
     DerpMap { regions }
 }
 
-fn push_delta_to_engine(
-    engine: &Engine,
-    snap: &ts_control::NetMapSnapshot,
-    our_home: u16,
-) {
+fn push_delta_to_engine(engine: &Engine, snap: &ts_control::NetMapSnapshot, our_home: u16) {
     let delta = &snap.delta;
     info!(
         seq = snap.seq,
@@ -1574,6 +1536,16 @@ fn push_delta_to_engine(
         patches = delta.patches_applied,
         "control.map.netmap"
     );
+
+    // Tailscale ACLs/grants are enforced at the destination node, not by
+    // DERP or the coordination server. Keep the engine deny-by-default until
+    // the first policy arrives, then atomically replace it on every update.
+    if delta.packet_filter_changed {
+        if let Some(policy) = &snap.packet_filter {
+            engine.set_inbound_policy(engine_packet_filter(policy));
+            info!("control.map.packet_filter.applied");
+        }
+    }
 
     for p in &delta.upserted {
         let allowed_ips = engine_allowed_ips(&p.allowed_ips);
@@ -1645,6 +1617,39 @@ fn push_delta_to_engine(
     }
 }
 
+fn engine_packet_filter(policy: &ts_control::PacketFilter) -> wg_engine::InboundPolicy {
+    match policy {
+        ts_control::PacketFilter::Rules(rules) => wg_engine::InboundPolicy::Rules(
+            rules
+                .iter()
+                .map(|rule| wg_engine::FilterRule {
+                    src_ips: rule
+                        .src_ips
+                        .iter()
+                        .map(|src| Ipv4Cidr {
+                            addr: src.addr,
+                            prefix: src.prefix,
+                        })
+                        .collect(),
+                    dst_ports: rule
+                        .dst_ports
+                        .iter()
+                        .map(|dst| wg_engine::NetPortRange {
+                            ip: Ipv4Cidr {
+                                addr: dst.ip.addr,
+                                prefix: dst.ip.prefix,
+                            },
+                            port_first: dst.port_first,
+                            port_last: dst.port_last,
+                        })
+                        .collect(),
+                    ip_protocols: rule.ip_protocols.clone(),
+                })
+                .collect(),
+        ),
+    }
+}
+
 /// Convert a peer's netmap AllowedIPs into the engine's route set.
 /// Default routes (prefix 0 — an exit node's 0.0.0.0/0 offer) are
 /// dropped: the Vita never routes through exit nodes, and installing
@@ -1706,9 +1711,9 @@ fn classify_control_error(err: &ts_control::ControlError) -> ErrorClass {
             ErrorClass::AuthFatal
         }
         // Noise-side trust failures — refuse to retry.
-        ControlError::BadServerKey { .. } | ControlError::ServerKeyChanged => {
-            ErrorClass::SecurityFatal
-        }
+        ControlError::BadServerKey { .. }
+        | ControlError::ServerKeyChanged
+        | ControlError::UnpinnedHttpControl => ErrorClass::SecurityFatal,
         // Everything else: network, idle long-poll, frame decode hiccup,
         // 5xx server errors, etc. Retry.
         _ => ErrorClass::Transient,
@@ -2065,14 +2070,22 @@ fn establish_control_conn(
 ) -> Result<Http2Conn, ts_control::ControlError> {
     suprx_trace("cs1: pre fetch_server_key (first HTTPS/TLS)");
 
-    // 1. Fetch server's Noise pubkey via cache (M13.5 Stage 2). Cache
-    // TTL is 1 h; on a Noise failure below we invalidate + retry to
-    // cover the legitimate-rotation case.
-    let server_pub = ts_control::fetch_server_key_cached(
-        &config.control_url,
-        config.capver,
-        state_dir,
-    )?;
+    // 1. Fetch server's Noise pubkey via cache (M13.5 Stage 2) for HTTPS.
+    // Cleartext HTTP cannot safely bootstrap its own authentication: a MITM
+    // can substitute a Noise key and then decrypt the registration request.
+    // Require an explicit pin, except for the loudly named migration escape.
+    let server_pub = if config.control_url.starts_with("http://") {
+        if let Some(pin) = config.control_server_key.as_deref() {
+            ts_control::MachinePublic::from_mkey_str(pin)?
+        } else if config.insecure_allow_http_control {
+            warn!("control.http.insecure_unpinned_bootstrap_enabled");
+            ts_control::fetch_server_key_cached(&config.control_url, config.capver, state_dir)?
+        } else {
+            return Err(ts_control::ControlError::UnpinnedHttpControl);
+        }
+    } else {
+        ts_control::fetch_server_key_cached(&config.control_url, config.capver, state_dir)?
+    };
     suprx_trace("cs2: server key received");
     info!(server_pub = %server_pub, "control.key.received");
 
@@ -2410,7 +2423,11 @@ fn update_peer_regions(
 ) {
     let delta = &snap.delta;
     for p in &delta.upserted {
-        let region = if p.home_derp != 0 { p.home_derp } else { our_home };
+        let region = if p.home_derp != 0 {
+            p.home_derp
+        } else {
+            our_home
+        };
         regions.insert(p.node_key, region);
     }
     for k in &delta.removed {
@@ -2453,9 +2470,7 @@ fn publish_snapshot(
     let mut peers = HashMap::with_capacity(netmap.peers.len());
     for (node_key, peer) in netmap.peers.iter() {
         let direct_endpoint = magic_ctl.alive_endpoint(node_key);
-        let direct_rtt = magic_ctl
-            .peer_rtt(node_key)
-            .map(|d| d.as_millis() as u64);
+        let direct_rtt = magic_ctl.peer_rtt(node_key).map(|d| d.as_millis() as u64);
         // Primary tailnet IP: pick the first /32 entry (typical case
         // for a node-IP-only peer). Peers with CIDR routes still get
         // those listed under `allowed_ips`, just no `tailscale_ip`.
@@ -2469,8 +2484,7 @@ fn publish_snapshot(
             .iter()
             .map(|a| format!("{}/{}", a.addr, a.prefix))
             .collect();
-        let endpoints: Vec<String> =
-            peer.endpoints.iter().map(|sa| sa.to_string()).collect();
+        let endpoints: Vec<String> = peer.endpoints.iter().map(|sa| sa.to_string()).collect();
         let hex = node_key_hex(node_key);
         peers.insert(
             hex.clone(),
@@ -2554,10 +2568,7 @@ fn publish_snapshot(
 ///
 /// Optimized for the path where the snapshot is mostly populated;
 /// holds the write lock for a few microseconds.
-fn publish_fatal_state(
-    out: &Arc<RwLock<RuntimeSnapshot>>,
-    lifecycle: &Mutex<LifecycleTracker>,
-) {
+fn publish_fatal_state(out: &Arc<RwLock<RuntimeSnapshot>>, lifecycle: &Mutex<LifecycleTracker>) {
     let lt = lifecycle.lock();
     let state = lt.state();
     let reason = lt.fatal_reason().map(str::to_owned);
@@ -2889,8 +2900,7 @@ mod tests {
     #[test]
     fn publish_parked_state_clears_and_freshens() {
         use crate::snapshot::{AllowedIpView, PeerView, RuntimeSnapshot};
-        let mut snap =
-            RuntimeSnapshot::empty("vita".into(), "0.0.0.0:41641".parse().unwrap());
+        let mut snap = RuntimeSnapshot::empty("vita".into(), "0.0.0.0:41641".parse().unwrap());
         snap.updated_at_unix = 0;
         snap.peer_count = 3;
         snap.public_endpoint = Some("66.31.113.175:41641".parse().unwrap());
@@ -3026,8 +3036,7 @@ mod tests {
     fn classify_watchdog_and_eof_are_transient() {
         let watchdog = ts_control::ControlError::MapWatchdog { idle_secs: 120 };
         assert_eq!(classify_control_error(&watchdog), ErrorClass::Transient);
-        let eof =
-            ts_control::ControlError::MapConnectionLost("server closed map stream".into());
+        let eof = ts_control::ControlError::MapConnectionLost("server closed map stream".into());
         assert_eq!(classify_control_error(&eof), ErrorClass::Transient);
     }
 }

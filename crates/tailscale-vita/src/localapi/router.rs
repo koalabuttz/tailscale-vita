@@ -4,11 +4,11 @@
 
 use std::sync::Arc;
 
-use vita_sync::RwLock;
 use ts_magicsock::MagicSocketCtl;
+use vita_sync::RwLock;
 
 use crate::localapi::handlers;
-use crate::localapi::http::{Request, write_error, write_json_response};
+use crate::localapi::http::{write_error, write_json_response, Request};
 use crate::runtime::ControlHandle;
 use crate::snapshot::RuntimeSnapshot;
 
@@ -26,11 +26,10 @@ pub struct HandlerCtx {
 /// Dispatch one request to the right handler. Writes the response
 /// directly to the stream so individual handlers don't have to
 /// allocate twice.
-pub fn dispatch(
-    stream: &mut TcpStream,
-    req: &Request,
-    ctx: &HandlerCtx,
-) -> std::io::Result<()> {
+pub fn dispatch(stream: &mut TcpStream, req: &Request, ctx: &HandlerCtx) -> std::io::Result<()> {
+    if req.method == "POST" && !req.has_action_header {
+        return write_error(stream, 403, "missing local action header");
+    }
     let result = match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/localapi/v0/status") => {
             let (status, body) = handlers::status(ctx);

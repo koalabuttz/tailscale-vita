@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lints]
+workspace = true
+
 # vita-sync is zero-dep: a thin shim between std::sync (host backend)
 # and SCE kernel mutex primitives (Vita SUPRX backend). Pulling in deps
 # would risk transitive thread_local/std::sync::Mutex usage that

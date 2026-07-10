@@ -13,10 +13,9 @@
 //!
 //! ## Security posture
 //!
-//! Plaintext + permissive auth is deliberate: WireGuard already encrypts the
-//! transport, and the **tailnet ACL is the boundary** (whoever the ACL lets
-//! reach the port is authorized). The server is config-gated (`enabled =
-//! false` by default) and jailed to a configurable `root`.
+//! WireGuard encrypts the transport, but it is not application
+//! authentication. The server is disabled by default, requires configured
+//! credentials when enabled, and is jailed to a configurable `root`.
 //!
 //! ## v1 scope
 //!
@@ -28,7 +27,7 @@
 use std::io;
 use std::net::Ipv4Addr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,6 +68,9 @@ pub(crate) const CTRL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const DATA_ACCEPT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Read/write timeout on a data transfer.
 pub(crate) const DATA_RW_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum bytes in one FTP command line. Caps a line-without-newline memory
+/// exhaustion attempt before it can occupy an entire session thread.
+pub(crate) const MAX_COMMAND_BYTES: usize = 4096;
 
 /// Shared holder for the node's tailnet IPv4, published by the runtime once
 /// the first MapResponse lands. `None` until then — PASV replies `425` in
@@ -87,6 +89,18 @@ pub struct FtpConfig {
     /// Jail root. Client `/` maps here; `..` cannot escape above it.
     #[serde(default = "default_root")]
     pub root: String,
+    /// Required FTP username. The service refuses to start with an empty
+    /// username or password rather than falling back to anonymous access.
+    #[serde(default = "default_username")]
+    pub username: String,
+    /// Required FTP password. Store this only in the Vita-local config; never
+    /// log it. Empty means the FTP service is disabled at startup.
+    #[serde(default)]
+    pub password: String,
+    /// Explicit compatibility escape hatch for VitaShell-style `/ux0:/...`
+    /// paths. False by default so `root` is an actual filesystem jail.
+    #[serde(default)]
+    pub allow_device_paths: bool,
     /// Deny STOR/DELE/MKD/RNFR when true.
     #[serde(default)]
     pub read_only: bool,
@@ -96,6 +110,10 @@ pub struct FtpConfig {
     /// High end of the PASV data-port range (inclusive).
     #[serde(default = "default_pasv_hi")]
     pub passive_port_hi: u16,
+    /// Maximum bytes accepted by STOR and returned by RETR. Transfers stream
+    /// to a temporary file, but this cap also protects finite storage.
+    #[serde(default = "default_max_transfer_bytes")]
+    pub max_transfer_bytes: u64,
 }
 
 fn default_enabled() -> bool {
@@ -107,11 +125,17 @@ fn default_port() -> u16 {
 fn default_root() -> String {
     "ux0:".to_string()
 }
+fn default_username() -> String {
+    "vita".to_string()
+}
 fn default_pasv_lo() -> u16 {
     30000
 }
 fn default_pasv_hi() -> u16 {
     30009
+}
+fn default_max_transfer_bytes() -> u64 {
+    32 * 1024 * 1024
 }
 
 impl Default for FtpConfig {
@@ -120,9 +144,13 @@ impl Default for FtpConfig {
             enabled: default_enabled(),
             port: default_port(),
             root: default_root(),
+            username: default_username(),
+            password: String::new(),
+            allow_device_paths: false,
             read_only: false,
             passive_port_lo: default_pasv_lo(),
             passive_port_hi: default_pasv_hi(),
+            max_transfer_bytes: default_max_transfer_bytes(),
         }
     }
 }
@@ -137,6 +165,10 @@ pub(crate) struct Ctx {
     /// transfers spread over `[passive_port_lo, passive_port_hi]` instead of
     /// every one-shot session reusing `lo`. See [`data::bind_passive`].
     pub(crate) next_pasv_port: Arc<AtomicU16>,
+    /// Monotonic id for STOR temp files, shared across ALL sessions so two
+    /// concurrent uploads of the same target name never share a `.partial`
+    /// (which would interleave their bodies and cross-delete on error).
+    pub(crate) partial_seq: Arc<AtomicU64>,
 }
 
 /// Running FTP service. Dropping it signals shutdown and joins the thread.
@@ -150,6 +182,14 @@ impl TsFtpServer {
     /// (non-fatal) if the bind or thread spawn fails — the runtime keeps
     /// running without FTP.
     pub fn spawn(stack: StackHandle, cfg: FtpConfig, tailnet_ip: TailnetIp) -> Option<Self> {
+        if cfg.username.is_empty() || cfg.password.is_empty() {
+            warn!("ts-ftp.refusing_to_start_without_credentials");
+            return None;
+        }
+        if cfg.max_transfer_bytes == 0 {
+            warn!("ts-ftp.refusing_to_start_with_zero_transfer_limit");
+            return None;
+        }
         let port = cfg.port;
         let listener = match TcpListener::bind_handle(&stack, port, CONTROL_POOL) {
             Ok(l) => l,
@@ -158,7 +198,7 @@ impl TsFtpServer {
                 return None;
             }
         };
-        info!(port, root = %cfg.root, read_only = cfg.read_only, "ts-ftp.listening");
+        info!(port, root = %cfg.root, read_only = cfg.read_only, allow_device_paths = cfg.allow_device_paths, max_transfer_bytes = cfg.max_transfer_bytes, "ts-ftp.listening");
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
@@ -168,6 +208,7 @@ impl TsFtpServer {
             cfg,
             tailnet_ip,
             next_pasv_port,
+            partial_seq: Arc::new(AtomicU64::new(0)),
         };
 
         let worker = match thread::Builder::new()
@@ -237,7 +278,11 @@ fn accept_loop(listener: TcpListener, shutdown: Arc<AtomicBool>, ctx: Ctx) {
                 if live.len() >= MAX_SESSIONS {
                     // At capacity: refuse fast so the accept loop stays free.
                     let mut stream = stream;
-                    let _ = crate::reply::reply(&mut stream, 421, "too many connections, retry shortly");
+                    let _ = crate::reply::reply(
+                        &mut stream,
+                        421,
+                        "too many connections, retry shortly",
+                    );
                     warn!(%peer, active = live.len(), "ts-ftp.session.rejected_at_cap");
                     continue;
                 }

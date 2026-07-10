@@ -5,13 +5,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use boringtun::noise::{Tunn, TunnResult};
-use vita_sync::{Condvar, Mutex};
 use vita_log::{debug, error, info, trace, warn};
+use vita_sync::{Condvar, Mutex};
 
 use crate::dispatch::{parse_ipv4_dst, peer_for_ip, route_inbound, InboundRoute};
 use crate::indices::Indices;
 use crate::peer::{DirectPathHint, Peer, TransportAddr};
 use crate::transport::Transport;
+use crate::InboundPolicy;
 
 /// Buffer size for `Tunn::encapsulate` / `decapsulate` work area. Per
 /// boringtun docs: at least src.len() + 32 and at least 148 bytes.
@@ -38,6 +39,7 @@ enum Outcome {
 /// Run the wg-engine pump loop. Returns when `shutdown` is set.
 pub(crate) fn run<T: Transport + ?Sized>(
     indices: Arc<Indices>,
+    inbound_policy: Arc<arc_swap::ArcSwap<InboundPolicy>>,
     transport: Arc<T>,
     direct_path_hint: Option<Arc<dyn DirectPathHint>>,
     tun_rx_q: Arc<Mutex<VecDeque<Vec<u8>>>>,
@@ -64,6 +66,7 @@ pub(crate) fn run<T: Transport + ?Sized>(
                 info!(?src_addr, n = datagram.len(), "wg.net.rx");
                 handle_inbound(
                     &indices,
+                    &inbound_policy,
                     &*transport,
                     src_addr,
                     &datagram,
@@ -103,10 +106,7 @@ pub(crate) fn run<T: Transport + ?Sized>(
 /// `RUST_LOG=wg_engine=debug` to observe whether direct paths are
 /// being used vs falling back to DERP. Default (`info`) is silent
 /// since `pick_addr` is on the hot path.
-fn pick_addr(
-    peer: &Peer,
-    hint: Option<&dyn DirectPathHint>,
-) -> Option<TransportAddr> {
+fn pick_addr(peer: &Peer, hint: Option<&dyn DirectPathHint>) -> Option<TransportAddr> {
     let pick = if let Some(auth) = peer.auth_src_fresh(std::time::Instant::now()) {
         // WireGuard roaming: reply to where the peer's last AUTHENTICATED packet
         // actually arrived from. This beats a possibly-stale Disco endpoint for
@@ -144,6 +144,7 @@ fn pick_addr(
 
 fn handle_inbound<T: Transport + ?Sized>(
     indices: &Indices,
+    inbound_policy: &arc_swap::ArcSwap<InboundPolicy>,
     transport: &T,
     src_addr: TransportAddr,
     datagram: &[u8],
@@ -239,8 +240,27 @@ fn handle_inbound<T: Transport + ?Sized>(
             send_outbound(transport, &peer.pubkey, src_addr, &bytes);
         }
 
-        let any_inbound_data = !tun_outputs.is_empty();
+        let mut any_inbound_data = false;
         for plaintext in tun_outputs {
+            let Some(meta) = parse_ipv4_meta(&plaintext) else {
+                trace!(peer_pub = %short_hex(&peer.pubkey), n = plaintext.len(), "dropping malformed inbound ipv4");
+                continue;
+            };
+            // BoringTun authenticates the peer key, not the inner source
+            // address. A peer may send only addresses/routes assigned to it
+            // by the control plane, otherwise it could impersonate another
+            // tailnet member to local services.
+            if !peer.allowed_ips.iter().any(|cidr| cidr.contains(meta.src)) {
+                warn!(peer_pub = %short_hex(&peer.pubkey), src = %meta.src, "dropping inbound packet with unowned source");
+                continue;
+            }
+            if !inbound_policy
+                .load()
+                .allows(meta.src, meta.dst, meta.protocol, meta.dst_port)
+            {
+                trace!(peer_pub = %short_hex(&peer.pubkey), src = %meta.src, dst = %meta.dst, proto = meta.protocol, port = ?meta.dst_port, "dropping inbound packet denied by packet filter");
+                continue;
+            }
             let len = plaintext.len();
             {
                 let mut s = peer.stats.lock();
@@ -249,6 +269,7 @@ fn handle_inbound<T: Transport + ?Sized>(
             }
             tun_rx_q.lock().push_back(plaintext);
             info!(peer_pub = %short_hex(&peer.pubkey), n = len, "wg.tun.rx");
+            any_inbound_data = true;
         }
 
         if any_inbound_data {
@@ -257,6 +278,40 @@ fn handle_inbound<T: Transport + ?Sized>(
             cv.notify_all();
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct Ipv4Meta {
+    src: std::net::Ipv4Addr,
+    dst: std::net::Ipv4Addr,
+    protocol: u8,
+    dst_port: Option<u16>,
+}
+
+/// Parse exactly the fields needed for source ownership and packet-filter
+/// checks. smoltcp remains responsible for full IPv4/TCP/UDP validation.
+fn parse_ipv4_meta(pkt: &[u8]) -> Option<Ipv4Meta> {
+    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        return None;
+    }
+    let ihl = usize::from(pkt[0] & 0x0f) * 4;
+    if ihl < 20 || pkt.len() < ihl {
+        return None;
+    }
+    let protocol = pkt[9];
+    let src = std::net::Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+    let dst = std::net::Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+    let dst_port = match protocol {
+        6 | 17 if pkt.len() >= ihl + 4 => Some(u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]])),
+        6 | 17 => return None,
+        _ => None,
+    };
+    Some(Ipv4Meta {
+        src,
+        dst,
+        protocol,
+        dst_port,
+    })
 }
 
 fn handle_outbound<T: Transport + ?Sized>(
@@ -531,5 +586,28 @@ mod pick_addr_tests {
         );
         let dead_hint = FixedHint(None);
         assert_eq!(pick_addr(&peer, Some(&dead_hint)), Some(DERP));
+    }
+
+    #[test]
+    fn ipv4_meta_extracts_tcp_addresses_and_destination_port() {
+        let mut pkt = vec![0u8; 24];
+        pkt[0] = 0x45;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&[100, 64, 0, 2]);
+        pkt[16..20].copy_from_slice(&[100, 64, 0, 1]);
+        pkt[22..24].copy_from_slice(&8080u16.to_be_bytes());
+        let meta = parse_ipv4_meta(&pkt).expect("valid ipv4 tcp metadata");
+        assert_eq!(meta.src, std::net::Ipv4Addr::new(100, 64, 0, 2));
+        assert_eq!(meta.dst, std::net::Ipv4Addr::new(100, 64, 0, 1));
+        assert_eq!(meta.protocol, 6);
+        assert_eq!(meta.dst_port, Some(8080));
+    }
+
+    #[test]
+    fn ipv4_meta_rejects_truncated_udp_header() {
+        let mut pkt = vec![0u8; 20];
+        pkt[0] = 0x45;
+        pkt[9] = 17;
+        assert!(parse_ipv4_meta(&pkt).is_none());
     }
 }

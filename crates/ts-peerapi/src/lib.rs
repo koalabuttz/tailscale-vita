@@ -42,13 +42,14 @@
 
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use netstack::{StackHandle, TcpListener};
 use serde::Deserialize;
 use vita_log::{info, warn};
+use vita_sync::Mutex;
 use vita_thread::{self as thread, JoinHandle};
 
 mod handler;
@@ -142,6 +143,15 @@ pub type TaildropSink = Arc<dyn Fn(TaildropReport) + Send + Sync>;
 pub(crate) struct Ctx {
     pub(crate) cfg: TaildropConfig,
     pub(crate) sink: Option<TaildropSink>,
+    /// Serializes the collision check and non-atomic rename, preventing two
+    /// simultaneous uploads from selecting the same final path.
+    pub(crate) finalize_lock: Mutex<()>,
+    /// Sum of declared bodies currently being received. This bounds aggregate
+    /// disk consumption even when all connection slots are active.
+    pub(crate) in_flight_bytes: AtomicU64,
+    /// Produces per-upload partial names so concurrent same-name PUTs never
+    /// append to one another's temporary file.
+    pub(crate) partial_seq: AtomicU64,
 }
 
 /// Running Taildrop service. Dropping it signals shutdown and joins the
@@ -173,7 +183,13 @@ impl TsPeerApi {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
-        let ctx = Ctx { cfg, sink };
+        let ctx = Ctx {
+            cfg,
+            sink,
+            finalize_lock: Mutex::new(()),
+            in_flight_bytes: AtomicU64::new(0),
+            partial_seq: AtomicU64::new(0),
+        };
 
         let worker = match thread::Builder::new()
             .name("ts-peerapi")

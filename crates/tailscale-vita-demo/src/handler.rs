@@ -14,7 +14,9 @@
 //! - `GET  /api/health`     → `GET  /localapi/v0/health`
 //! - `GET  /api/netmap`     → `GET  /localapi/v0/netmap`
 //! - `GET  /api/ping?ip=...`→ `GET  /localapi/v0/ping?ip=...`
-//! - `POST /api/reconnect`  → `POST /localapi/v0/reconnect`
+//! The proxy deliberately exposes only read-only LocalAPI GETs. Lifecycle
+//! controls stay loopback-only; a tailnet peer must never be able to turn the
+//! demo server into `/logout`, `/down`, or `/up`.
 
 use std::io::{ErrorKind, Read as _, Write};
 use std::net::{SocketAddr, TcpStream as StdTcpStream};
@@ -52,9 +54,7 @@ pub fn serve(mut stream: TcpStream, peer: SocketAddr) {
                     break;
                 }
             }
-            Err(e)
-                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-            {
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
                 break;
             }
             Err(e) => {
@@ -102,6 +102,13 @@ pub fn serve(mut stream: TcpStream, peer: SocketAddr) {
 /// stream back to the tailnet client as-is). Returns an error string
 /// if the loopback dial fails (LocalAPI disabled / bind failed / crashed).
 fn proxy_to_localapi(method: &str, rest: &str) -> Result<Vec<u8>, String> {
+    if method != "GET" {
+        return Err("only read-only GET LocalAPI proxying is allowed".into());
+    }
+    let path = rest.split('?').next().unwrap_or(rest);
+    if !matches!(path, "status" | "whois" | "health" | "netmap" | "ping") {
+        return Err("LocalAPI endpoint is not exposed through the demo proxy".into());
+    }
     // Build a minimal upstream request.
     let upstream_req = format!(
         "{method} /localapi/v0/{rest} HTTP/1.1\r\n\
@@ -110,8 +117,7 @@ fn proxy_to_localapi(method: &str, rest: &str) -> Result<Vec<u8>, String> {
          Content-Length: 0\r\n\
          \r\n"
     );
-    let mut conn = StdTcpStream::connect(LOCALAPI_ADDR)
-        .map_err(|e| format!("connect: {e}"))?;
+    let mut conn = StdTcpStream::connect(LOCALAPI_ADDR).map_err(|e| format!("connect: {e}"))?;
     conn.set_read_timeout(Some(READ_TIMEOUT))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
     conn.set_write_timeout(Some(WRITE_TIMEOUT))
@@ -128,9 +134,7 @@ fn proxy_to_localapi(method: &str, rest: &str) -> Result<Vec<u8>, String> {
         match conn.read(&mut tmp) {
             Ok(0) => break,
             Ok(n) => response.extend_from_slice(&tmp[..n]),
-            Err(e)
-                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-            {
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
                 return Err(format!("read timeout: {e}"));
             }
             Err(e) => return Err(format!("read: {e}")),

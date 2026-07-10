@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use netstack::tcp::TcpStream;
@@ -67,7 +68,13 @@ pub(crate) fn handle(mut stream: TcpStream, peer: SocketAddr, ctx: &Ctx) {
         Err(e) => {
             warn!(%peer, escaped, ?e, "peerapi.name.rejected");
             let _ = http::write_response(&mut stream, 400);
-            report(ctx, peer, escaped.to_string(), 0, format!("rejected: {e:?}"));
+            report(
+                ctx,
+                peer,
+                escaped.to_string(),
+                0,
+                format!("rejected: {e:?}"),
+            );
             return;
         }
     };
@@ -87,6 +94,21 @@ pub(crate) fn handle(mut stream: TcpStream, peer: SocketAddr, ctx: &Ctx) {
         report(ctx, peer, name, content_length, "rejected: too_big".into());
         return;
     }
+    let _reservation = match reserve_in_flight(ctx, content_length) {
+        Some(reservation) => reservation,
+        None => {
+            warn!(%peer, name, content_length, "peerapi.in_flight_limit");
+            let _ = http::write_response(&mut stream, 503);
+            report(
+                ctx,
+                peer,
+                name,
+                content_length,
+                "rejected: in_flight_limit".into(),
+            );
+            return;
+        }
+    };
 
     // v1 auth posture: the tailnet ACL is the boundary — accept any peer
     // that reached us (same stance as ts-ftp). We just LOG the source addr
@@ -94,7 +116,8 @@ pub(crate) fn handle(mut stream: TcpStream, peer: SocketAddr, ctx: &Ctx) {
     info!(%peer, name, content_length, "peerapi.put.begin");
 
     let dir = Path::new(&ctx.cfg.dir);
-    let partial = dir.join(format!("{name}.partial"));
+    let partial_id = ctx.partial_seq.fetch_add(1, Ordering::Relaxed);
+    let partial = dir.join(format!(".taildrop-{partial_id:016x}.partial"));
 
     // Truncate-create the .partial so it starts empty AND exists even when
     // the body is 0 bytes (a legit empty file streams zero chunks, so
@@ -127,7 +150,11 @@ pub(crate) fn handle(mut stream: TcpStream, peer: SocketAddr, ctx: &Ctx) {
 
     // Move .partial → collision-free final name, verifying the (non-atomic)
     // rename landed.
-    match finalize(dir, &partial, &name, written) {
+    let finalized = {
+        let _lock = ctx.finalize_lock.lock();
+        finalize(dir, &partial, &name, written)
+    };
+    match finalized {
         Ok(final_name) => {
             info!(%peer, name = %final_name, bytes = written, "peerapi.put.ok");
             let _ = http::write_response(&mut stream, 200);
@@ -150,7 +177,12 @@ pub(crate) fn handle(mut stream: TcpStream, peer: SocketAddr, ctx: &Ctx) {
 /// 500 and retries the whole file). Returns the final name on success.
 fn finalize(dir: &Path, partial: &Path, name: &str, expect_bytes: u64) -> io::Result<String> {
     let existing = dir_names(dir);
-    let final_name = name::next_free_name(name, &existing);
+    let final_name = name::next_free_name(name, &existing).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "taildrop name collision limit reached",
+        )
+    })?;
     let dest = dir.join(&final_name);
 
     vita_fs::rename(partial, &dest)?;
@@ -163,6 +195,43 @@ fn finalize(dir: &Path, partial: &Path, name: &str, expect_bytes: u64) -> io::Re
         other => Err(io::Error::other(format!(
             "rename verify failed for {final_name:?}: got {other:?}, expected >= {expect_bytes}"
         ))),
+    }
+}
+
+/// Reservation released automatically on every connection exit, including
+/// short reads and disk failures.
+struct InFlightReservation<'a> {
+    used: &'a std::sync::atomic::AtomicU64,
+    bytes: u64,
+}
+
+impl Drop for InFlightReservation<'_> {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+fn reserve_in_flight(ctx: &Ctx, bytes: u64) -> Option<InFlightReservation<'_>> {
+    let mut current = ctx.in_flight_bytes.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(bytes)?;
+        if next > ctx.cfg.max_size {
+            return None;
+        }
+        match ctx.in_flight_bytes.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                return Some(InFlightReservation {
+                    used: &ctx.in_flight_bytes,
+                    bytes,
+                });
+            }
+            Err(observed) => current = observed,
+        }
     }
 }
 
@@ -229,7 +298,10 @@ mod tests {
         let partial = stream_to_partial(&dir, "hello.txt", b"hello world");
         let final_name = finalize(&dir, &partial, "hello.txt", 11).unwrap();
         assert_eq!(final_name, "hello.txt");
-        assert_eq!(std::fs::read(dir.join("hello.txt")).unwrap(), b"hello world");
+        assert_eq!(
+            std::fs::read(dir.join("hello.txt")).unwrap(),
+            b"hello world"
+        );
         assert!(!partial.exists(), ".partial should be consumed by the move");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -242,8 +314,14 @@ mod tests {
         let final_name = finalize(&dir, &partial, "hello.txt", 9).unwrap();
         assert_eq!(final_name, "hello (1).txt");
         // Original untouched; new file under the collision-free name.
-        assert_eq!(std::fs::read(dir.join("hello.txt")).unwrap(), b"pre-existing");
-        assert_eq!(std::fs::read(dir.join("hello (1).txt")).unwrap(), b"new bytes");
+        assert_eq!(
+            std::fs::read(dir.join("hello.txt")).unwrap(),
+            b"pre-existing"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("hello (1).txt")).unwrap(),
+            b"new bytes"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

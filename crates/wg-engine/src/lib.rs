@@ -14,14 +14,15 @@ use vita_thread::JoinHandle;
 
 use arc_swap::ArcSwap;
 use boringtun::noise::Tunn;
-use vita_sync::{Condvar, Mutex};
 use vita_log::info;
+use vita_sync::{Condvar, Mutex};
 
 mod config;
 mod dispatch;
 pub mod icmp;
 mod indices;
 mod peer;
+mod policy;
 mod pump;
 mod queue;
 mod transport;
@@ -31,6 +32,7 @@ mod error;
 pub use config::{build_engine_inputs, decode_priv_key, decode_pub_key, read_wg_toml, WgToml};
 pub use error::WgError;
 pub use peer::{DirectPathHint, Ipv4Cidr, Peer, PeerConfig, PeerStats, TransportAddr};
+pub use policy::{FilterRule, InboundPolicy, NetPortRange};
 pub use transport::{NoopTransport, Transport, UdpTransport};
 
 /// How long an authenticated inbound source stays trusted as the reply/send
@@ -101,6 +103,7 @@ impl EngineConfig {
 /// the pump thread driving a `Transport`.
 pub struct Engine {
     indices: Arc<Indices>,
+    inbound_policy: Arc<ArcSwap<InboundPolicy>>,
     next_idx: AtomicU32,
     our_static_secret: x25519_dalek::StaticSecret,
 }
@@ -114,6 +117,7 @@ impl Engine {
         let next_idx = AtomicU32::new(1);
         let engine = Self {
             indices,
+            inbound_policy: Arc::new(ArcSwap::from_pointee(InboundPolicy::DenyAll)),
             next_idx,
             our_static_secret: cfg.our_static_secret,
         };
@@ -186,8 +190,21 @@ impl Engine {
         self.indices.remove(pubkey.as_bytes());
     }
 
+    /// Replace the destination's effective Tailscale packet filter. This is
+    /// called on MapResponse policy updates; ArcSwap makes the update atomic
+    /// with respect to the hot packet pump.
+    pub fn set_inbound_policy(&self, policy: InboundPolicy) {
+        self.inbound_policy.store(Arc::new(policy));
+    }
+
     pub fn set_endpoint(&self, pubkey: &x25519_dalek::PublicKey, endpoint: TransportAddr) {
-        if let Some(peer) = self.indices.by_pubkey.read().get(pubkey.as_bytes()).cloned() {
+        if let Some(peer) = self
+            .indices
+            .by_pubkey
+            .read()
+            .get(pubkey.as_bytes())
+            .cloned()
+        {
             peer.set_transport_addr(endpoint);
         }
     }
@@ -212,10 +229,7 @@ impl Engine {
     /// Takes `&self` so the caller keeps the `Engine` alive after start —
     /// M7's control thread needs to call `upsert_peer` / `remove_peer`
     /// based on `MapResponse` deltas.
-    pub fn start<T: Transport + 'static>(
-        &self,
-        transport: T,
-    ) -> Result<EngineRunning, WgError> {
+    pub fn start<T: Transport + 'static>(&self, transport: T) -> Result<EngineRunning, WgError> {
         self.start_with_hint(transport, None)
     }
 
@@ -234,6 +248,7 @@ impl Engine {
 
         let join = {
             let indices = Arc::clone(&self.indices);
+            let inbound_policy = Arc::clone(&self.inbound_policy);
             let transport = Arc::clone(&transport);
             let tun_rx_q = Arc::clone(&tun_rx_q);
             let tun_tx_q = Arc::clone(&tun_tx_q);
@@ -246,6 +261,7 @@ impl Engine {
                 .spawn(move || {
                     pump::run(
                         indices,
+                        inbound_policy,
                         transport,
                         hint,
                         tun_rx_q,
@@ -348,7 +364,11 @@ impl SelfTestReport {
             self.data_ok as u8,
             self.data_len,
             self.roundtrip_match as u8,
-            if self.note.is_empty() { "-" } else { self.note.as_str() },
+            if self.note.is_empty() {
+                "-"
+            } else {
+                self.note.as_str()
+            },
             verdict,
         )
     }

@@ -49,14 +49,16 @@ pub use error::ControlError;
 pub use http2::Http2Conn;
 pub use keystore::KeyStore;
 pub use map::{MapClient, MapEvent, NetMapSnapshot};
-pub use netmap::{AllowedIp, NetMap, NetMapDelta, PeerSnapshot, RekeyedPeer};
+pub use netmap::{
+    AllowedIp, FilterRule, NetMap, NetMapDelta, NetPortRange, PacketFilter, PeerSnapshot,
+    RekeyedPeer,
+};
 pub use noise::{NoiseHandshaker, NoiseTransport};
 pub use persist::{atomic_write, pin_or_load_server_key};
 pub use record::NoiseStream;
 pub use register::{logout, register, RegistrationOutcome};
 pub use server_key::{
-    fetch_server_key, fetch_server_key_cached, invalidate_server_key_cache,
-    SERVER_KEY_CACHE_TTL,
+    fetch_server_key, fetch_server_key_cached, invalidate_server_key_cache, SERVER_KEY_CACHE_TTL,
 };
 pub use types::{
     generate_machine_keypair, DiscoPrivate, DiscoPublic, MachinePrivate, MachinePublic,

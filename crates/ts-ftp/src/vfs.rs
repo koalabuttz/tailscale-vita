@@ -5,34 +5,27 @@
 //! - **Jail-relative** (historical): bare/relative paths and plain absolutes
 //!   like `data/...` or `/data/...` resolve *under* the configured `root`
 //!   (default `ux0:`), and `..` cannot escape above it.
-//! - **Device-absolute** (VitaShell/ftpvita): a path whose first segment is a
-//!   device token — `/ux0:/data`, `/ur0:/tai` — routes straight to that
-//!   device, bypassing the jail root. On a jailbroken Vita the tailnet ACL is
-//!   the real boundary (see the threat-model note in memory), so cross-device
-//!   access is intentional and matches what VitaShell exposes.
+//! - **Device-absolute** (VitaShell/ftpvita): optional compatibility mode for
+//!   a path whose first segment is a device token — `/ux0:/data`,
+//!   `/ur0:/tai`. It is disabled by default because it bypasses the jail.
 //!
 //! The virtual root `/` is the device-list level: `LIST /` shows the known
 //! mount points. There is no device-enumeration syscall, so [`DEVICES`] is a
 //! hardcoded list. Real paths are handed to `vita_fs`, which normalizes the
 //! device-prefix slash (`"ux0:/a" -> "ux0:a"`).
 
-use vita_fs::DirEntry;
-
-/// Known Vita mount points surfaced at the virtual root `/` (there is no
-/// enumeration syscall). A client can still `CWD`/`RETR` into any `xxx:`
-/// device that actually exists — this list only drives the `LIST /` view.
-pub(crate) const DEVICES: &[&str] = &["ux0:", "ur0:", "uma0:", "imc0:"];
-
 /// A path jail rooted at `root` (e.g. `"ux0:"` or `"ux0:/data"`).
 pub(crate) struct Vfs {
     root: String,
+    allow_device_paths: bool,
 }
 
 impl Vfs {
-    pub(crate) fn new(root: &str) -> Self {
+    pub(crate) fn new(root: &str, allow_device_paths: bool) -> Self {
         // Drop a trailing '/' so joins are clean ("ux0:/" -> "ux0:").
         Self {
             root: root.trim_end_matches('/').to_string(),
+            allow_device_paths,
         }
     }
 
@@ -69,7 +62,7 @@ impl Vfs {
     pub(crate) fn to_real(&self, vpath: &str) -> String {
         if let Some(rest) = vpath.strip_prefix('/') {
             let first = rest.split('/').next().unwrap_or("");
-            if is_device(first) {
+            if self.allow_device_paths && is_device(first) {
                 // `/ux0:/a` -> `ux0:/a`; `/ux0:` -> `ux0:`.
                 return rest.to_string();
             }
@@ -91,23 +84,6 @@ pub(crate) fn is_device(seg: &str) -> bool {
     seg.len() >= 2 && seg.ends_with(':') && !seg[..seg.len() - 1].contains(':')
 }
 
-/// Whether `vpath` is the virtual root (`/`) — the device-list level.
-pub(crate) fn is_root(vpath: &str) -> bool {
-    vpath == "/"
-}
-
-/// The `LIST /` view: the known [`DEVICES`] as directory entries.
-pub(crate) fn device_entries() -> Vec<DirEntry> {
-    DEVICES
-        .iter()
-        .map(|d| DirEntry {
-            name: (*d).to_string(),
-            is_dir: true,
-            size: 0,
-        })
-        .collect()
-}
-
 /// Split a virtual path into `(parent, name)`. `"/a/b" -> ("/a", "b")`,
 /// `"/b" -> ("/", "b")`. Used by `SIZE` (look the name up in its parent).
 pub(crate) fn split_parent(vpath: &str) -> (String, String) {
@@ -124,9 +100,12 @@ mod tests {
 
     #[test]
     fn relative_and_absolute() {
-        let v = Vfs::new("ux0:");
+        let v = Vfs::new("ux0:", false);
         assert_eq!(v.resolve("/", "data").as_deref(), Some("/data"));
-        assert_eq!(v.resolve("/data", "tailscale-vita").as_deref(), Some("/data/tailscale-vita"));
+        assert_eq!(
+            v.resolve("/data", "tailscale-vita").as_deref(),
+            Some("/data/tailscale-vita")
+        );
         assert_eq!(v.resolve("/data", "/app").as_deref(), Some("/app"));
         assert_eq!(v.resolve("/data/x", "..").as_deref(), Some("/data"));
         assert_eq!(v.resolve("/data", ".").as_deref(), Some("/data"));
@@ -134,7 +113,7 @@ mod tests {
 
     #[test]
     fn escape_above_root_is_rejected() {
-        let v = Vfs::new("ux0:");
+        let v = Vfs::new("ux0:", false);
         assert_eq!(v.resolve("/", ".."), None);
         assert_eq!(v.resolve("/data", "../../etc"), None);
         assert_eq!(v.resolve("/", "/../secret"), None);
@@ -142,10 +121,10 @@ mod tests {
 
     #[test]
     fn to_real_maps_under_root() {
-        let v = Vfs::new("ux0:");
+        let v = Vfs::new("ux0:", false);
         assert_eq!(v.to_real("/"), "ux0:");
         assert_eq!(v.to_real("/data/x"), "ux0:/data/x");
-        let v2 = Vfs::new("ux0:/data");
+        let v2 = Vfs::new("ux0:/data", false);
         assert_eq!(v2.to_real("/"), "ux0:/data");
         assert_eq!(v2.to_real("/foo"), "ux0:/data/foo");
     }
@@ -171,54 +150,40 @@ mod tests {
     }
 
     #[test]
-    fn device_absolute_paths_route_to_device() {
-        // Jail root is ux0:, but a leading device segment bypasses it and
-        // routes straight to the named device (VitaShell convention).
-        let v = Vfs::new("ux0:");
-        assert_eq!(v.to_real("/ux0:/data"), "ux0:/data");
-        assert_eq!(v.to_real("/ux0:"), "ux0:");
-        assert_eq!(v.to_real("/ur0:/tai"), "ur0:/tai");
-        // A subdir jail is still bypassed by an explicit device path.
-        let v2 = Vfs::new("ux0:/data");
-        assert_eq!(v2.to_real("/ur0:/tai"), "ur0:/tai");
+    fn device_absolute_paths_stay_jailed_by_default() {
+        let v = Vfs::new("ux0:", false);
+        assert_eq!(v.to_real("/ux0:/data"), "ux0:/ux0:/data");
+        assert_eq!(v.to_real("/ur0:/tai"), "ux0:/ur0:/tai");
+        let v2 = Vfs::new("ux0:/data", false);
+        assert_eq!(v2.to_real("/ur0:/tai"), "ux0:/data/ur0:/tai");
     }
 
     #[test]
     fn bare_paths_still_map_under_root() {
         // Issue #5(b): the historical bare/relative convention keeps working.
-        let v = Vfs::new("ux0:");
-        assert_eq!(v.to_real("/data/tailscale-vita/vita.log"), "ux0:/data/tailscale-vita/vita.log");
+        let v = Vfs::new("ux0:", false);
+        assert_eq!(
+            v.to_real("/data/tailscale-vita/vita.log"),
+            "ux0:/data/tailscale-vita/vita.log"
+        );
     }
 
     #[test]
-    fn bogus_device_routes_to_a_nonexistent_device_path() {
-        // Issue #5: a bogus device is still routed as a device path, so the
-        // FS layer rejects it (`550 no such directory/file`) rather than
-        // silently mapping it under the jail root.
-        let v = Vfs::new("ux0:");
-        assert_eq!(v.to_real("/zz0:/x"), "zz0:/x");
+    fn explicit_compatibility_mode_allows_device_paths() {
+        let v = Vfs::new("ux0:", false);
+        assert_eq!(v.to_real("/ur0:/tai"), "ux0:/ur0:/tai");
+        let compat = Vfs::new("ux0:", true);
+        assert_eq!(compat.to_real("/ur0:/tai"), "ur0:/tai");
     }
 
     #[test]
-    fn device_absolute_resolves_from_client_arg() {
-        // The old bug: `ux0:/data` used to resolve to `/ux0:/data` and then
-        // map to `ux0:/ux0:/data` (a `550`). Now the leading `ux0:` segment
-        // routes to the real device.
-        let v = Vfs::new("ux0:");
+    fn device_absolute_syntax_does_not_escape_jail() {
+        let v = Vfs::new("ux0:", false);
         let vp = v.resolve("/", "ux0:/data").unwrap();
         assert_eq!(vp, "/ux0:/data");
-        assert_eq!(v.to_real(&vp), "ux0:/data");
+        assert_eq!(v.to_real(&vp), "ux0:/ux0:/data");
         let vp2 = v.resolve("/", "/ur0:/tai").unwrap();
         assert_eq!(vp2, "/ur0:/tai");
-        assert_eq!(v.to_real(&vp2), "ur0:/tai");
-    }
-
-    #[test]
-    fn root_is_the_device_list_level() {
-        assert!(is_root("/"));
-        assert!(!is_root("/ux0:"));
-        let names: Vec<String> = device_entries().into_iter().map(|e| e.name).collect();
-        assert!(names.contains(&"ux0:".to_string()));
-        assert!(device_entries().iter().all(|e| e.is_dir));
+        assert_eq!(v.to_real(&vp2), "ux0:/ur0:/tai");
     }
 }

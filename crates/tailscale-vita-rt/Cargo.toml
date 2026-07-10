@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lints]
+workspace = true
+
 # Phase 2: std-based staticlib that runs the full tailscale-vita Runtime
 # inside a SUPRX-spawned thread. Phase 1's no_std + alloc-only structure
 # is gone; the TaipoolAllocator stays as our `#[global_allocator]`.

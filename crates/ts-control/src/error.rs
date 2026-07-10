@@ -14,6 +14,8 @@ pub enum ControlError {
     BadServerKey { reason: &'static str },
     #[error("server Noise key changed (security gate; remove server-key.bin to accept)")]
     ServerKeyChanged,
+    #[error("refusing unpinned cleartext HTTP control URL; use HTTPS or set control_server_key")]
+    UnpinnedHttpControl,
     #[error("url: {0}")]
     Url(&'static str),
     #[error("httparse: {0}")]

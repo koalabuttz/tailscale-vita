@@ -2,12 +2,14 @@
 //! and dispatch until QUIT or disconnect. Each session runs on its own thread
 //! (spawned by the accept loop, bounded by `MAX_SESSIONS`), so one slow or
 //! stalled client can't block others. PASV-only. Permissive auth — the tailnet
-//! ACL is the boundary.
+//! ACLs are enforced by the runtime before this service sees a packet; this
+//! module additionally authenticates FTP clients and enforces service limits.
 
-use std::io::{self, BufRead, BufReader, Write};
-use std::net::SocketAddr;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use netstack::tcp::TcpStream;
@@ -17,7 +19,10 @@ use vita_log::{debug, info, warn};
 use crate::command::{self, Command};
 use crate::reply::{dir_reply, reply, reply_multiline};
 use crate::vfs::{self, Vfs};
-use crate::{data, listing, Ctx, CTRL_IDLE_TIMEOUT, CTRL_POLL, DATA_ACCEPT_TIMEOUT, DATA_RW_TIMEOUT};
+use crate::{
+    data, listing, Ctx, CTRL_IDLE_TIMEOUT, CTRL_POLL, DATA_ACCEPT_TIMEOUT, DATA_RW_TIMEOUT,
+    MAX_COMMAND_BYTES,
+};
 
 /// Control reader: a `BufReader` over the control stream. `get_mut()` yields
 /// the underlying stream for writing replies (writes bypass the read buffer).
@@ -44,7 +49,7 @@ pub(crate) fn handle(ctrl: TcpStream, peer: SocketAddr, ctx: &Ctx, shutdown: &At
         return;
     }
 
-    let mut session = Session::new(ctx);
+    let mut session = Session::new(ctx, peer);
     while !shutdown.load(Ordering::Acquire) {
         let line = match read_line(&mut reader, shutdown) {
             Some(l) => l,
@@ -69,11 +74,20 @@ pub(crate) fn handle(ctrl: TcpStream, peer: SocketAddr, ctx: &Ctx, shutdown: &At
 /// rather than ending the session, while partial reads accumulate in `buf`.
 /// Returns `None` on EOF, idle-timeout, shutdown, or a real read error (a
 /// closed stream reports `BrokenPipe`, ending the session promptly).
-fn read_line(reader: &mut Ctrl, shutdown: &AtomicBool) -> Option<String> {
+fn read_line<R: BufRead>(reader: &mut R, shutdown: &AtomicBool) -> Option<String> {
     let mut buf = Vec::new();
     let deadline = Instant::now() + CTRL_IDLE_TIMEOUT;
     loop {
-        match reader.read_until(b'\n', &mut buf) {
+        // Bound each read to the remaining command-line budget. `read_until`
+        // does not return while bytes keep arriving without a newline, so an
+        // unbounded check *between* calls can't stop a fast no-newline stream
+        // from growing `buf` without limit (pre-auth memory exhaustion). The
+        // `Take` cap makes a single call read at most one byte past the limit,
+        // so the over-cap guard below reliably fires. `buf.len()` never exceeds
+        // `MAX_COMMAND_BYTES + 1` because the budget shrinks as `buf` grows.
+        let budget = (MAX_COMMAND_BYTES + 1).saturating_sub(buf.len()) as u64;
+        match (&mut *reader).take(budget).read_until(b'\n', &mut buf) {
+            Ok(_) if buf.len() > MAX_COMMAND_BYTES => return None,
             // EOF. A trailing fragment without a newline is a broken client; drop it.
             Ok(0) => return None,
             Ok(_) if matches!(buf.last(), Some(b'\n')) => {
@@ -85,7 +99,12 @@ fn read_line(reader: &mut Ctrl, shutdown: &AtomicBool) -> Option<String> {
             // Read returned bytes but no line end yet — keep reading.
             Ok(_) => {}
             // Poll timeout: bail on shutdown or idle-budget exhaustion, else retry.
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
                 if shutdown.load(Ordering::Acquire) || Instant::now() >= deadline {
                     return None;
                 }
@@ -100,22 +119,31 @@ struct Session {
     /// Current virtual directory, always absolute (`"/"`, `"/data"`, …).
     cwd: String,
     authed: bool,
+    pending_user: Option<String>,
+    control_peer_ip: IpAddr,
     /// Pending PASV data listener + its advertised port.
     pasv: Option<(TcpListener, u16)>,
     /// `RNFR` target, awaiting `RNTO`.
     rename_from: Option<String>,
     read_only: bool,
+    max_transfer_bytes: u64,
+    /// Shared STOR temp-file counter (see [`crate::Ctx::partial_seq`]).
+    partial_seq: Arc<AtomicU64>,
 }
 
 impl Session {
-    fn new(ctx: &Ctx) -> Self {
+    fn new(ctx: &Ctx, control_peer: SocketAddr) -> Self {
         Self {
-            vfs: Vfs::new(&ctx.cfg.root),
+            vfs: Vfs::new(&ctx.cfg.root, ctx.cfg.allow_device_paths),
             cwd: "/".to_string(),
             authed: false,
+            pending_user: None,
+            control_peer_ip: control_peer.ip(),
             pasv: None,
             rename_from: None,
             read_only: ctx.cfg.read_only,
+            max_transfer_bytes: ctx.cfg.max_transfer_bytes,
+            partial_seq: Arc::clone(&ctx.partial_seq),
         }
     }
 
@@ -124,13 +152,19 @@ impl Session {
 
         // Commands answerable before login.
         match cmd {
-            User(_) => {
+            User(user) => {
+                self.pending_user = Some(user.clone());
                 reply(r.get_mut(), 331, "user ok, send PASS")?;
                 return Ok(Flow::Continue);
             }
-            Pass(_) => {
-                self.authed = true;
-                reply(r.get_mut(), 230, "logged in")?;
+            Pass(password) => {
+                let user = self.pending_user.take().unwrap_or_default();
+                if credentials_match(&ctx.cfg.username, &ctx.cfg.password, &user, password) {
+                    self.authed = true;
+                    reply(r.get_mut(), 230, "logged in")?;
+                } else {
+                    reply(r.get_mut(), 530, "login incorrect")?;
+                }
                 return Ok(Flow::Continue);
             }
             Quit => {
@@ -261,7 +295,8 @@ impl Session {
     fn do_list(&mut self, arg: Option<&str>, names_only: bool, r: &mut Ctrl) -> io::Result<()> {
         // Resolve the target dir: ignore `ls`-style flag args (e.g. "-la").
         let vpath = match arg {
-            Some(a) if !a.is_empty() && !a.starts_with('-') => match self.vfs.resolve(&self.cwd, a) {
+            Some(a) if !a.is_empty() && !a.starts_with('-') => match self.vfs.resolve(&self.cwd, a)
+            {
                 Some(v) => v,
                 None => return reply(r.get_mut(), 550, "invalid path"),
             },
@@ -269,14 +304,10 @@ impl Session {
         };
         // The virtual root `/` is the device-list level: list the known mount
         // points (VitaShell convention) rather than the jail root's contents.
-        let entries = if vfs::is_root(&vpath) {
-            vfs::device_entries()
-        } else {
-            let real = self.vfs.to_real(&vpath);
-            match vita_fs::read_dir(Path::new(&real)) {
-                Ok(e) => e,
-                Err(_) => return reply(r.get_mut(), 550, "no such directory"),
-            }
+        let real = self.vfs.to_real(&vpath);
+        let entries = match vita_fs::read_dir(Path::new(&real)) {
+            Ok(e) => e,
+            Err(_) => return reply(r.get_mut(), 550, "no such directory"),
         };
         let body = if names_only {
             listing::format_nlst(&entries)
@@ -292,6 +323,19 @@ impl Session {
             None => return reply(r.get_mut(), 550, "invalid path"),
         };
         let real = self.vfs.to_real(&vpath);
+        // `vita_fs::read` slurps the whole file into RAM, so the size cap must
+        // be enforced BEFORE the read — and it must fail closed. If the size
+        // can't be determined (parent dir unreadable / no matching entry), a
+        // real readable file would have listed via the same `read_dir` LIST
+        // uses, so an unknown size means not-found; reading it anyway risks an
+        // unbounded allocation that OOMs the whole runtime.
+        match file_size(&self.vfs, &vpath) {
+            Some(size) if size > self.max_transfer_bytes => {
+                return reply(r.get_mut(), 552, "file exceeds transfer limit");
+            }
+            Some(_) => {}
+            None => return reply(r.get_mut(), 550, "cannot stat file"),
+        }
         let bytes = match vita_fs::read(Path::new(&real)) {
             Ok(b) => b,
             Err(e) => {
@@ -321,24 +365,39 @@ impl Session {
         };
         reply(r.get_mut(), 150, "ready to receive")?;
         match listener.accept_timeout(DATA_ACCEPT_TIMEOUT) {
-            Ok((mut data, _)) => {
+            Ok((mut data, data_peer)) if data_peer.ip() == self.control_peer_ip => {
                 let _ = data.set_read_timeout(Some(DATA_RW_TIMEOUT));
-                let mut buf = Vec::new();
-                let recv = read_to_end(&mut data, &mut buf);
+                // Per-upload unique temp name (adjacent to `real`, so the rename
+                // stays intra-device) so two concurrent STORs of the same target
+                // never share a `.partial`. Mirrors ts-peerapi's `partial_seq`.
+                let id = self.partial_seq.fetch_add(1, Ordering::Relaxed);
+                let partial = format!("{real}.{id:016x}.upload.partial");
+                let recv = stream_to_file(&mut data, Path::new(&partial), self.max_transfer_bytes);
                 drop(data);
                 match recv {
-                    Ok(()) => match vita_fs::write(Path::new(&real), &buf) {
+                    Ok(_) => match vita_fs::rename(Path::new(&partial), Path::new(&real)) {
                         Ok(()) => reply(r.get_mut(), 226, "stored"),
                         Err(e) => {
-                            warn!(error = %e, "ts-ftp.stor.write");
+                            let _ = vita_fs::remove_file(Path::new(&partial));
+                            warn!(error = %e, "ts-ftp.stor.rename");
                             reply(r.get_mut(), 550, "write failed")
                         }
                     },
                     Err(e) => {
+                        let _ = vita_fs::remove_file(Path::new(&partial));
                         warn!(error = %e, "ts-ftp.stor.recv");
-                        reply(r.get_mut(), 426, "receive failed")
+                        let code = if e.kind() == io::ErrorKind::FileTooLarge {
+                            552
+                        } else {
+                            426
+                        };
+                        reply(r.get_mut(), code, "receive failed")
                     }
                 }
+            }
+            Ok((_data, data_peer)) => {
+                warn!(control = %self.control_peer_ip, %data_peer, "ts-ftp.data.peer_mismatch");
+                reply(r.get_mut(), 425, "data peer mismatch")
             }
             Err(_) => reply(r.get_mut(), 425, "data connection failed"),
         }
@@ -441,10 +500,14 @@ impl Session {
         };
         reply(r.get_mut(), 150, "opening data connection")?;
         match listener.accept_timeout(DATA_ACCEPT_TIMEOUT) {
-            Ok((mut data, peer)) => {
+            Ok((mut data, peer)) if peer.ip() == self.control_peer_ip => {
                 info!(%peer, want = bytes.len(), "ts-ftp.data.accepted");
                 let _ = data.set_write_timeout(Some(DATA_RW_TIMEOUT));
                 pump_data(data, r.get_mut(), bytes)
+            }
+            Ok((_data, peer)) => {
+                warn!(control = %self.control_peer_ip, %peer, "ts-ftp.data.peer_mismatch");
+                reply(r.get_mut(), 425, "data peer mismatch")
             }
             Err(_) => {
                 warn!("ts-ftp.data.accept_failed");
@@ -452,6 +515,29 @@ impl Session {
             }
         }
     }
+}
+
+fn credentials_match(
+    expected_user: &str,
+    expected_password: &str,
+    user: &str,
+    password: &str,
+) -> bool {
+    use subtle::ConstantTimeEq;
+    (expected_user.as_bytes().ct_eq(user.as_bytes())
+        & expected_password.as_bytes().ct_eq(password.as_bytes()))
+    .unwrap_u8()
+        == 1
+}
+
+fn file_size(vfs: &Vfs, vpath: &str) -> Option<u64> {
+    let (parent, name) = vfs::split_parent(vpath);
+    let real_parent = vfs.to_real(&parent);
+    vita_fs::read_dir(Path::new(&real_parent))
+        .ok()?
+        .into_iter()
+        .find(|entry| entry.name == name && !entry.is_dir)
+        .map(|entry| entry.size)
 }
 
 /// The data connection the transfer pump drives. It only needs to write the
@@ -509,16 +595,29 @@ fn pump_data<D: DataStream, C: Write>(mut data: D, ctrl: &mut C, bytes: &[u8]) -
     }
 }
 
-/// Read a data stream to EOF. A read timeout is treated as end-of-data
-/// (best-effort for v1; the client normally signals EOF by closing → `Ok(0)`).
-fn read_to_end(s: &mut TcpStream, out: &mut Vec<u8>) -> io::Result<()> {
+/// Receive a STOR body straight into a temporary file. This keeps the FTP
+/// data path bounded even when a peer sends a file far larger than RAM.
+fn stream_to_file(s: &mut TcpStream, path: &Path, max_bytes: u64) -> io::Result<u64> {
+    vita_fs::write(path, b"")?;
     let mut buf = [0u8; 8192];
+    let mut total = 0u64;
     loop {
         match s.read(&mut buf) {
-            Ok(0) => return Ok(()),
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
-                return Ok(())
+            Ok(0) => return Ok(total),
+            Ok(n) => {
+                total = total.saturating_add(n as u64);
+                if total > max_bytes {
+                    return Err(io::Error::from(io::ErrorKind::FileTooLarge));
+                }
+                vita_fs::append(path, &buf[..n])?;
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(e)
             }
             Err(e) => return Err(e),
         }
@@ -529,9 +628,48 @@ fn read_to_end(s: &mut TcpStream, out: &mut Vec<u8>) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::io::Cursor;
     use std::rc::Rc;
 
     type Log = Rc<RefCell<Vec<String>>>;
+
+    #[test]
+    fn read_line_rejects_a_line_without_newline_over_the_cap() {
+        // A newline-less stream longer than the cap must be rejected without
+        // buffering all of it (the pre-auth memory-exhaustion guard). `Cursor`
+        // never returns WouldBlock, so this exercises the `Take` bound rather
+        // than the idle-timeout path.
+        let payload = vec![b'A'; MAX_COMMAND_BYTES + 50];
+        let mut reader = BufReader::new(Cursor::new(payload));
+        let never = AtomicBool::new(false);
+        assert_eq!(read_line(&mut reader, &never), None);
+    }
+
+    #[test]
+    fn read_line_returns_a_normal_command() {
+        let mut reader = BufReader::new(Cursor::new(b"USER vita\r\nPASS x\r\n".to_vec()));
+        let never = AtomicBool::new(false);
+        assert_eq!(read_line(&mut reader, &never).as_deref(), Some("USER vita"));
+        assert_eq!(read_line(&mut reader, &never).as_deref(), Some("PASS x"));
+    }
+
+    #[test]
+    fn credentials_require_exact_user_and_password() {
+        assert!(credentials_match(
+            "vita",
+            "correct horse",
+            "vita",
+            "correct horse"
+        ));
+        assert!(!credentials_match(
+            "vita",
+            "correct horse",
+            "other",
+            "correct horse"
+        ));
+        assert!(!credentials_match("vita", "correct horse", "vita", "wrong"));
+        assert!(!credentials_match("vita", "correct horse", "vita", ""));
+    }
 
     /// Mock data connection: records `write`/`close` into a shared log so the
     /// pump's ordering (bytes → close → reply) is observable.
@@ -586,8 +724,14 @@ mod tests {
     #[test]
     fn pump_writes_bytes_then_closes_then_226() {
         let log: Log = Rc::new(RefCell::new(Vec::new()));
-        let data = MockData { log: log.clone(), fail: false };
-        let mut ctrl = MockCtrl { log: log.clone(), buf: Vec::new() };
+        let data = MockData {
+            log: log.clone(),
+            fail: false,
+        };
+        let mut ctrl = MockCtrl {
+            log: log.clone(),
+            buf: Vec::new(),
+        };
         let payload = vec![0u8; 286]; // the field-report SIZE
         pump_data(data, &mut ctrl, &payload).unwrap();
         assert_eq!(
@@ -604,8 +748,14 @@ mod tests {
     #[test]
     fn pump_closes_socket_and_reports_426_on_write_error() {
         let log: Log = Rc::new(RefCell::new(Vec::new()));
-        let data = MockData { log: log.clone(), fail: true };
-        let mut ctrl = MockCtrl { log: log.clone(), buf: Vec::new() };
+        let data = MockData {
+            log: log.clone(),
+            fail: true,
+        };
+        let mut ctrl = MockCtrl {
+            log: log.clone(),
+            buf: Vec::new(),
+        };
         pump_data(data, &mut ctrl, b"whatever").unwrap();
         assert_eq!(
             *log.borrow(),

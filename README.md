@@ -28,12 +28,14 @@ End-to-end, against either self-hosted Headscale or real `tailscale.com`:
 - Auth-key registration; persistent identity across launches
   (`machine.priv` / `node.priv` / `disco.priv` in `ux0:/data/tailscale-vita/`).
 - Noise IK + HTTP/2 control stream against `controlplane.tailscale.com:443`
-  (TLS) or Headscale (HTTP); long-poll MapResponse + NetInfo update; periodic
-  keepalive; exponential-backoff reconnect on disconnect.
+  (TLS), or an explicitly pinned Headscale HTTP endpoint; long-poll
+  MapResponse + NetInfo update; periodic keepalive; exponential-backoff
+  reconnect on disconnect.
 - DERP probe (28 regions), home-region pick, persistent DERP connection,
   NaCl-boxed Disco transport over DERP.
 - WireGuard data plane via vendored BoringTun, per-peer `Tunn`,
-  three-way lookup (`by_pubkey` / `by_idx` / `by_ip`).
+  three-way lookup (`by_pubkey` / `by_idx` / `by_ip`), authenticated-peer
+  source-address validation, and locally enforced IPv4 ACL packet filters.
 - smoltcp-backed in-tunnel netstack: TCP listen/accept, ICMP echo
   auto-reply, UDP, IPv4 (IPv6 in progress under M15-C).
 - Direct-path UDP via STUN-derived public endpoints + CallMeMaybe NAT
@@ -42,7 +44,8 @@ End-to-end, against either self-hosted Headscale or real `tailscale.com`:
   `/health`, `/netmap`, `/ping`, `/reconnect`.
 - Demo eboot runs Tailscale + an in-tunnel HTTP/1.1 server on port 8080.
   From any tailnet peer: `curl http://100.x.y.z:8080/` returns
-  `hello from vita`; `/api/<endpoint>` proxies the LocalAPI for verification.
+  `hello from vita`; `/api/{status,whois,health,netmap,ping}` provides
+  read-only LocalAPI diagnostics.
 
 ## What's intentionally out of scope (for now)
 
@@ -58,7 +61,7 @@ End-to-end, against either self-hosted Headscale or real `tailscale.com`:
 - IPv6 magicsock (partial under M15-C: outbound v6 send + dual STUN
   probes shipped; Vita home WiFi is v4-only so end-to-end v6 paths are
   unverified).
-- Taildrop, MagicDNS, exit-node routing, subnet-route advertisement.
+- MagicDNS, exit-node routing, subnet-route advertisement, and Tailnet Lock.
 - OAuth / interactive login. Auth key only, in `config.toml`.
 - UPnP / NAT-PMP / PCP port-mapping clients.
 - Configuration UI. The on-device dashboard (M17-A) is READ-ONLY —
@@ -170,9 +173,11 @@ On first launch a template is written; edit it and relaunch.
 # Auth key from `headscale preauthkeys create` or the Tailscale admin console.
 auth_key = "tskey-auth-..."
 
-# Control-plane URL. For Headscale dev: http://<host-ip>:8080
-# For Tailscale prod: https://controlplane.tailscale.com
+# Control-plane URL. HTTPS is required unless an HTTP server key is pinned.
 control_url = "https://controlplane.tailscale.com"
+
+# For a development-only HTTP Headscale endpoint, pin its Noise server key:
+# control_server_key = "mkey:<64 hex chars>"
 
 # Hostname the tailnet sees. Defaults to "vita".
 hostname = "vita"
@@ -189,18 +194,39 @@ localapi_port = 41112
 
 A jailbroken Vita has no OS-level app sandbox: every homebrew app runs at
 the same effective privilege. The load-bearing boundary for what the Vita
-can reach on your tailnet is **the tailnet ACL itself**, enforced
-server-side. Use tags (`--tags=tag:vita`) on the auth key and write an
-ACL that scopes the Vita to the peers/ports it actually needs.
+can reach on your tailnet is **the tailnet ACL itself**, distributed by the
+control plane and enforced locally before decrypted IPv4 reaches the
+netstack. Use tags (`--tags=tag:vita`) on the auth key and write an ACL that
+scopes the Vita to the peers/ports it actually needs. Because the filter is
+enforced locally, the ACL must **grant every port a running service listens
+on** or inbound connections are dropped before the service sees them: the FTP
+control port, its PASV data range (`passive_port_lo..passive_port_hi`, default
+`30000`–`30009`), the demo port (`8080`), and Taildrop's peerapi port. ICMP
+(ping) needs an ACL that permits it as well.
 
 Local LocalAPI tiers:
 
-- **Tier 1 (read-only):** `/status`, `/whois`, `/health`, `/netmap` —
-  exposed on loopback, unauthenticated.
-- **Tier 2 (peer-reach):** `/ping`, `/reconnect` — same exposure; effect
-  is constrained by the tailnet ACL.
-- **Tier 3 (identity):** `up`, `logout`, control-URL changes — **not
-  exposed on LocalAPI**. Config-file only; requires a relaunch.
+- **Tier 1 (read-only):** `/status`, `/whois`, `/health`, `/netmap`, and
+  `/ping` — exposed on loopback, unauthenticated GETs. `/ping` triggers a
+  peer liveness probe but returns no device state and is intentionally **not**
+  header-gated, so the demo's port-8080 proxy can offer it to tailnet peers.
+- **Tier 2 (mutations):** `/reconnect`, `up`, `down`, `logout`, and
+  `login-interactive` are POSTs that require `X-Tailscale-Vita-Local: 1`; the
+  bundled UI supplies it. The custom header blocks browser-based CSRF against
+  the loopback service; loopback remains a same-device trust boundary, not a
+  sandbox against other local homebrew.
+- **Tier 3 (configuration):** control-URL and credentials stay config-file
+  only; a relaunch is required.
+
+The built-in FTP server is disabled unless it has a non-empty configured
+username **and** password — an empty password makes the service refuse to
+start (and the on-device dashboard toggle only flips `enabled`; it cannot set
+a password, so a password must be added to `config.toml` by hand). It is
+jailed to its configured root by default; device paths require an explicit
+compatibility opt-in. Taildrop is disabled by default, uses a dedicated
+directory, and limits both individual and aggregate in-flight uploads. State
+is not encrypted at rest on a jailbroken Vita, and Tailnet Lock is not yet
+supported.
 
 Full reasoning in the
 [`vita_threat_model`](https://github.com/koalabuttz/tailscale-vita/blob/main/docs/) memory writeup.

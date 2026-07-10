@@ -1,4 +1,5 @@
 use crate::ControlError;
+use serde::de::Deserializer;
 
 /// Generate a fresh `(MachinePrivate, MachinePublic)` pair using snow's
 /// default-resolver RNG. Suitable for ephemeral M5 demos; the real
@@ -362,16 +363,63 @@ pub(crate) struct MapResponseWire {
     /// rather than replaces (a no-change frame carries an empty/`null`
     /// list, which must not blank the accumulated map). CapVer≥138
     /// serializes the empty case as JSON `null` — reuse `null_or_default`.
-    #[serde(
-        rename = "UserProfiles",
-        default,
-        deserialize_with = "null_or_default"
-    )]
+    #[serde(rename = "UserProfiles", default, deserialize_with = "null_or_default")]
     pub user_profiles: Vec<UserProfileWire>,
     #[serde(rename = "ControlTime", default)]
     pub control_time: Option<String>,
-    // DNSConfig, PacketFilter, ClientVersion, etc. are parsed-and-dropped
-    // by serde (no fields). v1 doesn't consume them.
+    /// `PacketFilter` is destination-side access control. A nil/absent value
+    /// in a map delta means unchanged (tailcfg map-version contract).
+    #[serde(
+        rename = "PacketFilter",
+        default,
+        deserialize_with = "deserialize_packet_filter"
+    )]
+    pub packet_filter: PacketFilterWire,
+    // DNSConfig, ClientVersion, etc. are parsed-and-dropped by serde.
+}
+
+#[derive(Default, Debug, Clone)]
+pub(crate) enum PacketFilterWire {
+    /// Field omitted from this delta frame; retain the previous policy.
+    #[default]
+    Missing,
+    Rules(Vec<FilterRuleWire>),
+}
+
+fn deserialize_packet_filter<'de, D>(d: D) -> Result<PacketFilterWire, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<Vec<FilterRuleWire>>::deserialize(d)?
+        .map(PacketFilterWire::Rules)
+        .unwrap_or(PacketFilterWire::Missing))
+}
+
+/// Wire form of tailcfg.FilterRule after control has expanded policy aliases.
+#[derive(Deserialize, Default, Debug, Clone)]
+pub(crate) struct FilterRuleWire {
+    #[serde(rename = "SrcIPs", default)]
+    pub src_ips: Vec<String>,
+    #[serde(rename = "DstPorts", default)]
+    pub dst_ports: Vec<NetPortRangeWire>,
+    #[serde(rename = "IPProto", default)]
+    pub ip_proto: Vec<u8>,
+}
+
+#[derive(Deserialize, Default, Debug, Clone)]
+pub(crate) struct NetPortRangeWire {
+    #[serde(rename = "IP", default)]
+    pub ip: String,
+    #[serde(rename = "Ports", default)]
+    pub ports: PortRangeWire,
+}
+
+#[derive(Deserialize, Default, Debug, Clone)]
+pub(crate) struct PortRangeWire {
+    #[serde(rename = "First", default)]
+    pub first: u16,
+    #[serde(rename = "Last", default)]
+    pub last: u16,
 }
 
 /// Mirrors `tailcfg.UserProfile` — the display identity for a user that

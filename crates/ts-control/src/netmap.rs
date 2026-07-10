@@ -21,7 +21,10 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use vita_log::{debug, info, warn};
 
-use crate::types::{DerpMapWire, MapResponseWire, NodeWire, PeerChangeWire, UserProfileWire};
+use crate::types::{
+    DerpMapWire, FilterRuleWire, MapResponseWire, NodeWire, PacketFilterWire, PeerChangeWire,
+    UserProfileWire,
+};
 
 /// 32 raw bytes — the binary form of a `nodekey:<hex>` value.
 pub type NodeKeyBytes = [u8; 32];
@@ -30,6 +33,28 @@ pub type NodeKeyBytes = [u8; 32];
 pub struct AllowedIp {
     pub addr: Ipv4Addr,
     pub prefix: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetPortRange {
+    pub ip: AllowedIp,
+    pub port_first: u16,
+    pub port_last: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterRule {
+    pub src_ips: Vec<AllowedIp>,
+    pub dst_ports: Vec<NetPortRange>,
+    /// Empty means every IP protocol.
+    pub ip_protocols: Vec<u8>,
+}
+
+/// `None` in [`NetMap`] means the first policy-bearing MapResponse has not
+/// arrived. Consumers must treat that state as deny-all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PacketFilter {
+    Rules(Vec<FilterRule>),
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +108,7 @@ pub struct UserProfile {
 #[derive(Default)]
 pub struct NetMap {
     pub our_addrs: Vec<AllowedIp>,
+    pub packet_filter: Option<PacketFilter>,
     /// M15-B: tags the server has assigned to our node, computed from
     /// the auth-key + tailnet ACL policy. Empty when the auth-key
     /// wasn't tagged — runtime emits a warning on first MapResponse
@@ -129,6 +155,7 @@ pub struct NetMapDelta {
     pub removed: Vec<NodeKeyBytes>,
     pub rekeyed: Vec<RekeyedPeer>,
     pub our_addrs_changed: bool,
+    pub packet_filter_changed: bool,
     pub derp_map_changed: bool,
     pub patches_applied: usize,
     pub patches_skipped_unknown_node_id: usize,
@@ -216,6 +243,22 @@ impl NetMap {
                 "control.map.derp_map.set"
             );
             delta.derp_map_changed = true;
+        }
+
+        match &resp.packet_filter {
+            PacketFilterWire::Missing => {}
+            PacketFilterWire::Rules(rules) => {
+                let next =
+                    PacketFilter::Rules(rules.iter().filter_map(filter_rule_from_wire).collect());
+                if self.packet_filter.as_ref() != Some(&next) {
+                    let rule_count = match &next {
+                        PacketFilter::Rules(rules) => rules.len(),
+                    };
+                    info!(rule_count, "control.map.packet_filter.set");
+                    self.packet_filter = Some(next);
+                    delta.packet_filter_changed = true;
+                }
+            }
         }
 
         if let Some(peers) = &resp.peers {
@@ -342,6 +385,45 @@ fn user_profile_from_wire(w: &UserProfileWire) -> UserProfile {
         login_name: w.login_name.clone(),
         display_name: w.display_name.clone(),
     }
+}
+
+fn filter_rule_from_wire(wire: &FilterRuleWire) -> Option<FilterRule> {
+    let src_ips = wire
+        .src_ips
+        .iter()
+        .filter_map(|src| parse_filter_cidr(src))
+        .collect::<Vec<_>>();
+    let dst_ports = wire
+        .dst_ports
+        .iter()
+        .filter_map(|dst| {
+            let ip = parse_filter_cidr(&dst.ip)?;
+            (dst.ports.first <= dst.ports.last).then_some(NetPortRange {
+                ip,
+                port_first: dst.ports.first,
+                port_last: dst.ports.last,
+            })
+        })
+        .collect::<Vec<_>>();
+    // A malformed or IPv6-only rule must not accidentally become an allow.
+    (!src_ips.is_empty() && !dst_ports.is_empty()).then_some(FilterRule {
+        src_ips,
+        dst_ports,
+        ip_protocols: wire.ip_proto.clone(),
+    })
+}
+
+fn parse_filter_cidr(s: &str) -> Option<AllowedIp> {
+    if s == "*" {
+        return Some(AllowedIp {
+            addr: Ipv4Addr::UNSPECIFIED,
+            prefix: 0,
+        });
+    }
+    if let Ok(addr) = s.parse::<Ipv4Addr>() {
+        return Some(AllowedIp { addr, prefix: 32 });
+    }
+    parse_ipv4_cidr(s)
 }
 
 fn apply_patch_fields(peer: &mut PeerSnapshot, patch: &PeerChangeWire) {
@@ -548,7 +630,10 @@ mod tests {
         let mut nm = NetMap::default();
         let resp = MapResponseWire {
             seq: 1,
-            peers: Some(vec![node(1, 0x11, "100.64.0.2"), node(2, 0x22, "100.64.0.3")]),
+            peers: Some(vec![
+                node(1, 0x11, "100.64.0.2"),
+                node(2, 0x22, "100.64.0.3"),
+            ]),
             ..Default::default()
         };
         let delta = nm.apply(&resp);
@@ -562,7 +647,10 @@ mod tests {
     fn apply_full_peers_replace_drops_old() {
         let mut nm = NetMap::default();
         nm.apply(&MapResponseWire {
-            peers: Some(vec![node(1, 0x11, "100.64.0.2"), node(2, 0x22, "100.64.0.3")]),
+            peers: Some(vec![
+                node(1, 0x11, "100.64.0.2"),
+                node(2, 0x22, "100.64.0.3"),
+            ]),
             ..Default::default()
         });
         let delta = nm.apply(&MapResponseWire {
@@ -594,7 +682,10 @@ mod tests {
     fn apply_peers_removed_drops() {
         let mut nm = NetMap::default();
         nm.apply(&MapResponseWire {
-            peers: Some(vec![node(1, 0x11, "100.64.0.2"), node(2, 0x22, "100.64.0.3")]),
+            peers: Some(vec![
+                node(1, 0x11, "100.64.0.2"),
+                node(2, 0x22, "100.64.0.3"),
+            ]),
             ..Default::default()
         });
         let delta = nm.apply(&MapResponseWire {
@@ -904,6 +995,54 @@ mod tests {
         });
         // Older seqs don't reset us.
         assert_eq!(nm.last_seq, 5);
+    }
+
+    #[test]
+    fn packet_filter_parses_and_absent_delta_retains_it() {
+        let mut nm = NetMap::default();
+        let initial: MapResponseWire = serde_json::from_slice(
+            br#"{
+            "PacketFilter":[{
+                "SrcIPs":["100.64.0.2/32"],
+                "DstPorts":[{"IP":"100.64.0.1","Ports":{"First":8080,"Last":8080}}],
+                "IPProto":[6]
+            }]
+        }"#,
+        )
+        .unwrap();
+        let delta = nm.apply(&initial);
+        assert!(delta.packet_filter_changed);
+        assert_eq!(
+            nm.packet_filter,
+            Some(PacketFilter::Rules(vec![FilterRule {
+                src_ips: vec![AllowedIp {
+                    addr: "100.64.0.2".parse().unwrap(),
+                    prefix: 32
+                }],
+                dst_ports: vec![NetPortRange {
+                    ip: AllowedIp {
+                        addr: "100.64.0.1".parse().unwrap(),
+                        prefix: 32
+                    },
+                    port_first: 8080,
+                    port_last: 8080,
+                }],
+                ip_protocols: vec![6],
+            }]))
+        );
+
+        let delta = nm.apply(&MapResponseWire::default());
+        assert!(!delta.packet_filter_changed);
+        assert!(matches!(nm.packet_filter, Some(PacketFilter::Rules(_))));
+    }
+
+    #[test]
+    fn packet_filter_null_means_unchanged() {
+        let mut nm = NetMap::default();
+        let wire: MapResponseWire = serde_json::from_slice(br#"{"PacketFilter":null}"#).unwrap();
+        let delta = nm.apply(&wire);
+        assert!(!delta.packet_filter_changed);
+        assert_eq!(nm.packet_filter, None);
     }
 
     #[test]

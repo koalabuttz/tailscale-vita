@@ -15,9 +15,20 @@ use crate::error::ConfigError;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
-    /// Headscale URL — e.g. "http://192.168.x.x:8080" for a LAN dev
-    /// Headscale, or "https://controlplane.tailscale.com" for prod.
+    /// HTTPS control URL, or a deliberately pinned HTTP development server.
     pub control_url: String,
+
+    /// Static Noise machine public key (`mkey:<hex>`) required when
+    /// `control_url` uses cleartext HTTP. It prevents the otherwise circular
+    /// "fetch the key from the party we are trying to authenticate" bootstrap.
+    #[serde(default)]
+    pub control_server_key: Option<String>,
+
+    /// Development-only escape hatch for legacy HTTP Headscale setups. Do not
+    /// enable on a shared or hostile LAN: an attacker can impersonate control
+    /// and capture the registration auth key.
+    #[serde(default)]
+    pub insecure_allow_http_control: bool,
 
     /// Auth key. **Empty (the default) = interactive QR login** (M18):
     /// register with the `Auth` struct omitted, show the returned AuthURL
@@ -177,7 +188,16 @@ const TEMPLATE: &str = r#"# tailscale-vita demo config
 # Edit this file in place after the demo writes the template. Required
 # fields: `control_url` and `auth_key`. Everything else has defaults.
 
-control_url = "http://HEADSCALE_HOST_IP:8080"
+# Production: HTTPS validates the control server certificate and Noise key.
+control_url = "https://controlplane.tailscale.com"
+
+# For a development Headscale instance that only serves HTTP, pin its Noise
+# server key (the `mkey:...` returned by `/key`) here. HTTP without this pin
+# is refused. `insecure_allow_http_control = true` exists only as a temporary
+# migration escape hatch and must never be used on an untrusted LAN.
+# control_url = "http://HEADSCALE_HOST_IP:8080"
+# control_server_key = "mkey:<64 hex chars>"
+# insecure_allow_http_control = false
 
 # Leave empty to log in interactively (M18): on first run the Vita
 # shows a QR code + URL on screen — scan it with your phone and approve
@@ -226,16 +246,24 @@ capver              = 138
 want_running = true
 
 # FTP server on the tailnet IP — reach the Vita's files from any network
-# with a standard FTP client. Off by default: it exposes the filesystem,
-# gated only by your tailnet ACL. Plaintext is fine — WireGuard encrypts
-# the tunnel. `root` jails the client; `..` cannot escape above it.
+# with a standard FTP client. Off by default. Set a strong local password
+# before enabling; the service refuses to start with an empty password.
+# `root` is a real jail by default. `allow_device_paths` is an explicit,
+# dangerous compatibility escape hatch for VitaShell-style `/ur0:/...` paths.
+# NOTE: the tailnet ACL is enforced locally, so your ACL must grant BOTH
+# `port` AND the passive data range (`passive_port_lo..passive_port_hi`) to
+# the peers you connect from, or transfers hang at `425` even after login.
 [ftp]
 enabled         = false
 port            = 21
 root            = "ux0:"
+username        = "vita"
+password        = ""       # required when enabled; never logged
+allow_device_paths = false
 read_only       = false
 passive_port_lo = 30000
 passive_port_hi = 30009
+max_transfer_bytes = 33554432 # 32 MiB per STOR/RETR
 
 # Taildrop receiver (peerapi) on the tailnet IP. When enabled, run
 # `tailscale file cp <file> vita:` from any device on your tailnet and the
@@ -297,7 +325,7 @@ mod tests {
     #[test]
     fn template_round_trip() {
         let cfg: Config = toml::from_str(TEMPLATE).unwrap();
-        assert_eq!(cfg.control_url, "http://HEADSCALE_HOST_IP:8080");
+        assert_eq!(cfg.control_url, "https://controlplane.tailscale.com");
         assert_eq!(cfg.auth_key, "");
         assert_eq!(cfg.hostname, "vita");
         assert_eq!(cfg.demo_port, 8080);
@@ -321,6 +349,8 @@ mod tests {
     fn host_authority_strips_scheme() {
         let cfg = Config {
             control_url: "http://192.0.2.1:8080/".into(),
+            control_server_key: None,
+            insecure_allow_http_control: false,
             auth_key: String::new(),
             hostname: "v".into(),
             log_level: "info".into(),
@@ -344,6 +374,8 @@ mod tests {
     fn host_authority_handles_https() {
         let cfg = Config {
             control_url: "https://controlplane.tailscale.com".into(),
+            control_server_key: None,
+            insecure_allow_http_control: false,
             auth_key: String::new(),
             hostname: "v".into(),
             log_level: "info".into(),

@@ -33,8 +33,9 @@ pub enum NameError {
 /// tolerates up to 255; we cap there.
 const MAX_NAME_BYTES: usize = 255;
 
-/// Cap on collision-rename attempts before we accept an overwrite. 100 is
-/// far more `foo (N).ext` siblings than any real drop dir accumulates.
+/// Cap on collision-rename attempts. 100 is far more `foo (N).ext` siblings
+/// than any real drop dir accumulates; exhausting it rejects the upload
+/// rather than risking an overwrite.
 const MAX_COLLISION: u32 = 100;
 
 /// Percent-decode `raw` exactly ONCE, then validate it's a safe bare
@@ -114,22 +115,21 @@ fn hex_val(b: u8) -> Option<u8> {
 /// `existing`, use it as-is; otherwise insert ` (1)`, ` (2)`, … before the
 /// extension (`foo.txt` → `foo (1).txt`, `foo` → `foo (1)`, `.bashrc` →
 /// `.bashrc (1)` because a leading dot is not an extension). Caps at
-/// [`MAX_COLLISION`]; if every candidate is taken it returns the last one
-/// (accepting an overwrite beats rejecting the drop). Pure: `existing` is
-/// the current dir contents, so this is testable without vita-fs.
-pub fn next_free_name(base: &str, existing: &HashSet<String>) -> String {
+/// [`MAX_COLLISION`]; if every candidate is taken it returns `None` rather
+/// than overwriting an existing file. Pure: `existing` is the current dir
+/// contents, so this is testable without vita-fs.
+pub fn next_free_name(base: &str, existing: &HashSet<String>) -> Option<String> {
     if !existing.contains(base) {
-        return base.to_string();
+        return Some(base.to_string());
     }
     let (stem, ext) = split_stem_ext(base);
-    let mut candidate = String::new();
     for n in 1..=MAX_COLLISION {
-        candidate = format!("{stem} ({n}){ext}");
+        let candidate = format!("{stem} ({n}){ext}");
         if !existing.contains(&candidate) {
-            return candidate;
+            return Some(candidate);
         }
     }
-    candidate
+    None
 }
 
 /// Split `name` into `(stem, ext)` where `ext` includes its leading dot,
@@ -165,23 +165,23 @@ mod tests {
             ("", NameError::Empty),
             (".", NameError::DotOrDotDot),
             ("..", NameError::DotOrDotDot),
-            ("%2e%2e", NameError::DotOrDotDot),      // encoded ".."
-            ("..%2F", NameError::Separator),          // traversal
-            ("..%2f", NameError::Separator),          // traversal (lc hex)
-            ("foo%2Fbar", NameError::Separator),      // encoded slash
-            ("foo/bar", NameError::Separator),        // literal slash
-            ("foo%5Cbar", NameError::Separator),      // encoded backslash
-            ("foo\\bar", NameError::Separator),       // literal backslash
-            ("ux0:", NameError::Separator),           // device token
-            ("ux0%3Adata", NameError::Separator),     // encoded colon
-            ("a%00b", NameError::Control),            // NUL
-            ("a%09b", NameError::Control),            // TAB (< 0x20)
-            ("a%1Fb", NameError::Control),            // unit separator
-            ("a%7Fb", NameError::Control),            // DEL
-            (&"a".repeat(256), NameError::TooLong),   // overlong
-            ("%zz", NameError::BadEncoding),          // non-hex escape
-            ("%2", NameError::BadEncoding),           // truncated escape
-            ("ab%", NameError::BadEncoding),          // trailing percent
+            ("%2e%2e", NameError::DotOrDotDot),     // encoded ".."
+            ("..%2F", NameError::Separator),        // traversal
+            ("..%2f", NameError::Separator),        // traversal (lc hex)
+            ("foo%2Fbar", NameError::Separator),    // encoded slash
+            ("foo/bar", NameError::Separator),      // literal slash
+            ("foo%5Cbar", NameError::Separator),    // encoded backslash
+            ("foo\\bar", NameError::Separator),     // literal backslash
+            ("ux0:", NameError::Separator),         // device token
+            ("ux0%3Adata", NameError::Separator),   // encoded colon
+            ("a%00b", NameError::Control),          // NUL
+            ("a%09b", NameError::Control),          // TAB (< 0x20)
+            ("a%1Fb", NameError::Control),          // unit separator
+            ("a%7Fb", NameError::Control),          // DEL
+            (&"a".repeat(256), NameError::TooLong), // overlong
+            ("%zz", NameError::BadEncoding),        // non-hex escape
+            ("%2", NameError::BadEncoding),         // truncated escape
+            ("ab%", NameError::BadEncoding),        // trailing percent
         ];
         for (input, want) in reject {
             assert_eq!(
@@ -196,33 +196,45 @@ mod tests {
     fn next_free_name_collision_walk() {
         let mut ex: HashSet<String> = HashSet::new();
         // No collision → identity.
-        assert_eq!(next_free_name("foo.txt", &ex), "foo.txt");
+        assert_eq!(next_free_name("foo.txt", &ex).as_deref(), Some("foo.txt"));
         // First collision → " (1)" before the extension.
         ex.insert("foo.txt".into());
-        assert_eq!(next_free_name("foo.txt", &ex), "foo (1).txt");
+        assert_eq!(
+            next_free_name("foo.txt", &ex).as_deref(),
+            Some("foo (1).txt")
+        );
         // Walks to the first gap.
         ex.insert("foo (1).txt".into());
         ex.insert("foo (2).txt".into());
-        assert_eq!(next_free_name("foo.txt", &ex), "foo (3).txt");
+        assert_eq!(
+            next_free_name("foo.txt", &ex).as_deref(),
+            Some("foo (3).txt")
+        );
         // No extension.
         ex.insert("bar".into());
-        assert_eq!(next_free_name("bar", &ex), "bar (1)");
+        assert_eq!(next_free_name("bar", &ex).as_deref(), Some("bar (1)"));
         // Dotfile: the leading dot is not an extension.
         ex.insert(".bashrc".into());
-        assert_eq!(next_free_name(".bashrc", &ex), ".bashrc (1)");
+        assert_eq!(
+            next_free_name(".bashrc", &ex).as_deref(),
+            Some(".bashrc (1)")
+        );
         // Double extension: only the LAST dot splits.
         ex.insert("a.tar.gz".into());
-        assert_eq!(next_free_name("a.tar.gz", &ex), "a.tar (1).gz");
+        assert_eq!(
+            next_free_name("a.tar.gz", &ex).as_deref(),
+            Some("a.tar (1).gz")
+        );
     }
 
     #[test]
-    fn next_free_name_caps_at_max_and_accepts_overwrite() {
+    fn next_free_name_caps_at_max_without_overwrite() {
         let mut ex: HashSet<String> = HashSet::new();
         ex.insert("x.bin".into());
         for n in 1..=MAX_COLLISION {
             ex.insert(format!("x ({n}).bin"));
         }
-        // Every candidate taken → returns the last attempt (overwrite).
-        assert_eq!(next_free_name("x.bin", &ex), format!("x ({MAX_COLLISION}).bin"));
+        // Every candidate taken → reject rather than overwrite.
+        assert_eq!(next_free_name("x.bin", &ex), None);
     }
 }

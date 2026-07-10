@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lints]
+workspace = true
+
 # M12: Tailscale's "disco" protocol — NaCl-box encrypted Ping/Pong/CallMeMaybe
 # packets sent over UDP for direct-path liveness probing. Lifted from
 # tailscale-rs's `ts_disco_protocol` (~95% complete reference implementation),

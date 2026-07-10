@@ -21,15 +21,15 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use vita_thread::{self as thread, JoinHandle};
 use std::time::{Duration, Instant};
+use vita_thread::{self as thread, JoinHandle};
 
 use bytes::Bytes;
 use http::Method;
 use vita_log::{debug, info, warn};
 
 use crate::http2::{ChunkOutcome, Http2Conn};
-use crate::netmap::{NetMap, NetMapDelta};
+use crate::netmap::{NetMap, NetMapDelta, PacketFilter};
 use crate::persist::atomic_write;
 use crate::types::{
     DiscoPublic, MapHostinfoWire, MapRequestWire, MapResponseWire, NetInfoWire, NodePublic,
@@ -111,6 +111,8 @@ pub struct NetMapSnapshot {
     pub our_addrs: Vec<crate::netmap::AllowedIp>,
     pub peer_count: usize,
     pub derp_region_count: usize,
+    /// `None` until the control plane has sent the first PacketFilter.
+    pub packet_filter: Option<PacketFilter>,
     pub delta: NetMapDelta,
 }
 
@@ -175,10 +177,7 @@ impl MapClient {
             Method::POST,
             "/machine/map",
             &body,
-            &[
-                ("content-type", "application/json"),
-                ("ts-lb", &lb),
-            ],
+            &[("content-type", "application/json"), ("ts-lb", &lb)],
             &authority,
         )?;
 
@@ -222,10 +221,7 @@ impl MapClient {
             endpoint_types.len(),
             "Endpoints and EndpointTypes must be parallel arrays"
         );
-        info!(
-            count = endpoints.len(),
-            "control.map.local_endpoints.set"
-        );
+        info!(count = endpoints.len(), "control.map.local_endpoints.set");
         self.local_endpoints = endpoints;
         self.local_endpoint_types = endpoint_types;
     }
@@ -269,9 +265,7 @@ impl MapClient {
             persist_last_seq(&self.state_dir, delta.seq)?;
         }
         // Persist session_handle if the server assigned/changed one.
-        if !self.netmap.session_handle.is_empty()
-            && self.netmap.session_handle != prev_handle
-        {
+        if !self.netmap.session_handle.is_empty() && self.netmap.session_handle != prev_handle {
             persist_session_handle(&self.state_dir, &self.netmap.session_handle)?;
         }
 
@@ -291,6 +285,7 @@ impl MapClient {
             our_addrs: self.netmap.our_addrs.clone(),
             peer_count: self.netmap.peers.len(),
             derp_region_count: self.netmap.derp_regions.len(),
+            packet_filter: self.netmap.packet_filter.clone(),
             delta,
         }))
     }
@@ -328,10 +323,7 @@ impl MapClient {
             Method::POST,
             "/machine/map",
             &body,
-            &[
-                ("content-type", "application/json"),
-                ("ts-lb", &lb),
-            ],
+            &[("content-type", "application/json"), ("ts-lb", &lb)],
             &self.authority,
         )?;
         if head.status != 200 {
@@ -433,7 +425,10 @@ impl MapClient {
         let mut body_map = serde_json::Map::new();
         body_map.insert("Version".into(), json!(MAP_VERSION));
         body_map.insert("NodeKey".into(), json!(self.node_pub.to_nodekey_string()));
-        body_map.insert("DiscoKey".into(), json!(self.disco_pub.to_discokey_string()));
+        body_map.insert(
+            "DiscoKey".into(),
+            json!(self.disco_pub.to_discokey_string()),
+        );
         body_map.insert("Hostinfo".into(), serde_json::Value::Object(hostinfo));
         if !all_endpoints.is_empty() {
             body_map.insert("Endpoints".into(), json!(all_endpoints));
@@ -456,10 +451,7 @@ impl MapClient {
             Method::POST,
             "/machine/map",
             &body,
-            &[
-                ("content-type", "application/json"),
-                ("ts-lb", &lb),
-            ],
+            &[("content-type", "application/json"), ("ts-lb", &lb)],
             &self.authority,
         )?;
         if resp.status != 200 {
@@ -473,10 +465,7 @@ impl MapClient {
                 body: "/machine/map netinfo update non-200".into(),
             });
         }
-        info!(
-            resp_len = resp.body.len(),
-            "control.map.netinfo_update.ok"
-        );
+        info!(resp_len = resp.body.len(), "control.map.netinfo_update.ok");
         Ok(())
     }
 
@@ -830,10 +819,7 @@ impl Drop for GzipWorker {
     }
 }
 
-fn run_gzip_worker(
-    rx: Receiver<Vec<u8>>,
-    tx: Sender<Result<Vec<u8>, String>>,
-) {
+fn run_gzip_worker(rx: Receiver<Vec<u8>>, tx: Sender<Result<Vec<u8>, String>>) {
     let reader = ChannelReader {
         rx,
         leftover: Vec::new(),

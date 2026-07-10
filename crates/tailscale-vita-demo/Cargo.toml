@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 # M10: demo links the public Runtime API. The lower-level
 # ts-control/ts-derp/wg-engine crates are no longer direct deps.

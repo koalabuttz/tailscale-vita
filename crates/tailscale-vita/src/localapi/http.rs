@@ -25,15 +25,23 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// any reasonable client sends.
 const MAX_HEADERS: usize = 32;
 
-/// Parsed LocalAPI request. Only the fields we need: method, path,
-/// query, body. Headers are deliberately discarded — LocalAPI is
-/// loopback-only and doesn't need to consult Host, Auth, etc.
+/// Header required on mutating endpoints. It is deliberately a custom header:
+/// an ordinary HTML form cannot attach it and browser fetch/XHR must preflight,
+/// which prevents browser-based CSRF against the loopback service. It is not a
+/// privilege boundary against local homebrew, which shares the Vita's trust
+/// domain by design.
+pub const ACTION_HEADER: &str = "x-tailscale-vita-local";
+pub const ACTION_HEADER_VALUE: &str = "1";
+
+/// Parsed LocalAPI request. Only the fields we need: method, path, query,
+/// body, and whether the CSRF-protection header was supplied.
 pub struct Request {
     pub method: String,
     pub path: String,
     pub query: String,
     /// Request body bytes after the `\r\n\r\n` header terminator.
     pub body: Vec<u8>,
+    pub has_action_header: bool,
 }
 
 /// Failure modes when reading a request. The server treats parse
@@ -66,9 +74,7 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, RequestError> {
         let n = match stream.read(&mut tmp) {
             Ok(0) => return Err(RequestError::BadRequest("eof before headers")),
             Ok(n) => n,
-            Err(e)
-                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-            {
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
                 return Err(RequestError::BadRequest("read timeout"));
             }
             Err(e) => return Err(e.into()),
@@ -114,6 +120,10 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, RequestError> {
         .and_then(|h| std::str::from_utf8(h.value).ok())
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
+    let has_action_header = req.headers.iter().any(|h| {
+        h.name.eq_ignore_ascii_case(ACTION_HEADER)
+            && std::str::from_utf8(h.value).is_ok_and(|value| value.trim() == ACTION_HEADER_VALUE)
+    });
     let body_start = header_end + 4;
     let already_have = buf.len().saturating_sub(body_start);
     let mut body = buf[body_start..].to_vec();
@@ -128,10 +138,7 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, RequestError> {
             let n = match stream.read(&mut tmp[..cap]) {
                 Ok(0) => return Err(RequestError::BadRequest("eof before body end")),
                 Ok(n) => n,
-                Err(e)
-                    if e.kind() == ErrorKind::WouldBlock
-                        || e.kind() == ErrorKind::TimedOut =>
-                {
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
                     return Err(RequestError::BadRequest("body read timeout"));
                 }
                 Err(e) => return Err(e.into()),
@@ -145,12 +152,19 @@ pub fn read_request(stream: &mut TcpStream) -> Result<Request, RequestError> {
         body.truncate(content_length);
     }
 
-    trace!(method, path, query_len = query.len(), body_len = body.len(), "localapi.req");
+    trace!(
+        method,
+        path,
+        query_len = query.len(),
+        body_len = body.len(),
+        "localapi.req"
+    );
     Ok(Request {
         method,
         path,
         query,
         body,
+        has_action_header,
     })
 }
 
@@ -178,11 +192,7 @@ pub fn write_json_response(
 }
 
 /// Write a small error response with a JSON body `{error: msg}`.
-pub fn write_error(
-    stream: &mut TcpStream,
-    status: u16,
-    msg: &str,
-) -> std::io::Result<()> {
+pub fn write_error(stream: &mut TcpStream, status: u16, msg: &str) -> std::io::Result<()> {
     // Hand-rolled JSON to avoid pulling serde_json for a 1-key object.
     // (We use serde_json elsewhere but trivial-error path can be tight.)
     let escaped = escape_json_string(msg);
@@ -200,6 +210,7 @@ fn reason_phrase(status: u16) -> &'static str {
         202 => "Accepted",
         204 => "No Content",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",

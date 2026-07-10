@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lints]
+workspace = true
+
 # ts-peerapi: Taildrop *receive* over the tailnet. Binds a netstack
 # TcpListener on the node's tailnet IP and serves the peerapi PUT surface
 # (`PUT /v0/put/<name>`), streaming incoming file bodies straight to the

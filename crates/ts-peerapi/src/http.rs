@@ -124,7 +124,12 @@ pub fn read_head<R: Read>(r: &mut R) -> Result<RequestHead, HttpError> {
         .and_then(|s| s.trim().parse::<u64>().ok());
     let leftover = buf[header_end + 4..].to_vec();
 
-    trace!(method, path, cl = content_length.unwrap_or(0), "peerapi.head");
+    trace!(
+        method,
+        path,
+        cl = content_length.unwrap_or(0),
+        "peerapi.head"
+    );
     Ok(RequestHead {
         method,
         path,
@@ -193,6 +198,7 @@ fn reason_phrase(status: u16) -> &'static str {
         200 => "OK",
         400 => "Bad Request",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         411 => "Length Required",
         413 => "Payload Too Large",
         500 => "Internal Server Error",
@@ -212,7 +218,8 @@ mod tests {
 
     #[test]
     fn read_head_parses_put_and_strips_query() {
-        let raw = b"PUT /v0/put/hi.txt?offset=0 HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
+        let raw =
+            b"PUT /v0/put/hi.txt?offset=0 HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello";
         let mut cur = Cursor::new(raw.to_vec());
         let head = read_head(&mut cur).unwrap();
         assert_eq!(head.method, "PUT");
