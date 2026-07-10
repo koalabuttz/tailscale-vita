@@ -35,8 +35,12 @@
 #include <string.h>
 
 /* BGFTP's proven bgapp heap size. If the gdd partition can't grant this,
- * crt0's heap init fails and the memory probes below will say so. */
-unsigned int _newlib_heap_size_user = 14 * 1024 * 1024;
+ * crt0's heap init fails BEFORE main() — silent death, no log, no core
+ * (round-2 signature). SPIKE_HEAP_MB=1 builds the bisect variant. */
+#ifndef SPIKE_HEAP_MB
+#define SPIKE_HEAP_MB 14
+#endif
+unsigned int _newlib_heap_size_user = SPIKE_HEAP_MB * 1024 * 1024;
 
 #define LOG_PATH  "ux0:data/tailscale-vita/bgapp-spike.log"
 #define ECHO_PORT 31338
@@ -183,7 +187,7 @@ int main(void)
 {
     sceIoMkdir("ux0:data", 0777);
     sceIoMkdir("ux0:data/tailscale-vita", 0777);
-    slog("bgapp: ALIVE (gdd process started)");
+    slog("bgapp: ALIVE (gdd process started, heap=%uMB)", SPIKE_HEAP_MB);
 
     int rc = sceSysmoduleLoadModule(SCE_SYSMODULE_NOTIFICATION_UTIL);
     slog("bgapp: load NOTIFICATION_UTIL -> 0x%08X", (unsigned)rc);
