@@ -24,7 +24,8 @@ target_link_libraries(spike_launcher
   SceIofilemgr_stub
   SceProcessmgr_stub
   SceLibKernel_stub
-  SceKernelThreadMgr_stub)
+  SceKernelThreadMgr_stub
+  SceNet_stub)
 vita_create_self(eboot.bin spike_launcher UNSAFE MEMSIZE 4096)
 
 # --- background service (eboot2.bin, gdd) ----------------------------

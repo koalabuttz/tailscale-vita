@@ -16,6 +16,13 @@
  *                   the console stays awake (screen may turn off). NOTE:
  *                   the console will NOT auto-sleep while this runs; peel
  *                   the LiveArea card to stop it.
+ *   5. XPROC      — Phase A of PLAN-M21: TCP listener on 127.0.0.1:41112
+ *                   (exactly where LocalAPI binds). The launcher (gdc, a
+ *                   SEPARATE process with its OWN sceNet context) connects
+ *                   and GETs. Today LocalAPI loopback is only proven
+ *                   in-process — one sceNetInit instance may short-circuit
+ *                   loopback in the library without touching the kernel
+ *                   stack. This proves (or kills) dashboard↔daemon IPC.
  *
  * Log: ux0:data/tailscale-vita/bgapp-spike.log (shared with launcher).
  */
@@ -42,8 +49,9 @@
 #endif
 unsigned int _newlib_heap_size_user = SPIKE_HEAP_MB * 1024 * 1024;
 
-#define LOG_PATH  "ux0:data/tailscale-vita/bgapp-spike.log"
-#define ECHO_PORT 31338
+#define LOG_PATH   "ux0:data/tailscale-vita/bgapp-spike.log"
+#define ECHO_PORT  31338
+#define XPROC_PORT 41112 /* LocalAPI's real port — bind exactly like it */
 
 static unsigned up_s(void)
 {
@@ -71,8 +79,15 @@ static void slog(const char *fmt, ...)
 
 /* vitasdk binding: sceNotificationUtilSendNotification takes a UTF-16
  * text buffer that "must be 0x410 bytes". ASCII-widen into a zeroed
- * buffer of exactly that size. */
-static void notify(const char *ascii)
+ * buffer of exactly that size. BGFTP (MIT, GrapheneCt) passes a zeroed
+ * SceNotificationUtilSendParam struct with UTF-16 text at offset 0 —
+ * byte-identical wire shape to this. Its first send happens seconds
+ * after boot (from ftpvita callbacks), ours ~1 s in and fails with
+ * 0x80106301 — so the retry schedule in main() tests the shell-not-
+ * ready-yet theory. */
+static int g_notify_ok = 0;
+
+static int notify(const char *ascii)
 {
     SceWChar16 buf[0x410 / 2];
     memset(buf, 0, sizeof buf);
@@ -82,7 +97,10 @@ static void notify(const char *ascii)
     int rc = sceNotificationUtilSendNotification(buf);
     if (rc < 0) {
         slog("notify failed: 0x%08X", (unsigned)rc);
+    } else {
+        g_notify_ok = 1;
     }
+    return rc;
 }
 
 static void probe_memory(void)
@@ -183,6 +201,70 @@ static int net_up(void)
     return s;
 }
 
+/* Phase A probe: non-blocking TCP listener on 127.0.0.1:41112, polled
+ * from the main loop. Serves one canned HTTP response per connection.
+ * Requires net_up() to have run (sceNetInit done). */
+static int xproc_up(void)
+{
+    int s = sceNetSocket("spike-xproc", SCE_NET_AF_INET, SCE_NET_SOCK_STREAM,
+                         SCE_NET_IPPROTO_TCP);
+    if (s < 0) {
+        slog("xproc: socket failed 0x%08X", (unsigned)s);
+        return s;
+    }
+    int nbio = 1;
+    sceNetSetsockopt(s, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &nbio,
+                     sizeof nbio);
+
+    SceNetSockaddrIn sin;
+    memset(&sin, 0, sizeof sin);
+    sin.sin_len = sizeof sin;
+    sin.sin_family = SCE_NET_AF_INET;
+    sin.sin_port = sceNetHtons(XPROC_PORT);
+    sin.sin_addr.s_addr = sceNetHtonl(0x7F000001); /* 127.0.0.1, like LocalAPI */
+    int rc = sceNetBind(s, (SceNetSockaddr *)&sin, sizeof sin);
+    slog("xproc: bind 127.0.0.1:%d -> 0x%08X", XPROC_PORT, (unsigned)rc);
+    if (rc >= 0) {
+        rc = sceNetListen(s, 2);
+        slog("xproc: listen -> 0x%08X", (unsigned)rc);
+    }
+    if (rc < 0) {
+        sceNetSocketClose(s);
+        return rc;
+    }
+    return s;
+}
+
+/* One accept-poll. Returns 1 if a client was served. */
+static int xproc_poll(int lsock, unsigned *hits)
+{
+    SceNetSockaddrIn cli;
+    unsigned clilen = sizeof cli;
+    memset(&cli, 0, sizeof cli);
+    int c = sceNetAccept(lsock, (SceNetSockaddr *)&cli, &clilen);
+    if (c < 0) {
+        return 0; /* EWOULDBLOCK — nothing pending */
+    }
+    /* Accepted socket: make it blocking with a short recv timeout. */
+    int nbio = 0;
+    sceNetSetsockopt(c, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &nbio,
+                     sizeof nbio);
+    int to = 500 * 1000;
+    sceNetSetsockopt(c, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVTIMEO, &to,
+                     sizeof to);
+
+    char req[256];
+    int n = sceNetRecv(c, req, sizeof req - 1, 0);
+    static const char resp[] = "HTTP/1.1 200 OK\r\nConnection: close\r\n"
+                               "Content-Length: 19\r\n\r\nbgapp xproc says hi";
+    sceNetSend(c, resp, sizeof resp - 1, 0);
+    sceNetSocketClose(c);
+    (*hits)++;
+    slog("xproc: served hit #%u (%d bytes req, peer=0x%08X)", *hits, n,
+         (unsigned)sceNetNtohl(cli.sin_addr.s_addr));
+    return 1;
+}
+
 int main(void)
 {
     sceIoMkdir("ux0:data", 0777);
@@ -196,9 +278,12 @@ int main(void)
 
     probe_memory();
     int sock = net_up();
+    int xsock = xproc_up();
 
     unsigned echoes = 0;
+    unsigned xhits = 0;
     unsigned last_beat = 0;
+    unsigned notify_tries = 1; /* net_up already sent one */
     char pkt[512];
 
     for (;;) {
@@ -226,10 +311,26 @@ int main(void)
             sceKernelDelayThread(1 * 1000 * 1000);
         }
 
+        if (xsock >= 0) {
+            while (xproc_poll(xsock, &xhits)) {
+            }
+        }
+
         unsigned now = up_s();
         if (now - last_beat >= 30) {
             last_beat = now;
-            slog("heartbeat echoes=%u", echoes);
+            slog("heartbeat echoes=%u xhits=%u", echoes, xhits);
+            /* 0x80106301 timing experiment: retry the boot notification
+             * on heartbeats until one lands (max 5 attempts). */
+            if (!g_notify_ok && notify_tries < 5) {
+                notify_tries++;
+                char msg[64];
+                sceClibSnprintf(msg, sizeof msg,
+                                "TS bgapp spike retry #%u", notify_tries);
+                int nrc = notify(msg);
+                slog("notify retry #%u -> 0x%08X", notify_tries,
+                     (unsigned)nrc);
+            }
         }
     }
 
