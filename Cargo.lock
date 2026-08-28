@@ -1650,6 +1650,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tailscale-vita-daemon"
+version = "0.1.0"
+dependencies = [
+ "vita-log",
+]
+
+[[package]]
 name = "tailscale-vita-demo"
 version = "0.1.0"
 dependencies = [

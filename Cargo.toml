@@ -16,6 +16,7 @@ members = [
     "crates/ts-peerapi",
     "crates/tailscale-vita",
     "crates/tailscale-vita-demo",
+    "crates/tailscale-vita-daemon",
     "crates/tailscale-vita-rt",
 ]
 # Phase-0 spikes are standalone crates with their own [patch.crates-io] and

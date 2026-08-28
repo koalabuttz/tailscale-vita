@@ -7,6 +7,8 @@ target/
 *.self
 *.elf
 *.sfo
+!spikes/06-bgapp/reference/bgftp_param.sfo
+!spikes/06-bgapp/reference/bgftp_param2.sfo
 
 # Vita crash dumps (collected during M11/M15 SUPRX work)
 *.psp2dmp

@@ -1,0 +1,26 @@
+[package]
+name = "tailscale-vita-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+vita-log = { path = "../vita-log" }
+
+# M21 (docs/PLAN-M21.md): the gdd background-app SELF must carry a memory
+# budget in control-info-6 or the shell can't spawn it ("could not find
+# application" — M21 spike root cause). vita-make-fself flags:
+#   -m  = MEMSIZE in KB  -> ctrl-info-6 word3 (budget; system-mode
+#         ceiling 0x12800 = 75776 KB)
+#   -at = ATTRIBUTE      -> ctrl-info-6 word1 (3, matching BGFTP's gdd)
+# 48 MB budget hosts the 32 MB newlib heap (src/main.rs) + stacks/net/
+# slack. scripts/build-bgapp-vpk.sh asserts these words landed in the
+# built SELF before packaging.
+[package.metadata.vita]
+title_id   = "TSVT00002"
+title_name = "Tailscale Daemon"
+vita_make_fself_flags = ["-m", "49152", "-at", "3"]
